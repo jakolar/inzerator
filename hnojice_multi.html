@@ -1,0 +1,2699 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<title>Hnojice — Multi-tile 3D</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #87ceeb; font-family: system-ui, sans-serif; }
+  #info {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    background: rgba(255,255,255,0.95); padding: 14px 18px; border-radius: 8px;
+    font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 320px;
+  }
+  #info h2 { margin: 0 0 6px; color: #1a73e8; font-size: 15px; }
+  #info p { margin: 3px 0; color: #555; font-size: 12px; }
+  #info a { color: #1a73e8; text-decoration: none; }
+  #info label { display: block; margin: 4px 0; }
+  #info input[type=range] { width: 100%; }
+  #info hr { border: none; border-top: 1px solid #ddd; margin: 8px 0; }
+  #click-info {
+    position: absolute; top: 10px; right: 10px; z-index: 10;
+    background: rgba(255,255,255,0.95); padding: 14px 18px; border-radius: 8px;
+    font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); min-width: 220px;
+    display: none;
+  }
+  #click-info h3 { margin: 0 0 6px; color: #c0392b; font-size: 14px; }
+  #click-info .row { margin: 4px 0; }
+  #click-info .label { color: #888; }
+  #click-info a { color: #1a73e8; text-decoration: none; }
+  #building-popup {
+    position: absolute; z-index: 20;
+    background: rgba(255,255,255,0.97); padding: 14px 18px; border-radius: 8px;
+    font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); min-width: 200px;
+    display: none; pointer-events: auto;
+  }
+  #building-popup h3 { margin: 0 0 8px; color: #1a73e8; font-size: 15px; }
+  #building-popup .row { margin: 4px 0; }
+  #building-popup .label { color: #888; }
+  #building-popup a { color: #1a73e8; text-decoration: none; display: block; margin-top: 8px; }
+  #building-popup .close { position: absolute; top: 6px; right: 10px; cursor: pointer; color: #999; font-size: 18px; }
+  canvas { display: block; cursor: crosshair; }
+  #parcelsBtn.active { background: #1a73e8; color: white; border-color: #1456b8; }
+  #parcelsBtn:hover { background: #e8e8e8; }
+  #parcelsBtn.active:hover { background: #1456b8; }
+  #freeRecordBtn:hover { background: #e8e8e8; }
+  #freeRecordBtn.active { background: #1a73e8; color: white; border-color: #1456b8; }
+  #freeRecordBtn.active:hover { background: #1456b8; }
+  #video-panel {
+    position: absolute; top: 70px; right: 10px; z-index: 30;
+    background: rgba(255,255,255,0.97); padding: 14px 16px; border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3); width: 280px; font-size: 13px;
+  }
+  #video-panel .vp-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  #video-panel .vp-title { font-weight: 600; color: #1a73e8; font-size: 14px; }
+  #video-panel .vp-close { cursor: pointer; color: #999; font-size: 18px; }
+  #video-panel .vp-meta { color: #555; font-size: 12px; margin-bottom: 10px; }
+  #video-panel fieldset.vp-fieldset { border: 1px solid #ddd; border-radius: 4px; padding: 6px 8px; margin: 0 0 8px 0; }
+  #video-panel fieldset.vp-fieldset legend { color: #888; font-size: 11px; padding: 0 4px; }
+  #video-panel fieldset.vp-fieldset label { display: block; margin: 3px 0; cursor: pointer; }
+  #video-panel .vp-row { display: block; margin: 6px 0; }
+  #video-panel input[type=range] { width: 60%; vertical-align: middle; }
+  #video-panel .vp-actions { display: flex; gap: 8px; margin-top: 10px; }
+  #video-panel .vp-actions button {
+    flex: 1; padding: 7px 0; border-radius: 4px; border: 1px solid #ccc;
+    background: #f6f6f6; cursor: pointer; font-size: 13px;
+  }
+  #video-panel .vp-actions button:hover { background: #e8e8e8; }
+  #video-panel .vp-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #video-panel .vp-progress-row {
+    display: flex; gap: 6px; align-items: center; margin-top: 10px;
+  }
+  #video-panel .vp-progress-bar-wrap {
+    flex: 1; height: 6px; background: #eee; border-radius: 3px; overflow: hidden;
+  }
+  #video-panel #vp-progress-bar { height: 100%; background: #1a73e8; width: 0%; transition: width 0.1s linear; }
+  #video-panel .vp-ctrl-btn {
+    font-size: 11px; padding: 3px 6px; border-radius: 3px; border: 1px solid #ccc;
+    background: #f6f6f6; cursor: pointer;
+  }
+  #video-panel .vp-ctrl-btn:hover { background: #e8e8e8; }
+  #video-panel .vp-ctrl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #video-panel .vp-ctrl-cancel { color: #c0392b; border-color: #e8b4ad; }
+  #video-panel .vp-ctrl-cancel:hover { background: #fadbd8; }
+</style>
+</head>
+<body>
+<div id="info">
+  <h2>Hnojice — Multi-tile 3D</h2>
+  <p><b>Tiles:</b> 625 (25x25 grid, 120m each)</p>
+  <p><b>Mesh:</b> 0.50 m (native DMP), simplified</p>
+  <p><b>Ovládání:</b> levé tl. = posun, pravé = rotace, kolečko = zoom</p>
+  <p>Klikni pro výšku + Mapy.cz odkaz. Double-click = recenter.</p>
+  <hr>
+  <label>Výškové zesílení: <span id="exag-val">1.0</span>x
+    <input type="range" id="exag" min="0.5" max="5" step="0.1" value="1.0">
+  </label>
+  <label><input type="checkbox" id="wireframe"> Wireframe</label>
+  <hr>
+  <p><b>Podklad:</b></p>
+  <label><b>Kvalita ortofota:</b></label>
+  <select id="ortho-quality" style="width:100%;padding:4px;margin:4px 0;border-radius:4px;border:1px solid #ccc;">
+    <option value="256">256px (rychlé, 15 KB)</option>
+    <option value="512">512px (komprese, 49 KB)</option>
+    <option value="640">640px (nativní, 65 KB)</option>
+    <option value="768" selected>768px (nativní raw, ~120 KB)</option>
+    <option value="1024">1024px (upscale, 200 KB)</option>
+  </select>
+  <label><b>Podklad:</b></label>
+  <select id="basemap-select" style="width:100%;padding:4px;margin:4px 0;border-radius:4px;border:1px solid #ccc;">
+    <optgroup label="Aktuální">
+      <option value="ortofoto_cuzk" selected>ČÚZK Ortofoto (aktuální)</option>
+      <option value="ortofoto_esri">Esri World Imagery</option>
+    </optgroup>
+    <optgroup label="Archiv ČÚZK (Hnojice)">
+      <option value="ortofoto_2022">2022</option>
+      <option value="ortofoto_2020">2020</option>
+      <option value="ortofoto_2018">2018</option>
+      <option value="ortofoto_2016">2016</option>
+      <option value="ortofoto_2014">2014</option>
+      <option value="ortofoto_2012">2012</option>
+      <option value="ortofoto_2009">2009</option>
+      <option value="ortofoto_2006">2006</option>
+      <option value="ortofoto_2003">2003</option>
+      <option value="ortofoto_2000">2000</option>
+    </optgroup>
+    <optgroup label="Analýza">
+      <option value="height">Výškové barvy</option>
+      <option value="slope">Sklon terénu</option>
+    </optgroup>
+  </select>
+  <label><input type="checkbox" id="toggle-cadastre"> Katastrální mapa (overlay)</label>
+  <label><b>Linie katastru:</b></label>
+  <select id="cadastre-style" style="width:100%;padding:4px;margin:4px 0;border-radius:4px;border:1px solid #ccc;">
+    <option value="thin">Tenké (1px)</option>
+    <option value="normal" selected>Normální (2px)</option>
+    <option value="medium">Střední + AA (3px)</option>
+    <option value="thick">Silné + AA (4px)</option>
+  </select>
+  </select>
+  <hr>
+  <button id="parcelsBtn" style="width:100%;padding:6px;border-radius:4px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer;font-size:12px">
+    Parcely (RÚIAN) — vyp
+  </button>
+  <p style="font-size:11px;color:#888;margin:6px 0 4px;line-height:1.3">
+    🎬 <b>Video režim:</b> pravým klikem na parcelu otevři panel pro export. Nebo:
+  </p>
+  <button id="freeRecordBtn" style="width:100%;padding:6px;border-radius:4px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer;font-size:12px">
+    📹 Nahrát aktuální pohled
+  </button>
+  <p><a href="index.html">← Zpět</a></p>
+</div>
+<div id="click-info">
+  <h3>Detail</h3>
+  <div class="row"><span class="label">Výška:</span> <b id="ci-height">—</b></div>
+  <div class="row"><span class="label">WGS84:</span> <span id="ci-wgs">—</span></div>
+  <div class="row" style="margin-top:6px"><a id="ci-mapy" href="#" target="_blank">Mapy.cz 3D</a></div>
+</div>
+<div id="building-popup">
+  <span class="close" id="popup-close">&times;</span>
+  <h3 id="popup-title"></h3>
+  <div class="row"><span class="label">Č.p.:</span> <span id="popup-cislo"></span></div>
+  <div class="row"><span class="label">Plocha:</span> <span id="popup-plocha"></span> m²</div>
+  <div class="row"><span class="label">Kód:</span> <span id="popup-kod"></span></div>
+  <a id="popup-mapy" href="#" target="_blank">Mapy.cz 3D</a>
+  <a id="popup-ruian" href="#" target="_blank">RÚIAN detail</a>
+</div>
+<div id="video-panel" style="display:none">
+  <div class="vp-header">
+    <span class="vp-title">🎬 Video pro parcelu</span>
+    <span id="vp-close" class="vp-close">&times;</span>
+  </div>
+  <div class="vp-meta">
+    <span id="vp-label"></span> · <span id="vp-area"></span> m² · <span id="vp-use"></span>
+  </div>
+  <fieldset class="vp-fieldset">
+    <legend>Preset</legend>
+    <label><input type="radio" name="vp-preset" value="topdown" checked> 📐 Top-down zoom (15s)</label>
+    <label><input type="radio" name="vp-preset" value="highorbit360"> 🛰️ High orbit 360° (30s)</label>
+    <label><input type="radio" name="vp-preset" value="halforbit"> 🔄 Half-orbit (15s)</label>
+    <label><input type="radio" name="vp-preset" value="revealpullup"> 📡 Reveal pull-up (25s)</label>
+    <label><input type="radio" name="vp-preset" value="divepush"> 🎯 Diagonal push-in (20s)</label>
+    <label><input type="radio" name="vp-preset" value="locator"> 🌍 Locator zoom (20s)</label>
+    <label><input type="radio" name="vp-preset" value="contextarc"> 🌀 Context arc (25s)</label>
+    <label><input type="radio" name="vp-preset" value="lateralflyby"> ✈️ Lateral fly-by (15s)</label>
+    <label><input type="radio" name="vp-preset" value="sunsetorbit"> 🌅 Sunset orbit (15s)</label>
+  </fieldset>
+  <fieldset class="vp-fieldset">
+    <legend>Mód</legend>
+    <label><input type="radio" name="vp-mode" value="property" checked> Property (parcel + budova)</label>
+    <label><input type="radio" name="vp-mode" value="land"> Land only</label>
+  </fieldset>
+  <fieldset class="vp-fieldset">
+    <legend>Zvýraznění</legend>
+    <label><input type="checkbox" name="vp-hl" value="pulse"> ✨ Pulsing outline</label>
+    <label><input type="checkbox" name="vp-hl" value="beam"> 🔦 Beam z parcely</label>
+    <label><input type="checkbox" name="vp-hl" value="label"> 🏷️ Floating label</label>
+    <label><input type="checkbox" name="vp-hl" value="ants"> 🐜 Marching ants</label>
+    <label><input type="checkbox" name="vp-hl" value="glow"> 💡 Volumetric glow</label>
+    <label><input type="checkbox" name="vp-hl" value="pin"> 📍 Pin</label>
+  </fieldset>
+  <label class="vp-row"><input type="checkbox" id="vp-overlay"> Info overlay</label>
+  <label class="vp-row">Délka <input type="range" id="vp-duration" min="15" max="45" step="1" value="25"> <span id="vp-duration-val">25</span>s</label>
+  <fieldset class="vp-fieldset">
+    <legend>Začátek dráhy</legend>
+    <label class="vp-row">Úhel <input type="range" id="vp-start-angle" min="-180" max="180" step="5" value="0"> <span id="vp-start-angle-val">0</span>°</label>
+    <label class="vp-row">Vzdálenost <input type="range" id="vp-start-dist" min="0.5" max="2.5" step="0.05" value="1.0"> <span id="vp-start-dist-val">1.0</span>×</label>
+  </fieldset>
+  <div class="vp-actions">
+    <button id="vp-preview">Preview</button>
+    <button id="vp-export">Export</button>
+  </div>
+  <div id="vp-progress" class="vp-progress-row" style="display:none">
+    <div class="vp-progress-bar-wrap"><div id="vp-progress-bar"></div></div>
+    <button id="vp-pause" class="vp-ctrl-btn">⏸ Pauza</button>
+    <button id="vp-cancel" class="vp-ctrl-btn vp-ctrl-cancel">✕ Zrušit</button>
+  </div>
+</div>
+<script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+proj4.defs("EPSG:5514", "+proj=krovak +lat_0=49.5 +lon_0=24.83333333333333 +alpha=30.28813975277778 +k=0.9999 +x_0=0 +y_0=0 +ellps=bessel +towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56 +units=m +no_defs");
+
+const gcx = -547700;
+const gcy = -1107700;
+let tiles = [];
+let ruianBuildings = [];
+const dataLoaded = fetch('tiles_hnojice_multi/hnojice_data.json')
+  .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+  .then(d => { tiles = d.tiles; ruianBuildings = d.ruianBuildings; });
+
+// ─── Parcels layer (lazy) ────────────────────────────────────────────
+const PARCEL_COLORS = {
+  2:  0xb9905a,   // orná půda
+  3:  0x3a5f2a,   // chmelnice
+  4:  0x5a3a55,   // vinice
+  5:  0x6a8a3a,   // zahrada
+  6:  0x4a7a30,   // ovocný sad
+  7:  0x8db04a,   // trvalý travní porost
+  10: 0x1f3a1c,   // lesní pozemek
+  11: 0x2a4a6e,   // vodní plocha
+  13: 0x555555,   // zastavěná plocha
+  14: 0xa89878,   // ostatní plocha
+};
+const PARCEL_FALLBACK = 0x777777;
+const PARCEL_TILE_H = 0.15;
+const PARCEL_LIFT   = 0.02;
+
+let _parcels = null;          // raw array from server
+let _parcelGroup = null;      // THREE.Group
+const _parcelMeshes = [];     // flat list of clickable top-meshes for raycast
+let _parcelHover = null;      // THREE.Line currently outlining hovered parcel
+let _selectedParcelMesh = null;   // THREE.Group with top + sides, yellow highlight
+
+// ─── Video tool state ────────────────────────────────────────────────
+let _videoSubject = null;     // { parcel, label, ring_local, area_m2, use_label, building_idx }
+let _videoState = 'idle';     // 'idle' | 'panel' | 'preview' | 'recording' | 'paused' | 'converting'
+let _videoStartTs = 0;        // performance.now() at preview/record start
+let _videoDurationMs = 25000; // current selection
+let _videoOverlay = false;    // info-overlay toggle
+let _videoMode = 'property';  // 'property' | 'land'
+let _videoHighlights = { pulse: false, beam: false, label: false, ants: false, glow: false, pin: false };
+let _videoStartAngleDeg = 0;       // -180..+180, rotation around Y around centroid
+let _videoStartDistanceMul = 1.0;  // 0.5..2.5, multiplier on radial distance
+let _hlPulseObjs = [];     // array of { obj, baseOpacity } for objects whose opacity is animated
+let _hlBeam = null;        // THREE.Mesh
+let _hlLabel = null;       // THREE.Sprite
+let _hlAnts = null;        // THREE.Line with LineDashedMaterial
+let _hlGlow = null;        // THREE.Mesh (box)
+let _hlPin = null;         // THREE.Group (pin marker)
+let _hlAntsOffset = 0;     // animated dash offset
+let _videoPreset = 'topdown';
+let _sunsetTintActive = false;
+let _sunsetTintRestore = [];   // [{ material, hex }]
+let _videoCurves = null;      // { posCurve, targetCurve } from buildCameraPath
+let _videoPauseElapsed = null;   // ms elapsed when paused; null when not paused
+let _videoCancelled = false;     // set true to skip download in recording onstop
+let _currentRecorder = null;     // active MediaRecorder (set by Export, cleared on stop/cancel)
+let _ffmpegInstance = null;      // lazily loaded FFmpeg instance (ffmpeg.wasm)
+let _ffmpegLoading = null;       // in-flight load promise (deduplicate concurrent calls)
+let _videoPrevMode = null;       // which state ('preview'|'recording') we were in before pausing
+const _savedSceneState = new Map();  // material/opacity backup keyed by Object3D.uuid
+let _selectClickSeq = 0;         // monotonic counter for in-flight selectParcelAtClick debounce
+
+// ─── Video path helpers (pure functions, no DOM/scene mutation) ───────
+// Compute centroid + bbox + diagonal + top-Y from a parcel ring_local.
+function computeSubjectGeometry(ring_local) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, maxY = -Infinity;
+  let sumX = 0, sumZ = 0;
+  for (const [x, z, y] of ring_local) {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    if (y > maxY) maxY = y;
+    sumX += x; sumZ += z;
+  }
+  const cx = sumX / ring_local.length;
+  const cz = sumZ / ring_local.length;
+  const diagonal = Math.hypot(maxX - minX, maxZ - minZ);
+  const groundY = maxY;          // approximation: top of parcel = local terrain height
+  return { centroid: [cx, cz], bbox: { minX, maxX, minZ, maxZ }, diagonal, groundY };
+}
+
+// Closest road-segment point in mesh-local frame, falling back to a point
+// 200 m due west of the centroid at terrain level when /api/roads has no
+// data nearby (or hasn't been loaded for this viewer yet).
+function findNearestRoadPoint(centroid, fallbackY) {
+  const FALLBACK = [centroid[0] - 200, fallbackY, centroid[1]];
+  if (typeof window.roads === 'undefined' || !Array.isArray(window.roads) || window.roads.length === 0) {
+    return FALLBACK;
+  }
+  let best = null, bestD2 = Infinity;
+  for (const polyline of window.roads) {
+    for (const [x, z, y] of polyline) {
+      const dx = x - centroid[0], dz = z - centroid[1];
+      const d2 = dx*dx + dz*dz;
+      if (d2 < bestD2) { bestD2 = d2; best = [x, y || fallbackY, z]; }
+    }
+  }
+  return best || FALLBACK;
+}
+
+// Build CatmullRomCurve3 paths for the presets.
+function buildCameraPath(preset, subject) {
+  const [cx, cz] = subject.centroid;
+  const gy = subject.groundY;
+  const tgtAt = (y = gy) => new THREE.Vector3(cx, y, cz);
+
+  if (preset === 'topdown') {
+    // Vertical descent, camera always 90° down on parcel.
+    const posPts = [
+      new THREE.Vector3(cx, gy + 150, cz),
+      new THREE.Vector3(cx, gy + 115, cz),
+      new THREE.Vector3(cx, gy +  80, cz),
+    ];
+    const tgtPts = [tgtAt(), tgtAt(), tgtAt()];
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'highorbit360') {
+    const R = 250, H = 200;
+    const N = 16;
+    const posPts = [];
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      posPts.push(new THREE.Vector3(cx + R * Math.cos(theta), gy + H, cz + R * Math.sin(theta)));
+    }
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, true, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, true),
+    };
+  }
+
+  if (preset === 'halforbit') {
+    // 90° arc (quarter circle) at fixed altitude.
+    const R = 220, H = 180;
+    const N = 8;
+    const startAng = Math.PI;        // start at west
+    const endAng = startAng - Math.PI / 2;   // 90° CCW (toward south)
+    const posPts = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const theta = startAng + (endAng - startAng) * t;
+      posPts.push(new THREE.Vector3(cx + R * Math.cos(theta), gy + H, cz + R * Math.sin(theta)));
+    }
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'revealpullup') {
+    // Start LOW + FAR from village, pull up and back.
+    const posPts = [
+      new THREE.Vector3(cx - 400,  gy + 30,  cz - 400),    // far SW, low over field
+      new THREE.Vector3(cx - 250,  gy + 90,  cz - 250),
+      new THREE.Vector3(cx - 100,  gy + 160, cz - 100),
+      new THREE.Vector3(cx,        gy + 220, cz),           // high over parcel
+    ];
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'divepush') {
+    // Wide → medium push-in, safety stop at 80 m altitude (never closer).
+    const posPts = [
+      new THREE.Vector3(cx - 250, gy + 300, cz - 250),    // wide start
+      new THREE.Vector3(cx - 100, gy + 180, cz - 100),
+      new THREE.Vector3(cx +  80, gy + 100, cz +  20),
+      new THREE.Vector3(cx +  80, gy +  80, cz +  20),    // safety stop, slows here
+    ];
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'locator') {
+    // Zoom from 500 m altitude directly above parcel down to 150 m.
+    const posPts = [
+      new THREE.Vector3(cx, gy + 500, cz),
+      new THREE.Vector3(cx, gy + 350, cz),
+      new THREE.Vector3(cx, gy + 220, cz),
+      new THREE.Vector3(cx, gy + 150, cz),
+    ];
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'contextarc') {
+    // 90° arc, but ends with tilt-down to top-down view of parcel.
+    const R = 220, H = 180;
+    const N = 8;
+    const startAng = Math.PI;
+    const endAng = startAng - Math.PI / 2;
+    const posPts = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const theta = startAng + (endAng - startAng) * t;
+      // Last segment lifts toward top-down: shrink radius → 0 in last 25%.
+      const radiusFalloff = t < 0.75 ? 1.0 : (1.0 - (t - 0.75) / 0.25);
+      const r = R * radiusFalloff;
+      // Altitude rises slightly toward end so we end above parcel.
+      const h = H + (1 - radiusFalloff) * 40;
+      posPts.push(new THREE.Vector3(cx + r * Math.cos(theta), gy + h, cz + r * Math.sin(theta)));
+    }
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'lateralflyby') {
+    // Lateral pass at altitude 220 m, offset 80 m N of target so camera
+    // never crosses directly above the parcel — avoids lookAt gimbal flip
+    // at zenith.
+    const ZOFF = 80;
+    const posPts = [
+      new THREE.Vector3(cx - 350, gy + 220, cz + ZOFF),
+      new THREE.Vector3(cx - 100, gy + 220, cz + ZOFF),
+      new THREE.Vector3(cx + 100, gy + 220, cz + ZOFF),
+      new THREE.Vector3(cx + 350, gy + 220, cz + ZOFF),
+    ];
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  if (preset === 'sunsetorbit') {
+    // Same path as halforbit; the tint is applied separately via state flag.
+    const R = 220, H = 180;
+    const N = 8;
+    const startAng = Math.PI;
+    const endAng = startAng - Math.PI / 2;
+    const posPts = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const theta = startAng + (endAng - startAng) * t;
+      posPts.push(new THREE.Vector3(cx + R * Math.cos(theta), gy + H, cz + R * Math.sin(theta)));
+    }
+    const tgtPts = posPts.map(() => tgtAt());
+    return {
+      posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+      targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+    };
+  }
+
+  // Fallback (unknown preset): vertical top-down zoom.
+  const posPts = [
+    new THREE.Vector3(cx, gy + 150, cz),
+    new THREE.Vector3(cx, gy +  80, cz),
+  ];
+  const tgtPts = [tgtAt(), tgtAt()];
+  return {
+    posCurve: new THREE.CatmullRomCurve3(posPts, false, 'catmullrom', 0.5),
+    targetCurve: new THREE.CatmullRomCurve3(tgtPts, false),
+  };
+}
+
+function applyStartTransform(curves, subject) {
+  const angleDeg = _videoStartAngleDeg || 0;
+  const distMul = _videoStartDistanceMul || 1.0;
+  if (angleDeg === 0 && distMul === 1.0) return curves;   // identity, no work
+  const [cx, cz] = subject.centroid;
+  const rad = angleDeg * Math.PI / 180;
+  const cosA = Math.cos(rad), sinA = Math.sin(rad);
+  // pos points: rotate + scale
+  for (const pt of curves.posCurve.points) {
+    const dx = pt.x - cx, dz = pt.z - cz;
+    const rx = dx * cosA - dz * sinA;
+    const rz = dx * sinA + dz * cosA;
+    pt.x = cx + rx * distMul;
+    pt.z = cz + rz * distMul;
+    // pt.y unchanged (vertical axis preserved)
+  }
+  // target points: rotate only (no scale — they stay anchored to centroid)
+  for (const pt of curves.targetCurve.points) {
+    const dx = pt.x - cx, dz = pt.z - cz;
+    pt.x = cx + dx * cosA - dz * sinA;
+    pt.z = cz + dx * sinA + dz * cosA;
+  }
+  curves.posCurve.updateArcLengths();
+  curves.targetCurve.updateArcLengths();
+  return curves;
+}
+
+// Standard ray-casting point-in-polygon (2D, X/Z plane). Polygon is a list
+// of [x, z] pairs (or [x, z, y] — Y is ignored).
+function pointInPolygon2D(px, pz, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, zi] = polygon[i];
+    const [xj, zj] = polygon[j];
+    const intersect = ((zi > pz) !== (zj > pz)) &&
+      (px < (xj - xi) * (pz - zi) / (zj - zi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// Find the OSM/RÚIAN building whose footprint centroid lies inside the
+// parcel ring. Returns the index into ruianBuildings, or -1 if no match.
+function findSubjectBuildingIdx(ring_local) {
+  if (!Array.isArray(ruianBuildings) || ruianBuildings.length === 0) return -1;
+  for (let i = 0; i < ruianBuildings.length; i++) {
+    const b = ruianBuildings[i];
+    const ring = b.coords;
+    if (!Array.isArray(ring) || ring.length < 3) continue;
+    let cx = 0, cz = 0;
+    for (const [x, z] of ring) { cx += x; cz += z; }
+    cx /= ring.length; cz /= ring.length;
+    if (pointInPolygon2D(cx, cz, ring_local)) return i;
+  }
+  return -1;
+}
+
+// ─── Presentation-mode helpers ────────────────────────────────────────────────
+
+// Save the original visual state of `obj.material` so it can be restored later.
+// Uses `_savedSceneState` Map keyed by uuid. Only saves once per uuid.
+function saveMaterialState(obj) {
+  if (!obj || !obj.material || _savedSceneState.has(obj.uuid)) return;
+  const m = obj.material;
+  _savedSceneState.set(obj.uuid, {
+    color: m.color ? m.color.getHex() : null,
+    opacity: m.opacity,
+    transparent: m.transparent,
+    depthWrite: m.depthWrite,
+    emissive: m.emissive ? m.emissive.getHex() : null,
+    emissiveIntensity: m.emissiveIntensity,
+  });
+}
+
+// Restore one material from the saved state map (and remove the entry).
+function restoreMaterialState(obj) {
+  if (!obj || !obj.material) return;
+  const saved = _savedSceneState.get(obj.uuid);
+  if (!saved) return;
+  const m = obj.material;
+  if (saved.color !== null && m.color) m.color.setHex(saved.color);
+  m.opacity = saved.opacity;
+  m.transparent = saved.transparent;
+  m.depthWrite = saved.depthWrite;
+  if (saved.emissive !== null && m.emissive) m.emissive.setHex(saved.emissive);
+  if ('emissiveIntensity' in m) m.emissiveIntensity = saved.emissiveIntensity;
+  _savedSceneState.delete(obj.uuid);
+}
+
+const SUBJECT_YELLOW = 0xfde047;
+const SUBJECT_CYAN   = 0x67e8f9;
+
+// Apply highlight to subject + dim everything else. Idempotent.
+function applyPresentationMode(subject, mode) {
+  if (!subject || subject.free) return;   // no highlights in free flythrough mode
+  if (!_parcelGroup || !subject) return;
+  // 1. Highlight subject parcel.
+  for (const pg of _parcelGroup.children) {
+    const top = pg.children[0];
+    const side = pg.children[1];
+    if (!top || !side) continue;
+    const isSubject = top.userData.parcel && top.userData.parcel.id === subject.parcel.id;
+    saveMaterialState(top);
+    saveMaterialState(side);
+    if (isSubject) {
+      top.material.color.setHex(SUBJECT_YELLOW);
+      top.material.opacity = 1.0;
+      side.material.color.setHex(SUBJECT_YELLOW);
+      side.material.opacity = 1.0;
+    } else {
+      top.material.opacity = 0.30;
+      side.material.opacity = 0.30;
+    }
+    top.material.transparent = true;
+    side.material.transparent = true;
+  }
+  // 2. Highlight subject building (only in 'property' mode) — draw a cyan
+  // LineLoop along its footprint, draped on the terrain. The DSM already
+  // contains the building as a textured bump; we just add the outline.
+  if (mode === 'property' && subject.building_idx >= 0) {
+    const b = ruianBuildings[subject.building_idx];
+    if (b && Array.isArray(b.coords) && b.coords.length >= 3) {
+      const pts = [];
+      for (const [x, z] of b.coords) {
+        const y = getTerrainHeightAt(x, z) + 0.3;   // 30 cm above terrain
+        pts.push(new THREE.Vector3(x, y, z));
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({
+        color: SUBJECT_CYAN, transparent: true, opacity: 0.95, depthTest: false,
+      });
+      const loop = new THREE.LineLoop(geo, mat);
+      loop.renderOrder = 5;
+      loop.userData.videoSubjectOutline = true;
+      scene.add(loop);
+    }
+  }
+}
+
+function restorePresentationMode() {
+  // Remove subject-building outline (added in apply for 'property' mode).
+  const toRemove = [];
+  scene.traverse(obj => {
+    if (obj.userData && obj.userData.videoSubjectOutline) toRemove.push(obj);
+  });
+  for (const obj of toRemove) {
+    scene.remove(obj);
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) obj.material.dispose();
+  }
+  // Restore every saved material — build uuid → object index in ONE traversal,
+  // then look up each saved entry. O(N+M) instead of O(N×M).
+  const byUuid = new Map();
+  scene.traverse(o => {
+    if (_savedSceneState.has(o.uuid)) byUuid.set(o.uuid, o);
+  });
+  const uuids = Array.from(_savedSceneState.keys());
+  for (const uuid of uuids) {
+    const target = byUuid.get(uuid);
+    if (target) restoreMaterialState(target);
+    else _savedSceneState.delete(uuid);
+  }
+}
+
+function applyHighlights(subject) {
+  if (!subject || subject.free || !subject.ring_local) return;
+  const ring = subject.ring_local;
+  const [cx, cz] = subject.centroid;
+  const gy = subject.groundY;
+
+  // PULSE — collect objects whose material.opacity will be animated.
+  if (_videoHighlights.pulse) {
+    // Subject parcel top + side meshes
+    if (_parcelGroup) {
+      for (const pg of _parcelGroup.children) {
+        const top = pg.children[0];
+        if (top && top.userData.parcel && top.userData.parcel.id === subject.parcel.id) {
+          _hlPulseObjs.push({ obj: top.material, baseOpacity: top.material.opacity });
+          if (pg.children[1]) _hlPulseObjs.push({ obj: pg.children[1].material, baseOpacity: pg.children[1].material.opacity });
+          break;
+        }
+      }
+    }
+    // Subject building outline (LineLoop with userData.videoSubjectOutline)
+    scene.traverse(obj => {
+      if (obj.userData && obj.userData.videoSubjectOutline) {
+        _hlPulseObjs.push({ obj: obj.material, baseOpacity: obj.material.opacity });
+      }
+    });
+  }
+
+  // BEAM — yellow translucent cone from parcel centroid up.
+  if (_videoHighlights.beam) {
+    const beamHeight = 200;
+    const beamGeo = new THREE.ConeGeometry(8, beamHeight, 16, 1, true);
+    const beamMat = new THREE.MeshBasicMaterial({
+      color: 0xfde047, transparent: true, opacity: 0.18,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    _hlBeam = new THREE.Mesh(beamGeo, beamMat);
+    _hlBeam.position.set(cx, gy + beamHeight / 2, cz);
+    scene.add(_hlBeam);
+  }
+
+  // LABEL — canvas-textured Sprite floating above parcel.
+  if (_videoHighlights.label) {
+    const c = document.createElement('canvas');
+    c.width = 1024; c.height = 256;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.beginPath();
+    ctx.roundRect(0, 0, c.width, c.height, 24);
+    ctx.fill();
+    ctx.fillStyle = '#fde047';
+    ctx.font = '700 80px system-ui, sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText(subject.label || '—', 32, 28);
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '500 56px system-ui, sans-serif';
+    const sub = `${(subject.area_m2 || 0).toLocaleString('cs-CZ')} m² · ${subject.use_label || '—'}`;
+    ctx.fillText(sub, 32, 130);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    _hlLabel = new THREE.Sprite(mat);
+    _hlLabel.scale.set(60, 15, 1);   // world-space size; ~60 m wide
+    _hlLabel.position.set(cx, gy + 25, cz);
+    _hlLabel.renderOrder = 10;
+    scene.add(_hlLabel);
+  }
+
+  // ANTS — dashed LineLoop along parcel perimeter, animated via dash offset.
+  if (_videoHighlights.ants) {
+    const pts = ring.map(([x, z, y]) => new THREE.Vector3(x, y + 0.5, z));
+    pts.push(pts[0].clone());   // close the loop
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineDashedMaterial({
+      color: 0xfde047, dashSize: 1.5, gapSize: 1.0,
+      transparent: true, opacity: 0.95, depthTest: false,
+    });
+    _hlAnts = new THREE.Line(geo, mat);
+    _hlAnts.computeLineDistances();
+    _hlAnts.renderOrder = 11;
+    scene.add(_hlAnts);
+  }
+
+  // GLOW — semi-transparent vertical volume covering parcel bbox.
+  if (_videoHighlights.glow) {
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const [x, z] of ring) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const w = maxX - minX, d = maxZ - minZ;
+    const h = 60;
+    const glowGeo = new THREE.BoxGeometry(w, h, d);
+    // Vertex-color gradient (top alpha 0, bottom alpha 0.35).
+    const colors = new Float32Array(glowGeo.attributes.position.count * 3);
+    const alphas = new Float32Array(glowGeo.attributes.position.count);
+    for (let i = 0; i < glowGeo.attributes.position.count; i++) {
+      const y = glowGeo.attributes.position.getY(i);
+      // y in [-h/2, +h/2]; t=0 at bottom, t=1 at top
+      const t = (y + h/2) / h;
+      colors[i*3]   = 1.0;     // R
+      colors[i*3+1] = 0.88;    // G
+      colors[i*3+2] = 0.28;    // B (warm yellow)
+      alphas[i] = 0.35 * (1.0 - t);   // fade upward
+    }
+    glowGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    glowGeo.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+    const glowMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, side: THREE.DoubleSide,
+      vertexShader: `
+        attribute float alpha;
+        varying float vAlpha;
+        varying vec3 vColor;
+        void main() {
+          vAlpha = alpha;
+          vColor = color;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        varying float vAlpha;
+        varying vec3 vColor;
+        void main() { gl_FragColor = vec4(vColor, vAlpha); }`,
+      vertexColors: true,
+    });
+    _hlGlow = new THREE.Mesh(glowGeo, glowMat);
+    _hlGlow.position.set((minX + maxX) / 2, gy + h/2, (minZ + maxZ) / 2);
+    scene.add(_hlGlow);
+  }
+
+  // PIN — Google-Maps-style 3D marker drops on subject building (or parcel centroid).
+  if (_videoHighlights.pin) {
+    let px = cx, pz = cz;
+    if (subject.building_idx >= 0 && Array.isArray(ruianBuildings) && ruianBuildings[subject.building_idx]) {
+      const b = ruianBuildings[subject.building_idx];
+      if (Array.isArray(b.coords) && b.coords.length >= 3) {
+        let sx = 0, sz = 0;
+        for (const [x, z] of b.coords) { sx += x; sz += z; }
+        px = sx / b.coords.length;
+        pz = sz / b.coords.length;
+      }
+    }
+    const group = new THREE.Group();
+    // Stem (cone pointing down): apex at group origin, base 7 m up.
+    const stemGeo = new THREE.ConeGeometry(2.5, 7, 16);
+    stemGeo.translate(0, 3.5, 0);
+    stemGeo.rotateX(Math.PI);
+    stemGeo.translate(0, 7, 0);
+    const pinMat = new THREE.MeshStandardMaterial({
+      color: 0xc0392b, roughness: 0.5, metalness: 0.1,
+      depthTest: false, transparent: true, opacity: 0.95,
+    });
+    const stem = new THREE.Mesh(stemGeo, pinMat);
+    stem.renderOrder = 12;
+    group.add(stem);
+
+    // Ball on top of stem.
+    const ballGeo = new THREE.SphereGeometry(3, 24, 18);
+    const ball = new THREE.Mesh(ballGeo, pinMat.clone());
+    ball.position.y = 10;
+    ball.renderOrder = 12;
+    group.add(ball);
+
+    // White dot — Sprite (billboard) always faces camera, visually centered on ball.
+    const dotCanvas = document.createElement('canvas');
+    dotCanvas.width = 128; dotCanvas.height = 128;
+    const dctx = dotCanvas.getContext('2d');
+    dctx.fillStyle = 'rgba(255,255,255,0)';
+    dctx.fillRect(0, 0, 128, 128);
+    dctx.fillStyle = '#ffffff';
+    dctx.beginPath();
+    dctx.arc(64, 64, 50, 0, Math.PI * 2);
+    dctx.fill();
+    // Subtle dark ring for depth
+    dctx.strokeStyle = 'rgba(60,30,30,0.4)';
+    dctx.lineWidth = 4;
+    dctx.stroke();
+    const dotTex = new THREE.CanvasTexture(dotCanvas);
+    dotTex.colorSpace = THREE.SRGBColorSpace;
+    const dotMat = new THREE.SpriteMaterial({
+      map: dotTex, transparent: true, depthTest: false,
+    });
+    const dot = new THREE.Sprite(dotMat);
+    dot.scale.set(2.6, 2.6, 1);     // world-space size; ~2.6 m wide
+    dot.position.set(0, 10, 0);     // CENTER of the ball
+    dot.renderOrder = 13;
+    group.add(dot);
+
+    // Find actual surface Y at pin XZ — DSM mesh includes building heights,
+    // so this returns roof Y when over a building, terrain Y otherwise.
+    const pinRay = new THREE.Raycaster();
+    pinRay.set(new THREE.Vector3(px, 5000, pz), new THREE.Vector3(0, -1, 0));
+    const pinHits = pinRay.intersectObjects(allMeshes, false);
+    const surfaceY = pinHits.length ? pinHits[0].point.y : gy;
+    const PIN_HOVER = 5;     // meters above surface
+    const finalY = surfaceY + PIN_HOVER;
+
+    group.position.set(px, finalY + 80, pz);    // start 80 m above hover position
+    group.userData.pinAppliedAt = performance.now();
+    group.userData.pinDropDurMs = 600;
+    group.userData.pinFinalY = finalY;
+    _hlPin = group;
+    scene.add(group);
+  }
+}
+
+function restoreHighlights() {
+  // Restore pulse opacities
+  for (const { obj, baseOpacity } of _hlPulseObjs) {
+    obj.opacity = baseOpacity;
+  }
+  _hlPulseObjs = [];
+  // Remove highlight objects
+  for (const ref of [_hlBeam, _hlLabel, _hlAnts, _hlGlow, _hlPin]) {
+    if (!ref) continue;
+    scene.remove(ref);
+    ref.traverse(node => {
+      if (node.geometry) node.geometry.dispose();
+      if (node.material) {
+        if (node.material.map) node.material.map.dispose();
+        node.material.dispose();
+      }
+    });
+  }
+  _hlBeam = _hlLabel = _hlAnts = _hlGlow = _hlPin = null;
+}
+
+function applySunsetTint() {
+  if (_sunsetTintActive) return;
+  _sunsetTintActive = true;
+  _sunsetTintRestore = [];
+  const TINT = 0xffaa66;   // warm orange multiplier
+  // Tint terrain GLB tile materials.
+  for (const m of allMeshes) {
+    if (m.material && m.material.color) {
+      _sunsetTintRestore.push({ material: m.material, hex: m.material.color.getHex() });
+      m.material.color.setHex(TINT);
+    }
+  }
+  // Tint parcel layer materials (if visible).
+  if (_parcelGroup) {
+    _parcelGroup.traverse(obj => {
+      if (obj.isMesh && obj.material && obj.material.color) {
+        _sunsetTintRestore.push({ material: obj.material, hex: obj.material.color.getHex() });
+        const orig = new THREE.Color(obj.material.color.getHex());
+        const tint = new THREE.Color(TINT);
+        // Multiply original color by tint (preserves color variation by use_code).
+        obj.material.color.setRGB(orig.r * tint.r, orig.g * tint.g, orig.b * tint.b);
+      }
+    });
+  }
+  // Tint selected parcel highlight too.
+  if (_selectedParcelMesh) {
+    _selectedParcelMesh.traverse(obj => {
+      if (obj.isMesh && obj.material && obj.material.color) {
+        _sunsetTintRestore.push({ material: obj.material, hex: obj.material.color.getHex() });
+        const orig = new THREE.Color(obj.material.color.getHex());
+        const tint = new THREE.Color(TINT);
+        obj.material.color.setRGB(orig.r * tint.r, orig.g * tint.g, orig.b * tint.b);
+      }
+    });
+  }
+}
+
+function restoreSunsetTint() {
+  if (!_sunsetTintActive) return;
+  for (const { material, hex } of _sunsetTintRestore) {
+    if (material && material.color) material.color.setHex(hex);
+  }
+  _sunsetTintRestore = [];
+  _sunsetTintActive = false;
+}
+
+// Single object that orchestrates presentation mode + highlights + sunset tint.
+// Callers use apply() / clear() / tick() / setSunset() — never the underlying
+// apply*/restore* functions directly.
+const _sceneOverlay = {
+  active: false,
+  // shadow state
+  subject: null,
+  mode: null,
+  highlights: null,
+  sunset: false,
+
+  apply(subject, mode, highlights = null) {
+    // Restore current state first (idempotent — no-op if active=false).
+    this.clear({ keepSunset: true });    // sunset toggle managed separately
+    if (!subject) return;
+    applyPresentationMode(subject, mode);
+    // Sync highlight flags to global object that applyHighlights reads.
+    if (highlights) {
+      Object.assign(_videoHighlights, highlights);
+    }
+    applyHighlights(subject);
+    this.subject = subject;
+    this.mode = mode;
+    this.highlights = highlights;
+    this.active = true;
+  },
+
+  clear(opts = {}) {
+    if (!this.active && !opts.force) {
+      // Only restore sunset if requested, otherwise nothing to do.
+      if (!opts.keepSunset && _sunsetTintActive) restoreSunsetTint();
+      return;
+    }
+    restoreHighlights();
+    restorePresentationMode();
+    this.subject = null;
+    this.mode = null;
+    this.highlights = null;
+    this.active = false;
+    if (!opts.keepSunset && _sunsetTintActive) restoreSunsetTint();
+  },
+
+  setSunset(on) {
+    if (on && !_sunsetTintActive) applySunsetTint();
+    else if (!on && _sunsetTintActive) restoreSunsetTint();
+    this.sunset = on;
+  },
+
+  tick() {
+    tickHighlights();
+  },
+};
+
+// Per-frame animation for pulse + ants
+function tickHighlights() {
+  if (_hlPulseObjs.length) {
+    const t = (performance.now() % 1200) / 1200;
+    const phase = 0.5 + 0.5 * Math.sin(t * Math.PI * 2);  // 0..1
+    const alpha = 0.45 + 0.55 * phase;
+    for (const { obj, baseOpacity } of _hlPulseObjs) {
+      obj.opacity = baseOpacity * alpha + (1 - baseOpacity) * 0;  // scale base
+    }
+  }
+  if (_hlAnts) {
+    _hlAntsOffset += 0.04;
+    // True marching ants requires shader-based offset; LineDashedMaterial
+    // doesn't support animation natively. Cheap approximation: oscillate gapSize.
+    if (_hlAnts.material) _hlAnts.material.gapSize = 0.7 + 0.6 * (0.5 + 0.5 * Math.sin(_hlAntsOffset * 2));
+    if (_hlAnts.material) _hlAnts.material.needsUpdate = true;
+  }
+  if (_hlPin) {
+    const elapsed = performance.now() - _hlPin.userData.pinAppliedAt;
+    const dropDur = _hlPin.userData.pinDropDurMs;
+    const finalY = _hlPin.userData.pinFinalY;
+    if (elapsed < dropDur) {
+      // Cubic ease-out drop from +80 m to finalY.
+      const t = elapsed / dropDur;
+      const ease = 1 - Math.pow(1 - t, 3);
+      _hlPin.position.y = finalY + 80 * (1 - ease);
+    } else {
+      // Idle hover ±0.3 m sinusoidal over 2 s.
+      const hovT = (performance.now() % 2000) / 2000;
+      _hlPin.position.y = finalY + 0.3 * Math.sin(hovT * Math.PI * 2);
+    }
+  }
+}
+
+function smoothstep(t) {
+  // Cubic Hermite, identical to GLSL smoothstep(0, 1, t).
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * (3 - 2 * x);
+}
+
+function videoTick() {
+  if (!_videoCurves || !_videoStartTs) return;
+  const elapsed = performance.now() - _videoStartTs;
+  const tRaw = Math.min(1, elapsed / _videoDurationMs);
+  const t = smoothstep(tRaw);
+  const pos = _videoCurves.posCurve.getPointAt(t);
+  const tgt = _videoCurves.targetCurve.getPointAt(t);
+  camera.position.copy(pos);
+  camera.lookAt(tgt);
+  _sceneOverlay.tick();
+  renderer.render(scene, camera);
+  if (_videoOverlay) blitOverlay();         // defined in Task 6
+  if (tRaw >= 1) _onVideoComplete();        // defined/overridden in Task 8
+}
+
+function startVideoTick(curves, durationMs) {
+  if (typeof controls !== 'undefined' && controls) controls.enabled = false;
+  _videoCurves = curves;
+  _videoDurationMs = durationMs;
+  _videoStartTs = performance.now();
+  _currentTick = videoTick;
+}
+
+function stopVideoTick() {
+  _currentTick = interactiveTick;
+  if (typeof controls !== 'undefined' && controls && _videoCurves) {
+    const endTgt = _videoCurves.targetCurve.getPointAt(1);
+    controls.target.copy(endTgt);
+    controls.enabled = true;
+  }
+  _videoCurves = null;
+  _videoStartTs = 0;
+}
+
+function pauseVideoTick() {
+  if (_videoState !== 'preview' && _videoState !== 'recording') return;
+  _videoPrevMode = _videoState;
+  _videoPauseElapsed = performance.now() - _videoStartTs;
+  _currentTick = interactiveTick;
+  if (_videoState === 'recording' && _currentRecorder && _currentRecorder.state === 'recording') {
+    try { _currentRecorder.pause(); } catch (e) { console.warn('pause failed', e); }
+  }
+  _videoState = 'paused';
+}
+
+function resumeVideoTick() {
+  if (_videoPauseElapsed === null || !_videoPrevMode) return;
+  _videoStartTs = performance.now() - _videoPauseElapsed;
+  _videoPauseElapsed = null;
+  _currentTick = videoTick;
+  const wasMode = _videoPrevMode;
+  _videoState = wasMode;
+  _videoPrevMode = null;
+  if (wasMode === 'recording' && _currentRecorder && _currentRecorder.state === 'paused') {
+    try { _currentRecorder.resume(); } catch (e) { console.warn('resume failed', e); }
+  }
+}
+
+function resetRecordingUI() {
+  _currentRecorder = null;
+  _videoCancelled = false;
+  _sceneOverlay.setSunset(false);
+  document.getElementById('vp-progress').style.display = 'none';
+  document.getElementById('vp-progress-bar').style.width = '0%';
+  const status = document.getElementById('vp-progress-status');
+  if (status && status.parentNode) status.parentNode.removeChild(status);
+  const pauseBtn = document.getElementById('vp-pause');
+  const cancelBtn = document.getElementById('vp-cancel');
+  if (pauseBtn) {
+    pauseBtn.disabled = false;
+    pauseBtn.style.opacity = '';
+    pauseBtn.textContent = '⏸ Pauza';
+  }
+  if (cancelBtn) {
+    cancelBtn.disabled = false;
+    cancelBtn.style.opacity = '';
+  }
+  document.getElementById('vp-preview').disabled = false;
+  document.getElementById('vp-export').disabled = false;
+  const closeBtn = document.getElementById('vp-close');
+  if (closeBtn) {
+    closeBtn.style.opacity = '';
+    closeBtn.style.pointerEvents = '';
+  }
+  const bmsel = document.getElementById('basemap-select');
+  if (bmsel) bmsel.disabled = false;
+  const oqsel = document.getElementById('ortho-quality');
+  if (oqsel) oqsel.disabled = false;
+  _videoState = 'panel';
+}
+
+function cancelVideoTick() {
+  if (_videoState !== 'preview' && _videoState !== 'recording' && _videoState !== 'paused') return;
+  _videoCancelled = true;
+  if (_currentRecorder) {
+    try {
+      if (_currentRecorder.state !== 'inactive') _currentRecorder.stop();
+    } catch (e) { console.warn('cancel stop failed', e); }
+  }
+  stopVideoTick();
+  _videoPauseElapsed = null;
+  _videoPrevMode = null;
+  // resetRecordingUI handles sunset tint, progress, buttons, _videoCancelled, _videoState
+  resetRecordingUI();
+}
+
+// HUD overlay rendered via a separate Orthographic scene drawn after the
+// main scene. This gives MediaRecorder a baked-in info pill in the canvas.
+let _hudCanvas = null, _hudTexture = null, _hudMesh = null, _hudScene = null, _hudCam = null;
+
+function initHud() {
+  if (_hudCanvas) return;
+  _hudCanvas = document.createElement('canvas');
+  _hudCanvas.width = 512;
+  _hudCanvas.height = 96;
+  _hudTexture = new THREE.CanvasTexture(_hudCanvas);
+  _hudTexture.minFilter = THREE.LinearFilter;
+  _hudTexture.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: _hudTexture, transparent: true, depthTest: false });
+  const geo = new THREE.PlaneGeometry(1, 1);
+  _hudMesh = new THREE.Mesh(geo, mat);
+  _hudScene = new THREE.Scene();
+  _hudScene.add(_hudMesh);
+  _hudCam = new THREE.OrthographicCamera(0, 1, 1, 0, 0, 1);
+}
+
+function drawHudText(label, area, useLabel) {
+  initHud();
+  const c = _hudCanvas;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  // Background pill.
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  const r = 12;
+  ctx.beginPath();
+  ctx.roundRect(0, 0, c.width, c.height, r);
+  ctx.fill();
+  // Text.
+  ctx.fillStyle = 'white';
+  ctx.font = '600 24px system-ui, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillText(label, 16, 14);
+  ctx.font = '400 18px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  const fmtArea = `${area.toLocaleString('cs-CZ')} m²`;
+  ctx.fillText(`${fmtArea} · ${useLabel || '—'}`, 16, 50);
+  _hudTexture.needsUpdate = true;
+}
+
+function blitOverlay() {
+  if (!_hudMesh) return;
+  // Position pill at lower-left, 16 px from edges, fixed pixel size.
+  const W = renderer.domElement.width;
+  const H = renderer.domElement.height;
+  const pillW = 320, pillH = 60;
+  const x = 16 / W;
+  const y = 16 / H;
+  const w = pillW / W;
+  const h = pillH / H;
+  _hudMesh.scale.set(w, h, 1);
+  _hudMesh.position.set(x + w / 2, y + h / 2, 0);
+  // We must not let the auto-clear wipe the main scene; render the HUD
+  // with autoClear off.
+  const wasAutoClear = renderer.autoClear;
+  renderer.autoClear = false;
+  renderer.render(_hudScene, _hudCam);
+  renderer.autoClear = wasAutoClear;
+}
+
+// Stub for Task 8 to override.
+let _onVideoComplete = function () {
+  stopVideoTick();
+};
+
+function openVideoPanel(parcel) {
+  const ring = parcel.ring_local;
+  if (!ring || ring.length < 3) return;
+  const sg = computeSubjectGeometry(ring);
+  const buildingIdx = findSubjectBuildingIdx(ring);
+  _videoSubject = {
+    parcel,
+    label: parcel.label,
+    area_m2: parcel.area_m2,
+    use_label: parcel.use_label,
+    ring_local: ring,
+    centroid: sg.centroid,
+    diagonal: sg.diagonal,
+    groundY: sg.groundY,
+    building_idx: buildingIdx,
+  };
+  document.getElementById('vp-label').textContent = `parcela ${parcel.label}`;
+  document.getElementById('vp-area').textContent  = parcel.area_m2.toLocaleString('cs-CZ');
+  document.getElementById('vp-use').textContent   = parcel.use_label || '—';
+  document.getElementById('video-panel').style.display = 'block';
+  _videoStartAngleDeg = 0;
+  _videoStartDistanceMul = 1.0;
+  document.getElementById('vp-start-angle').value = 0;
+  document.getElementById('vp-start-angle-val').textContent = '0';
+  document.getElementById('vp-start-dist').value = '1.0';
+  document.getElementById('vp-start-dist-val').textContent = '1.00';
+  // Prefer building č.p. when subject building is found; else "parcela <label>".
+  let hudTitle = `parcela ${parcel.label}`;
+  if (buildingIdx >= 0) {
+    const b = ruianBuildings[buildingIdx];
+    if (b && b.cislo) {
+      hudTitle = `č.p. ${b.cislo}`;
+    }
+  }
+  drawHudText(hudTitle, parcel.area_m2, parcel.use_label);
+  _sceneOverlay.apply(_videoSubject, _videoMode);
+  _videoState = 'panel';
+}
+
+function openVideoPanelFreeMode() {
+  // Synthesize a "subject" from the current camera/controls state.
+  // No parcel ring, so applyPresentationMode is skipped; we still want
+  // the subject highlight controls to render but they have no effect.
+  const tgt = controls.target;
+  // Use camera distance to estimate scene scale.
+  const dx = camera.position.x - tgt.x;
+  const dz = camera.position.z - tgt.z;
+  const dist = Math.hypot(dx, dz);
+  _videoSubject = {
+    parcel: { id: null, label: 'aktuální pohled', area_m2: 0, use_label: '—' },
+    label: 'aktuální pohled',
+    area_m2: 0,
+    use_label: '—',
+    ring_local: null,
+    centroid: [tgt.x, tgt.z],
+    diagonal: Math.max(80, dist * 0.8),
+    groundY: tgt.y,
+    building_idx: -1,
+    free: true,    // marker so we don't try to applyPresentationMode
+  };
+  document.getElementById('vp-label').textContent = 'aktuální pohled';
+  document.getElementById('vp-area').textContent  = '—';
+  document.getElementById('vp-use').textContent   = 'volný přílet';
+  document.getElementById('video-panel').style.display = 'block';
+  _videoStartAngleDeg = 0;
+  _videoStartDistanceMul = 1.0;
+  document.getElementById('vp-start-angle').value = 0;
+  document.getElementById('vp-start-angle-val').textContent = '0';
+  document.getElementById('vp-start-dist').value = '1.0';
+  document.getElementById('vp-start-dist-val').textContent = '1.00';
+  drawHudText('Hnojice — volný přílet', 0, '');
+  // applyPresentationMode early-returns on subject.free; overlay.apply is safe.
+  _sceneOverlay.apply(_videoSubject, _videoMode);
+  _videoState = 'panel';
+}
+
+function closeVideoPanel() {
+  if (_videoState === 'preview' || _videoState === 'recording' ||
+      _videoState === 'paused' || _videoState === 'converting') {
+    return;  // refuse to close mid-record or mid-conversion
+  }
+  document.getElementById('video-panel').style.display = 'none';
+  _sceneOverlay.clear();
+  _videoSubject = null;
+  _videoState = 'idle';
+}
+
+document.getElementById('vp-close').addEventListener('click', closeVideoPanel);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _videoState === 'panel') closeVideoPanel();
+});
+
+document.querySelectorAll('input[name=vp-preset]').forEach(r => {
+  r.addEventListener('change', () => {
+    if (_videoState !== 'panel') return;
+    _videoPreset = r.value;
+    const defaults = {
+      topdown: 15, highorbit360: 30, halforbit: 15,
+      revealpullup: 25, divepush: 20, locator: 20,
+      contextarc: 25, lateralflyby: 15, sunsetorbit: 15,
+    };
+    const slider = document.getElementById('vp-duration');
+    slider.value = defaults[_videoPreset] || 25;
+    document.getElementById('vp-duration-val').textContent = slider.value;
+    _videoDurationMs = parseInt(slider.value) * 1000;
+  });
+});
+document.querySelectorAll('input[name=vp-mode]').forEach(r => {
+  r.addEventListener('change', () => {
+    if (_videoState !== 'panel') return;
+    _videoMode = r.value;
+    if (_videoSubject) {
+      _sceneOverlay.apply(_videoSubject, _videoMode);
+    }
+  });
+});
+document.getElementById('vp-overlay').addEventListener('change', e => {
+  if (_videoState !== 'panel') return;
+  _videoOverlay = e.target.checked;
+});
+document.querySelectorAll('input[name=vp-hl]').forEach(cb => {
+  cb.addEventListener('change', () => {
+    if (_videoState !== 'panel') return;
+    _videoHighlights[cb.value] = cb.checked;
+    if (_videoSubject) {
+      _sceneOverlay.apply(_videoSubject, _videoMode);
+    }
+  });
+});
+document.getElementById('vp-duration').addEventListener('input', e => {
+  if (_videoState !== 'panel') return;
+  document.getElementById('vp-duration-val').textContent = e.target.value;
+  _videoDurationMs = parseInt(e.target.value) * 1000;
+});
+document.getElementById('vp-start-angle').addEventListener('input', e => {
+  if (_videoState !== 'panel') return;
+  _videoStartAngleDeg = parseInt(e.target.value);
+  document.getElementById('vp-start-angle-val').textContent = _videoStartAngleDeg;
+});
+document.getElementById('vp-start-dist').addEventListener('input', e => {
+  if (_videoState !== 'panel') return;
+  _videoStartDistanceMul = parseFloat(e.target.value);
+  document.getElementById('vp-start-dist-val').textContent = _videoStartDistanceMul.toFixed(2);
+});
+document.getElementById('vp-preview').addEventListener('click', () => {
+  if (!_videoSubject || _videoState === 'preview' || _videoState === 'recording' || _videoState === 'paused' || _videoState === 'converting') return;
+  const subjectForPath = {
+    centroid: _videoSubject.centroid,
+    groundY: _videoSubject.groundY,
+    diagonal: _videoSubject.diagonal,
+  };
+  const curves = applyStartTransform(buildCameraPath(_videoPreset, subjectForPath), subjectForPath);
+  _videoState = 'preview';
+  document.getElementById('vp-preview').disabled = true;
+  document.getElementById('vp-export').disabled = true;
+  // Show progress bar.
+  const prog = document.getElementById('vp-progress');
+  const bar = document.getElementById('vp-progress-bar');
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+  // Drive the bar from rAF since the duration is known.
+  const updateBar = () => {
+    if (_videoState !== 'preview' && _videoState !== 'paused') return;
+    const elapsed = _videoState === 'paused' ? _videoPauseElapsed : (performance.now() - _videoStartTs);
+    const t = Math.min(1, elapsed / _videoDurationMs);
+    bar.style.width = `${(t * 100).toFixed(1)}%`;
+    if (t < 1) requestAnimationFrame(updateBar);
+  };
+  requestAnimationFrame(updateBar);
+  _sceneOverlay.setSunset(_videoPreset === 'sunsetorbit');
+  startVideoTick(curves, _videoDurationMs);
+});
+
+// Override the placeholder _onVideoComplete from Task 5.
+_onVideoComplete = function () {
+  stopVideoTick();
+  _sceneOverlay.setSunset(false);
+  if (_videoState === 'preview') {
+    // Preview-only path: do the full UI reset right now.
+    document.getElementById('vp-progress').style.display = 'none';
+    document.getElementById('vp-progress-bar').style.width = '0%';
+    document.getElementById('vp-preview').disabled = false;
+    document.getElementById('vp-export').disabled = false;
+    _videoState = 'panel';
+  } else if (_videoState === 'recording') {
+    // Recording path: do NOT touch progress/buttons here — recorder.onstop
+    // will keep the progress visible during MP4 conversion and reset
+    // everything once conversion completes (or fails).
+    if (typeof _onRecordingFrameComplete === 'function') _onRecordingFrameComplete();
+  }
+};
+
+// Task 9 — Export: record canvas via MediaRecorder, download webm.
+function pickWebmMime() {
+  const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const m of candidates) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return 'video/webm';
+}
+
+async function ensureFfmpeg() {
+  if (_ffmpegInstance) return _ffmpegInstance;
+  if (_ffmpegLoading) return _ffmpegLoading;
+  _ffmpegLoading = (async () => {
+    const FFmpegMod = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js');
+    const ffmpeg = new FFmpegMod.FFmpeg();
+    // Workers loaded from cross-origin URLs are blocked by the browser.
+    // Fetch each script as bytes and turn into a same-origin blob URL.
+    const fetchAsBlobURL = async (url, mimeType) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`fetch ${url}: HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+      return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+    };
+    const [classWorkerURL, coreURL, wasmURL] = await Promise.all([
+      fetchAsBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js', 'text/javascript'),
+      fetchAsBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js', 'text/javascript'),
+      fetchAsBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm', 'application/wasm'),
+    ]);
+    await ffmpeg.load({ classWorkerURL, coreURL, wasmURL });
+    _ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+  try {
+    return await _ffmpegLoading;
+  } catch (err) {
+    _ffmpegLoading = null;  // allow retry on next Export
+    throw err;
+  }
+}
+
+async function transcodeWebmToMp4(webmBlob, onProgress) {
+  const ffmpeg = await ensureFfmpeg();
+  let progressHandler = null;
+  if (onProgress) {
+    progressHandler = ({ progress }) => onProgress(Math.max(0, Math.min(1, progress)));
+    ffmpeg.on('progress', progressHandler);
+  }
+  try {
+    const inputBytes = new Uint8Array(await webmBlob.arrayBuffer());
+    await ffmpeg.writeFile('input.webm', inputBytes);
+    await ffmpeg.exec([
+      '-i', 'input.webm',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      'output.mp4',
+    ]);
+    const outBytes = await ffmpeg.readFile('output.mp4');
+    try { await ffmpeg.deleteFile('input.webm'); } catch (e) {}
+    try { await ffmpeg.deleteFile('output.mp4'); } catch (e) {}
+    const buffer = outBytes instanceof Uint8Array ? outBytes.buffer : outBytes;
+    return new Blob([buffer], { type: 'video/mp4' });
+  } finally {
+    if (progressHandler) ffmpeg.off('progress', progressHandler);
+  }
+}
+
+let _onRecordingFrameComplete = null;     // assigned per recording session
+
+document.getElementById('vp-export').addEventListener('click', () => {
+  if (!_videoSubject || _videoState === 'preview' || _videoState === 'recording' || _videoState === 'paused' || _videoState === 'converting') return;
+  const subjectForPath = {
+    centroid: _videoSubject.centroid,
+    groundY: _videoSubject.groundY,
+    diagonal: _videoSubject.diagonal,
+  };
+  const curves = applyStartTransform(buildCameraPath(_videoPreset, subjectForPath), subjectForPath);
+
+  const stream = renderer.domElement.captureStream(30);
+  const mime = pickWebmMime();
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: 8_000_000,
+    });
+  } catch (err) {
+    alert(`MediaRecorder unsupported: ${err.message}`);
+    return;
+  }
+  _currentRecorder = recorder;
+  _videoCancelled = false;
+  const chunks = [];
+  recorder.ondataavailable = e => e.data && e.data.size && chunks.push(e.data);
+
+  _videoState = 'recording';
+  document.getElementById('vp-preview').disabled = true;
+  document.getElementById('vp-export').disabled = true;
+  document.getElementById('vp-close').style.opacity = '0.4';
+  document.getElementById('vp-close').style.pointerEvents = 'none';
+  const bmsel = document.getElementById('basemap-select');
+  if (bmsel) bmsel.disabled = true;
+  const oqsel = document.getElementById('ortho-quality');
+  if (oqsel) oqsel.disabled = true;
+  const prog = document.getElementById('vp-progress');
+  const bar  = document.getElementById('vp-progress-bar');
+  prog.style.display = 'block';
+  bar.style.width = '0%';
+  const updateBarRec = () => {
+    if (_videoState !== 'recording' && _videoState !== 'paused') return;
+    const elapsed = _videoState === 'paused' ? _videoPauseElapsed : (performance.now() - _videoStartTs);
+    const t = Math.min(1, elapsed / _videoDurationMs);
+    bar.style.width = `${(t * 100).toFixed(1)}%`;
+    if (t < 1) requestAnimationFrame(updateBarRec);
+  };
+  requestAnimationFrame(updateBarRec);
+
+  recorder.onerror = (ev) => {
+    console.error('MediaRecorder error', ev);
+    alert('Chyba nahrávání: ' + (ev?.error?.message || 'unknown'));
+    _onRecordingFrameComplete = null;
+    stopVideoTick();
+    resetRecordingUI();
+  };
+
+  _onRecordingFrameComplete = () => {
+    _onRecordingFrameComplete = null;
+    // Defer stop one frame so captureStream pulls the final rendered frame.
+    requestAnimationFrame(() => requestAnimationFrame(() => recorder.stop()));
+    recorder.onstop = async () => {
+      _currentRecorder = null;
+      if (_videoCancelled) {
+        _videoCancelled = false;
+        // Skip download. cancelVideoTick already restored UI.
+        return;
+      }
+      const webmBlob = new Blob(chunks, { type: mime });
+      // Transition to 'converting' state. Pause/Cancel are not meaningful here.
+      _videoState = 'converting';
+      document.getElementById('vp-progress').style.display = 'block';
+      const bar = document.getElementById('vp-progress-bar');
+      const pauseBtn = document.getElementById('vp-pause');
+      const cancelBtn = document.getElementById('vp-cancel');
+      pauseBtn.disabled = true;
+      cancelBtn.disabled = true;
+      pauseBtn.style.opacity = '0.4';
+      cancelBtn.style.opacity = '0.4';
+      // Status text below progress bar.
+      let statusEl = document.getElementById('vp-progress-status');
+      if (!statusEl) {
+        statusEl = document.createElement('div');
+        statusEl.id = 'vp-progress-status';
+        statusEl.style.cssText = 'font-size:11px;color:#666;margin-top:4px';
+        document.getElementById('vp-progress').appendChild(statusEl);
+      }
+      statusEl.textContent = 'Převádím na MP4…';
+      bar.style.width = '0%';
+      let outBlob, ext;
+      try {
+        outBlob = await transcodeWebmToMp4(webmBlob, (p) => {
+          bar.style.width = `${(p * 100).toFixed(1)}%`;
+        });
+        ext = 'mp4';
+      } catch (err) {
+        console.error('mp4 conversion failed', err);
+        statusEl.textContent = 'MP4 konverze selhala — stahuji webm';
+        outBlob = webmBlob;
+        ext = 'webm';
+      }
+      // Trigger download.
+      const url = URL.createObjectURL(outBlob);
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      a.href = url;
+      a.download = `parcela-${_videoSubject.label.replace(/[\\/]/g, '-')}-${_videoPreset}-${ts}.${ext}`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      // Reset UI.
+      resetRecordingUI();
+    };
+  };
+
+  try {
+    recorder.start();
+  } catch (err) {
+    alert(`MediaRecorder.start() failed: ${err.message}`);
+    _onRecordingFrameComplete = null;
+    resetRecordingUI();
+    return;
+  }
+  _sceneOverlay.setSunset(_videoPreset === 'sunsetorbit');
+  startVideoTick(curves, _videoDurationMs);
+});
+
+document.getElementById('vp-pause').addEventListener('click', () => {
+  const pb = document.getElementById('vp-pause');
+  if (_videoState === 'preview' || _videoState === 'recording') {
+    pauseVideoTick();
+    pb.textContent = '▶ Pokračovat';
+  } else if (_videoState === 'paused') {
+    resumeVideoTick();
+    pb.textContent = '⏸ Pauza';
+  }
+});
+document.getElementById('vp-cancel').addEventListener('click', () => {
+  cancelVideoTick();
+});
+
+function buildParcelGroup(parcels) {
+  const group = new THREE.Group();
+  for (const p of parcels) {
+    const ring = p.ring_local;
+    if (!ring || ring.length < 3) continue;
+    const color = PARCEL_COLORS[p.use_code] ?? PARCEL_FALLBACK;
+
+    // Top face — triangulate the 2D outline; apply per-vertex Y from ring.
+    const contour = ring.map(([x, z]) => new THREE.Vector2(x, z));
+    const tris = THREE.ShapeUtils.triangulateShape(contour, []);
+    const topPos = new Float32Array(ring.length * 3);
+    for (let i = 0; i < ring.length; i++) {
+      const [x, z, y] = ring[i];
+      topPos[i*3]     = x;
+      topPos[i*3 + 1] = y + PARCEL_LIFT + PARCEL_TILE_H;
+      topPos[i*3 + 2] = z;
+    }
+    const topIdx = [];
+    for (const t of tris) topIdx.push(t[0], t[1], t[2]);
+    const topGeo = new THREE.BufferGeometry();
+    topGeo.setAttribute('position', new THREE.BufferAttribute(topPos, 3));
+    topGeo.setIndex(topIdx);
+    topGeo.computeVertexNormals();
+    const topMat = new THREE.MeshStandardMaterial({
+      color, transparent: true, opacity: 0.55, depthWrite: false,
+      roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
+    });
+    const topMesh = new THREE.Mesh(topGeo, topMat);
+    topMesh.renderOrder = 1;
+
+    // Sides — quad per ring edge.
+    const sidePos = [];
+    const sideIdx = [];
+    for (let i = 0; i < ring.length; i++) {
+      const [ax, az, ay] = ring[i];
+      const [bx, bz, by] = ring[(i + 1) % ring.length];
+      const base = sidePos.length / 3;
+      sidePos.push(
+        ax, ay + PARCEL_LIFT,                  az,
+        bx, by + PARCEL_LIFT,                  bz,
+        bx, by + PARCEL_LIFT + PARCEL_TILE_H,  bz,
+        ax, ay + PARCEL_LIFT + PARCEL_TILE_H,  az,
+      );
+      sideIdx.push(base, base+1, base+2,  base, base+2, base+3);
+    }
+    const sideGeo = new THREE.BufferGeometry();
+    sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
+    sideGeo.setIndex(sideIdx);
+    sideGeo.computeVertexNormals();
+    const sideMat = new THREE.MeshStandardMaterial({
+      color, transparent: true, opacity: 0.85,
+      roughness: 0.9, metalness: 0.0,
+    });
+    const sideMesh = new THREE.Mesh(sideGeo, sideMat);
+    sideMesh.renderOrder = 1;
+
+    const parcelGroup = new THREE.Group();
+    parcelGroup.add(topMesh);
+    parcelGroup.add(sideMesh);
+    topMesh.userData = { parcel: p };   // read by click + hover raycast
+    group.add(parcelGroup);
+    _parcelMeshes.push(topMesh);
+  }
+  return group;
+}
+
+function buildSelectedParcelMesh(parcel) {
+  const ring = parcel.ring_local;
+  if (!ring || ring.length < 3) return null;
+
+  // ── 1. Compute parcel bbox in LOCAL coords ─────────────────────────
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const [x, z] of ring) {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+  }
+  // Pad bbox so the outline stroke isn't clipped at edges of the texture.
+  const PAD = 6;   // meters
+  const bxMin = minX - PAD, bxMax = maxX + PAD;
+  const bzMin = minZ - PAD, bzMax = maxZ + PAD;
+  const bWidth = bxMax - bxMin, bHeight = bzMax - bzMin;
+
+  // ── 2. Generate the outline texture on a Canvas ────────────────────
+  // Resolution: ~10 px per meter, capped to keep memory reasonable.
+  const PX_PER_M = 10;
+  const TEX_W = Math.min(2048, Math.ceil(bWidth * PX_PER_M));
+  const TEX_H = Math.min(2048, Math.ceil(bHeight * PX_PER_M));
+  const canvas = document.createElement('canvas');
+  canvas.width = TEX_W; canvas.height = TEX_H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, TEX_W, TEX_H);
+  // Map ring vertices from world coords to canvas pixel coords.
+  const toCanvas = ([x, z]) => {
+    const cx = ((x - bxMin) / bWidth) * TEX_W;
+    const cy = ((z - bzMin) / bHeight) * TEX_H;
+    return [cx, cy];
+  };
+  // Draw the outline (closed polygon stroke).
+  ctx.lineWidth = 6;                    // pixels of canvas → ~0.6 m at 10 px/m
+  ctx.strokeStyle = '#fde047';          // yellow
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  const [x0, y0] = toCanvas(ring[0]);
+  ctx.moveTo(x0, y0);
+  for (let i = 1; i < ring.length; i++) {
+    const [px, py] = toCanvas(ring[i]);
+    ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  // Optional dark inner stroke for readability against bright ortho.
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(60,30,0,0.85)';
+  ctx.stroke();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+
+  // ── 3. Find terrain tiles that overlap the parcel bbox ─────────────
+  const overlapTiles = [];
+  for (const m of allMeshes) {
+    if (!m.geometry) continue;
+    if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
+    const bb = m.geometry.boundingBox;
+    if (!bb) continue;
+    if (bb.max.x < bxMin || bb.min.x > bxMax) continue;
+    if (bb.max.z < bzMin || bb.min.z > bzMax) continue;
+    overlapTiles.push(m);
+  }
+  if (overlapTiles.length === 0) return null;
+
+  // ── 4. For each overlap tile, build a face-filtered, UV-mapped mesh
+  //      that paints the outline texture onto the terrain surface. ──
+  const group = new THREE.Group();
+  for (const tileMesh of overlapTiles) {
+    const tileGeo = tileMesh.geometry;
+    const pos = tileGeo.attributes.position.array;
+    const idx = tileGeo.index ? tileGeo.index.array : null;
+    if (!idx) continue;   // expecting indexed geometry (GLB tiles are)
+
+    // Filter faces: keep only those with |normal.y| > 0.5 AND that have
+    // at least one vertex inside the parcel bbox (to keep mesh small).
+    const keepFaces = [];
+    for (let f = 0; f < idx.length; f += 3) {
+      const a = idx[f], b = idx[f+1], c = idx[f+2];
+      const ax = pos[a*3], ay = pos[a*3+1], az = pos[a*3+2];
+      const bx = pos[b*3], by = pos[b*3+1], bz = pos[b*3+2];
+      const cx = pos[c*3], cy = pos[c*3+1], cz = pos[c*3+2];
+      // Bbox quick reject (any vertex outside expanded bbox by PAD)
+      const bxMinTri = Math.min(ax, bx, cx), bxMaxTri = Math.max(ax, bx, cx);
+      const bzMinTri = Math.min(az, bz, cz), bzMaxTri = Math.max(az, bz, cz);
+      if (bxMaxTri < bxMin || bxMinTri > bxMax) continue;
+      if (bzMaxTri < bzMin || bzMinTri > bzMax) continue;
+      // Normal Y filter
+      const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+      const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+      const nx = e1y*e2z - e1z*e2y;
+      const ny = e1z*e2x - e1x*e2z;
+      const nz = e1x*e2y - e1y*e2x;
+      const nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+      if (nlen < 1e-6) continue;
+      const nyNorm = Math.abs(ny) / nlen;
+      if (nyNorm <= 0.5) continue;     // skip walls
+      keepFaces.push(a, b, c);
+    }
+    if (keepFaces.length === 0) continue;
+
+    // Compute UVs for ALL vertices (we share the position buffer; unused
+    // vertices have arbitrary UV — they're not referenced via index).
+    const uvs = new Float32Array((pos.length / 3) * 2);
+    for (let i = 0; i < pos.length / 3; i++) {
+      const vx = pos[i*3];
+      const vz = pos[i*3+2];
+      uvs[i*2]     = (vx - bxMin) / bWidth;
+      uvs[i*2 + 1] = 1.0 - (vz - bzMin) / bHeight;
+    }
+
+    const overlayGeo = new THREE.BufferGeometry();
+    overlayGeo.setAttribute('position', tileGeo.attributes.position.clone());
+    overlayGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    overlayGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(keepFaces), 1));
+
+    const overlayMat = new THREE.MeshBasicMaterial({
+      map: tex,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      alphaTest: 0.05,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+    });
+    const overlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
+    overlayMesh.renderOrder = 101;     // above cadastre overlay (100)
+    overlayMesh.userData = { selectedParcel: parcel };
+    group.add(overlayMesh);
+  }
+  if (group.children.length === 0) return null;
+  return group;
+}
+
+function clearSelectedParcel() {
+  if (_selectedParcelMesh) {
+    scene.remove(_selectedParcelMesh);
+    _selectedParcelMesh.traverse(node => {
+      if (node.geometry) node.geometry.dispose();
+      if (node.material) node.material.dispose();
+    });
+    _selectedParcelMesh = null;
+  }
+}
+
+async function selectParcelAtClick(localX, localZ) {
+  const seq = ++_selectClickSeq;
+  const sx = localX + gcx;
+  const sy = -localZ + gcy;
+  try {
+    const r = await fetch(`/api/parcel-at-point?gcx=${gcx}&gcy=${gcy}&sx=${sx}&sy=${sy}`);
+    if (seq !== _selectClickSeq) return null;   // stale, drop
+    if (r.status === 404) {
+      clearSelectedParcel();
+      return null;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const parcel = await r.json();
+    if (seq !== _selectClickSeq) return null;   // also stale
+    clearSelectedParcel();
+    const mesh = buildSelectedParcelMesh(parcel);
+    if (mesh) {
+      _selectedParcelMesh = mesh;
+      scene.add(mesh);
+    }
+    return parcel;
+  } catch (err) {
+    console.error('selectParcelAtClick', err);
+    return null;
+  }
+}
+
+async function ensureParcelsData() {
+  if (_parcels) return _parcels;
+  const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=2000`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  _parcels = await r.json();
+  return _parcels;
+}
+
+async function ensureParcels() {
+  if (_parcelGroup) return _parcelGroup;
+  await ensureParcelsData();
+  _parcelGroup = buildParcelGroup(_parcels);
+  scene.add(_parcelGroup);
+  return _parcelGroup;
+}
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 5000);
+camera.position.set(200, 150, 200);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.15;
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+controls.screenSpacePanning = true;
+controls.minDistance = 1;
+controls.maxDistance = 2000;
+controls.maxPolarAngle = Math.PI / 2.05;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const dir = new THREE.DirectionalLight(0xffffff, 0.5);
+dir.position.set(100, 200, 100);
+dir.castShadow = true;
+scene.add(dir);
+
+const allMeshes = [];
+let origPositions = [];
+const texLoader = new THREE.TextureLoader();
+const gltfLoader = new GLTFLoader();
+const useGLB = true;
+
+dataLoaded.then(() => {
+  for (const tile of tiles) {
+    if (useGLB && tile.glb_url) {
+      const setupMesh = (geometry) => {
+        const mat = new THREE.MeshBasicMaterial({ vertexColors: false, side: THREE.DoubleSide });
+        const mesh = new THREE.Mesh(geometry, mat);
+        mesh.userData = { tile, mat, geo: geometry, ortofotoTexture: null, ortofotoLoaded: false };
+        scene.add(mesh);
+        allMeshes.push(mesh);
+  
+        // Load ortofoto
+        const bbox = tile.sjtsk_bbox;
+        const wbbox = tile.wgs_bbox;
+        const ortSize = document.getElementById('ortho-quality').value;
+        const ortUrl = `/proxy/ortofoto?BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WBBOX=${wbbox[0]},${wbbox[1]},${wbbox[2]},${wbbox[3]}&size=${ortSize}`;
+        texLoader.load(ortUrl, (texture) => {
+          texture.colorSpace = THREE.SRGBColorSpace;
+          mesh.material.map = texture;
+          mesh.material.needsUpdate = true;
+          mesh.userData.ortofotoLoaded = true;
+          mesh.userData.ortofotoTexture = texture;
+        });
+      };
+  
+      gltfLoader.load(tile.glb_url, (gltf) => {
+        let m = gltf.scene.children[0];
+        if (m && !m.isMesh && m.children[0]) m = m.children[0];
+        if (m) setupMesh(m.geometry);
+      });
+      continue;
+    }
+  
+    const geo = new THREE.BufferGeometry();
+    const nFaceVerts = tile.faces.length * 3;
+    const positions = new Float32Array(nFaceVerts * 3);
+    const texUvs = new Float32Array(nFaceVerts * 2);
+  
+    let idx = 0, uvIdx = 0;
+    for (const face of tile.faces) {
+      for (const vi of face) {
+        const v = tile.vertices[vi];
+        positions[idx++] = v[0] + tile.offset_x;
+        positions[idx++] = v[1];
+        positions[idx++] = v[2] + tile.offset_z;
+        const uv = tile.uvs[vi];
+        texUvs[uvIdx++] = uv[0];
+        texUvs[uvIdx++] = uv[1];
+      }
+    }
+  
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(texUvs, 2));
+    geo.computeVertexNormals();
+  
+    // Height colors
+    const colors = new Float32Array(nFaceVerts * 3);
+    for (let i = 0; i < positions.length; i += 3) {
+      const h = positions[i + 1];
+      let r, g, b;
+      if (h < 0.3) { r=0.3; g=0.65; b=0.2; }
+      else if (h < 2) { r=0.5; g=0.7; b=0.3; }
+      else if (h < 4) { r=0.92; g=0.88; b=0.78; }
+      else if (h < 8) { r=0.85; g=0.35; b=0.25; }
+      else { r=0.55; g=0.15; b=0.15; }
+      colors[i]=r; colors[i+1]=g; colors[i+2]=b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  
+    // MeshBasicMaterial = no lighting (true ortofoto colors)
+    // MeshStandardMaterial = with lighting (adds 3D depth via shadows)
+    const mat = new THREE.MeshBasicMaterial({
+      vertexColors: true, side: THREE.DoubleSide,
+    });
+    const matLit = new THREE.MeshStandardMaterial({
+      roughness: 1.0, side: THREE.DoubleSide,
+    });
+    const matDark = new THREE.MeshBasicMaterial({
+      side: THREE.DoubleSide, color: 0xbbbbbb,  // darken texture
+    });
+  
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData = { tile, mat, matLit, matDark, geo, ortofotoTexture: null, ortofotoLoaded: false };
+    scene.add(mesh);
+    allMeshes.push(mesh);
+  
+    // Load ortofoto for this tile
+    const bbox = tile.sjtsk_bbox;
+    const wbbox = tile.wgs_bbox;
+    const ortUrl = `/proxy/ortofoto?BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WBBOX=${wbbox[0]},${wbbox[1]},${wbbox[2]},${wbbox[3]}`;
+    texLoader.load(ortUrl, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+      mesh.userData.ortofotoTexture = texture;
+      mesh.userData.ortofotoLoaded = true;
+      mat.map = texture;
+      mat.vertexColors = false;
+      mat.needsUpdate = true;
+      matLit.map = texture;
+      matLit.needsUpdate = true;
+      matDark.map = texture;
+      matDark.needsUpdate = true;
+      // Also apply to simplified mesh
+      if (mesh.userData.simpMesh) {
+        mesh.userData.simpMesh.material.map = texture;
+        mesh.userData.simpMesh.material.vertexColors = false;
+        mesh.userData.simpMesh.material.needsUpdate = true;
+        mesh.userData.simpMesh.userData.ortofotoLoaded = true;
+        mesh.userData.simpMesh.userData.ortofotoTexture = texture;
+      }
+    });
+  
+    // Build simplified mesh
+    if (tile.simp_vertices && tile.simp_faces.length > 0) {
+      const sGeo = new THREE.BufferGeometry();
+      const sNFV = tile.simp_faces.length * 3;
+      const sPos = new Float32Array(sNFV * 3);
+      const sUvs = new Float32Array(sNFV * 2);
+      let si = 0, su = 0;
+      for (const face of tile.simp_faces) {
+        for (const vi of face) {
+          const v = tile.simp_vertices[vi];
+          sPos[si++] = v[0] + tile.offset_x;
+          sPos[si++] = v[1];
+          sPos[si++] = v[2] + tile.offset_z;
+          const uv = tile.simp_uvs[vi];
+          sUvs[su++] = uv[0];
+          sUvs[su++] = uv[1];
+        }
+      }
+      sGeo.setAttribute('position', new THREE.BufferAttribute(sPos, 3));
+      sGeo.setAttribute('uv', new THREE.BufferAttribute(sUvs, 2));
+      sGeo.computeVertexNormals();
+  
+      // Height colors
+      const sCol = new Float32Array(sNFV * 3);
+      for (let i = 0; i < sPos.length; i += 3) {
+        const h = sPos[i + 1];
+        let r, g, b;
+        if (h < 0.3) { r=0.3; g=0.65; b=0.2; }
+        else if (h < 2) { r=0.5; g=0.7; b=0.3; }
+        else if (h < 4) { r=0.92; g=0.88; b=0.78; }
+        else if (h < 8) { r=0.85; g=0.35; b=0.25; }
+        else { r=0.55; g=0.15; b=0.15; }
+        sCol[i]=r; sCol[i+1]=g; sCol[i+2]=b;
+      }
+      sGeo.setAttribute('color', new THREE.BufferAttribute(sCol, 3));
+  
+      const sMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+      const sMesh = new THREE.Mesh(sGeo, sMat);
+      sMesh.visible = false;
+      sMesh.userData = { mat: sMat, geo: sGeo, ortofotoTexture: null, ortofotoLoaded: false };
+      scene.add(sMesh);
+      allSimpMeshes.push(sMesh);
+      mesh.userData.simpMesh = sMesh;
+    }
+  }
+  
+  // Store original Y for exaggeration
+  origPositions = allMeshes.map(m => new Float32Array(m.geometry.attributes.position.array));
+});
+
+document.getElementById('exag').addEventListener('input', (e) => {
+  const val = parseFloat(e.target.value);
+  document.getElementById('exag-val').textContent = val.toFixed(1);
+  allMeshes.forEach((mesh, mi) => {
+    const pos = mesh.geometry.attributes.position.array;
+    const orig = origPositions[mi];
+    for (let i = 1; i < pos.length; i += 3) pos[i] = orig[i] * val;
+    mesh.geometry.attributes.position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+  });
+});
+
+document.getElementById('wireframe').addEventListener('change', (e) => {
+  allMeshes.forEach(m => { m.userData.mat.wireframe = e.target.checked; });
+});
+
+// Basemap switching
+function setBasemap(mode) {
+  allMeshes.forEach(m => {
+    const mat = m.userData.mat;
+    const geo = m.userData.geo;
+
+    // Toggle simplified vs full meshes
+    const useSimp = (mode === 'ortofoto_simplified');
+    m.visible = !useSimp;
+    if (m.userData.simpMesh) m.userData.simpMesh.visible = useSimp;
+
+    if (mode === 'ortofoto_simplified') {
+      if (m.userData.simpMesh && m.userData.simpMesh.userData.ortofotoLoaded) {
+        m.userData.simpMesh.material.map = m.userData.simpMesh.userData.ortofotoTexture;
+        m.userData.simpMesh.material.vertexColors = false;
+        m.userData.simpMesh.material.needsUpdate = true;
+      }
+    } else if (mode === 'ortofoto_basic' && m.userData.ortofotoLoaded) {
+      // MeshBasicMaterial — no lighting, true colors from aerial photo
+      m.material = m.userData.mat;
+      m.userData.mat.map = m.userData.ortofotoTexture;
+      m.userData.mat.vertexColors = false;
+      m.userData.mat.color.set(0xffffff);
+      m.userData.mat.needsUpdate = true;
+    } else if (mode === 'ortofoto_lit' && m.userData.ortofotoLoaded) {
+      // MeshStandardMaterial — with lighting for 3D depth
+      m.material = m.userData.matLit;
+      m.userData.matLit.needsUpdate = true;
+    } else if (mode === 'ortofoto_dark' && m.userData.ortofotoLoaded) {
+      // MeshBasicMaterial — darkened for better contrast
+      m.material = m.userData.matDark;
+      m.userData.matDark.needsUpdate = true;
+    } else if (mode === 'slope') {
+      // Recolor vertices by slope
+      m.material = m.userData.mat;
+      m.userData.mat.map = null;
+      m.userData.mat.vertexColors = true;
+      m.userData.mat.color.set(0xffffff);
+      const pos = geo.attributes.position.array;
+      const colors = geo.attributes.color.array;
+      for (let i = 0; i < pos.length; i += 9) {
+        // Triangle normal → slope
+        const ax = pos[i+3]-pos[i], ay = pos[i+4]-pos[i+1], az = pos[i+5]-pos[i+2];
+        const bx = pos[i+6]-pos[i], by = pos[i+7]-pos[i+1], bz = pos[i+8]-pos[i+2];
+        const nx = ay*bz - az*by, ny = az*bx - ax*bz, nz = ax*by - ay*bx;
+        const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+        const slope = Math.acos(Math.abs(ny / len)) * 180 / Math.PI;
+
+        // Color: green=flat, yellow=moderate, red=steep
+        for (let j = 0; j < 3; j++) {
+          const ci = i + j * 3;
+          if (slope < 10) { colors[ci]=0.2; colors[ci+1]=0.7; colors[ci+2]=0.2; }
+          else if (slope < 25) { colors[ci]=0.9; colors[ci+1]=0.9; colors[ci+2]=0.2; }
+          else if (slope < 45) { colors[ci]=0.9; colors[ci+1]=0.5; colors[ci+2]=0.1; }
+          else { colors[ci]=0.9; colors[ci+1]=0.2; colors[ci+2]=0.1; }
+        }
+      }
+      geo.attributes.color.needsUpdate = true;
+    } else {
+      // Height colors (default)
+      m.material = m.userData.mat;
+      m.userData.mat.map = null;
+      m.userData.mat.vertexColors = true;
+      m.userData.mat.color.set(0xffffff);
+      const pos = geo.attributes.position.array;
+      const colors = geo.attributes.color.array;
+      const exag = parseFloat(document.getElementById('exag').value);
+      for (let i = 0; i < pos.length; i += 3) {
+        const h = pos[i + 1] / exag;
+        let r, g, b;
+        if (h < 0.3) { r=0.3; g=0.65; b=0.2; }
+        else if (h < 2) { r=0.5; g=0.7; b=0.3; }
+        else if (h < 4) { r=0.92; g=0.88; b=0.78; }
+        else if (h < 8) { r=0.85; g=0.35; b=0.25; }
+        else { r=0.55; g=0.15; b=0.15; }
+        colors[i]=r; colors[i+1]=g; colors[i+2]=b;
+      }
+      geo.attributes.color.needsUpdate = true;
+    }
+    mat.needsUpdate = true;
+  });
+}
+
+// Ortofoto quality reload with loading indicator
+document.getElementById('ortho-quality').addEventListener('change', (e) => {
+  const size = e.target.value;
+  const currentBasemap = document.getElementById('basemap-select').value;
+  if (!currentBasemap.startsWith('ortofoto_')) return;
+  const source = currentBasemap.replace('ortofoto_', '');
+
+  let loaded = 0;
+  const total = allMeshes.length;
+
+  // Dim all tiles to show loading
+  allMeshes.forEach(m => {
+    m.userData.mat.color.set(0x888888);
+    m.userData.mat.needsUpdate = true;
+  });
+
+  allMeshes.forEach(m => {
+    const tile = m.userData.tile;
+    if (!tile) { loaded++; return; }
+    const bbox = tile.sjtsk_bbox;
+    const wbbox = tile.wgs_bbox;
+    const ortUrl = `/proxy/ortofoto?BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WBBOX=${wbbox[0]},${wbbox[1]},${wbbox[2]},${wbbox[3]}&source=${source}&size=${size}`;
+    texLoader.load(ortUrl, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+      m.userData.mat.map = texture;
+      m.userData.mat.color.set(0xffffff);
+      m.userData.mat.vertexColors = false;
+      m.userData.mat.needsUpdate = true;
+      m.userData.ortofotoTexture = texture;
+      loaded++;
+    });
+  });
+});
+
+document.getElementById('basemap-select').addEventListener('change', (e) => {
+  const mode = e.target.value;
+  if (mode.startsWith('ortofoto_')) {
+    const source = mode.replace('ortofoto_', '');
+    const size = document.getElementById('ortho-quality').value;
+
+    // Dim tiles to indicate loading
+    allMeshes.forEach(m => {
+      m.userData.mat.color.set(0x888888);
+      m.userData.mat.needsUpdate = true;
+    });
+
+    allMeshes.forEach(m => {
+      const tile = m.userData.tile;
+      if (!tile) return;
+      const bbox = tile.sjtsk_bbox;
+      const wbbox = tile.wgs_bbox;
+      const ortUrl = `/proxy/ortofoto?BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WBBOX=${wbbox[0]},${wbbox[1]},${wbbox[2]},${wbbox[3]}&source=${source}&size=${size}`;
+
+      texLoader.load(ortUrl, (texture) => {
+        texture.colorSpace = THREE.SRGBColorSpace;
+        m.userData.mat.map = texture;
+        m.userData.mat.color.set(0xffffff);
+        m.userData.mat.vertexColors = false;
+        m.userData.mat.needsUpdate = true;
+        m.userData.ortofotoTexture = texture;
+        m.userData.ortofotoLoaded = true;
+      });
+    });
+  } else {
+    setBasemap(mode);
+  }
+});
+
+// Cadastre overlay
+let cadastreMeshes = [];
+
+function reloadCadastre() {
+  // Remove old
+  cadastreMeshes.forEach(m => scene.remove(m));
+  cadastreMeshes = [];
+
+  const checked = document.getElementById('toggle-cadastre').checked;
+  if (!checked) return;
+
+  const cadStyle = document.getElementById('cadastre-style').value;
+  allMeshes.forEach(m => {
+    const tile = m.userData.tile;
+    if (!tile) return;
+    // Use ACTUAL vertex extent for cadastre bbox + UV (sampling fix shifted
+    // vertices by 0.25m from nominal tile bounds, so sjtsk_bbox is off).
+    const geo = m.geometry;
+    const pos = geo.attributes.position.array;
+    const origIdx = geo.index.array;
+
+    const ox = tile.offset_x;
+    const oz = tile.offset_z;
+
+    // Local x/z extent (min/max across all vertices)
+    let lxMin = Infinity, lxMax = -Infinity, lzMin = Infinity, lzMax = -Infinity;
+    for (let i = 0; i < pos.length; i += 3) {
+      const lx = pos[i] - ox;
+      const lz = pos[i+2] - oz;
+      if (lx < lxMin) lxMin = lx; if (lx > lxMax) lxMax = lx;
+      if (lz < lzMin) lzMin = lz; if (lz > lzMax) lzMax = lz;
+    }
+    // World bbox matching the actual mesh extent
+    const wxMin = tile.center_sjtsk[0] + lxMin;
+    const wxMax = tile.center_sjtsk[0] + lxMax;
+    const wyMin = tile.center_sjtsk[1] - lzMax;  // world Y = cy - local z
+    const wyMax = tile.center_sjtsk[1] - lzMin;
+    const cadastreUrl = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&style=${cadStyle}`;
+    texLoader.load(cadastreUrl, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+
+      // Filter faces: keep only where |normal.y| > 0.5 (not a wall)
+      const keepFaces = [];
+      for (let f = 0; f < origIdx.length; f += 3) {
+        const a = origIdx[f], b = origIdx[f+1], c = origIdx[f+2];
+        const ax = pos[a*3], ay = pos[a*3+1], az = pos[a*3+2];
+        const bx = pos[b*3], by = pos[b*3+1], bz = pos[b*3+2];
+        const cx = pos[c*3], cy = pos[c*3+1], cz = pos[c*3+2];
+        // Face normal Y component
+        const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+        const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+        const nx = e1y*e2z - e1z*e2y;
+        const ny = e1z*e2x - e1x*e2z;
+        const nz = e1x*e2y - e1y*e2x;
+        const nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+        if (nlen < 1e-6) continue;
+        const nyNorm = Math.abs(ny) / nlen;
+        if (nyNorm > 0.5) {
+          keepFaces.push(a, b, c);
+        }
+      }
+
+      const cadUvs = new Float32Array(pos.length / 3 * 2);
+      const lxRange = lxMax - lxMin, lzRange = lzMax - lzMin;
+      for (let i = 0; i < pos.length; i += 3) {
+        const lx = pos[i] - ox;
+        const lz = pos[i+2] - oz;
+        cadUvs[(i/3)*2] = (lx - lxMin) / lxRange;
+        cadUvs[(i/3)*2+1] = 1.0 - (lz - lzMin) / lzRange;
+      }
+      const cadGeo = new THREE.BufferGeometry();
+      cadGeo.setAttribute('position', geo.attributes.position.clone());
+      cadGeo.setAttribute('uv', new THREE.BufferAttribute(cadUvs, 2));
+      cadGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(keepFaces), 1));
+
+      const cadMat = new THREE.MeshBasicMaterial({
+        map: texture, transparent: true, side: THREE.DoubleSide,
+        depthWrite: false, alphaTest: 0.3,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+      });
+      const cadMesh = new THREE.Mesh(cadGeo, cadMat);
+      cadMesh.renderOrder = 100;
+      scene.add(cadMesh);
+      cadastreMeshes.push(cadMesh);
+    }, undefined, (err) => {
+      console.error('[cadastre] texLoader FAILED for tile', tile.grid_col, tile.grid_row, err);
+    });
+  });
+}
+
+document.getElementById('cadastre-style').addEventListener('change', () => {
+  if (document.getElementById('toggle-cadastre').checked) reloadCadastre();
+});
+
+document.getElementById('toggle-cadastre').addEventListener('change', () => reloadCadastre());
+
+// Building highlight — outline only, simplified + Y-smoothed
+const highlightObjects = [];
+const heightRaycaster = new THREE.Raycaster();
+const _downDir = new THREE.Vector3(0, -1, 0);
+const _fromAbove = new THREE.Vector3();
+
+function getTerrainHeightAt(x, z, fallback = 0) {
+  _fromAbove.set(x, 10000, z);
+  heightRaycaster.set(_fromAbove, _downDir);
+  const hits = heightRaycaster.intersectObjects(allMeshes, false);
+  return hits.length ? hits[0].point.y : fallback;
+}
+
+function clearHighlight() {
+  for (const o of highlightObjects) {
+    scene.remove(o);
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  }
+  highlightObjects.length = 0;
+}
+
+function dpOpen(points, epsilon) {
+  if (points.length < 3) return points.slice();
+  const a = points[0], b = points[points.length - 1];
+  const dx = b[0] - a[0], dz = b[1] - a[1];
+  const len2 = dx * dx + dz * dz;
+  let maxDist = 0, idx = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const p = points[i];
+    let d;
+    if (len2 === 0) {
+      d = Math.hypot(p[0] - a[0], p[1] - a[1]);
+    } else {
+      const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / len2));
+      d = Math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dz));
+    }
+    if (d > maxDist) { maxDist = d; idx = i; }
+  }
+  if (maxDist > epsilon) {
+    const left = dpOpen(points.slice(0, idx + 1), epsilon);
+    const right = dpOpen(points.slice(idx), epsilon);
+    return left.slice(0, -1).concat(right);
+  }
+  return [a, b];
+}
+
+function simplifyClosed(coords, epsilon) {
+  if (coords.length < 4) return coords.slice();
+  let pts = coords.slice();
+  const first = pts[0], last = pts[pts.length - 1];
+  if (Math.hypot(first[0] - last[0], first[1] - last[1]) < 1e-6) pts = pts.slice(0, -1);
+  let far = 0, farDist = -1;
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - pts[0][0], pts[i][1] - pts[0][1]);
+    if (d > farDist) { farDist = d; far = i; }
+  }
+  const a = dpOpen(pts.slice(0, far + 1), epsilon);
+  const b = dpOpen(pts.slice(far).concat([pts[0]]), epsilon);
+  return a.slice(0, -1).concat(b.slice(0, -1));
+}
+
+function smoothYClosed(points, window) {
+  const n = points.length;
+  const half = Math.floor(window / 2);
+  const ys = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0, cnt = 0;
+    for (let k = -half; k <= half; k++) {
+      sum += points[(i + k + n) % n].y;
+      cnt++;
+    }
+    ys[i] = sum / cnt;
+  }
+  for (let i = 0; i < n; i++) points[i].y = ys[i];
+}
+
+function highlightBuilding(building) {
+  clearHighlight();
+  if (!building || building.coords.length < 2) return;
+
+  const simplified = simplifyClosed(building.coords, 0.15);
+
+  const segLen = 1.0;
+  const pts = [];
+  for (let i = 0; i < simplified.length; i++) {
+    const a = simplified[i];
+    const b = simplified[(i + 1) % simplified.length];
+    const dx = b[0] - a[0], dz = b[1] - a[1];
+    const len = Math.hypot(dx, dz);
+    const steps = Math.max(1, Math.ceil(len / segLen));
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      const x = a[0] + dx * t;
+      const z = a[1] + dz * t;
+      pts.push(new THREE.Vector3(x, getTerrainHeightAt(x, z), z));
+    }
+  }
+
+  smoothYClosed(pts, 7);
+  for (const p of pts) p.y += 0.25;
+
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xff3300,
+    depthTest: false,
+    transparent: true,
+  });
+  const line = new THREE.LineLoop(geo, mat);
+  line.renderOrder = 51;
+  scene.add(line);
+  highlightObjects.push(line);
+}
+
+const popup = document.getElementById('building-popup');
+document.getElementById('popup-close').addEventListener('click', () => {
+  popup.style.display = 'none';
+  restoreMeshColors();
+});
+
+function isPointInPolygon(px, pz, coords, buffer) {
+  // Ray casting with optional buffer (expand polygon outward)
+  const buf = buffer || 0;
+  if (buf > 0) {
+    // Simple check: test against each edge, if distance < buffer → inside
+    for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+      const x1 = coords[j][0], z1 = coords[j][1];
+      const x2 = coords[i][0], z2 = coords[i][1];
+      const dx = x2 - x1, dz = z2 - z1;
+      const len = Math.sqrt(dx*dx + dz*dz) || 1;
+      // Distance from point to line segment
+      const t = Math.max(0, Math.min(1, ((px-x1)*dx + (pz-z1)*dz) / (len*len)));
+      const cx = x1 + t*dx, cz = z1 + t*dz;
+      const dist = Math.sqrt((px-cx)*(px-cx) + (pz-cz)*(pz-cz));
+      if (dist < buf) return true;
+    }
+  }
+  // Standard ray casting
+  let inside = false;
+  for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+    const xi = coords[i][0], zi = coords[i][1];
+    const xj = coords[j][0], zj = coords[j][1];
+    if (((zi > pz) !== (zj > pz)) && (px < (xj - xi) * (pz - zi) / (zj - zi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+
+// Click
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const marker = new THREE.Mesh(new THREE.SphereGeometry(0.5), new THREE.MeshBasicMaterial({color: 0xff0000}));
+marker.visible = false;
+scene.add(marker);
+
+renderer.domElement.addEventListener('click', (e) => {
+  // Don't react to clicks while a video is in flight — would contaminate
+  // the recording with parcel highlights / popup state changes.
+  if (_videoState !== 'idle' && _videoState !== 'panel') return;
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  // Deselect previous
+  highlightBuilding(null);
+  popup.style.display = 'none';
+
+  // Parcels layer takes click priority when visible.
+  if (_parcelGroup && _parcelGroup.visible && _parcelMeshes.length) {
+    const phits = raycaster.intersectObjects(_parcelMeshes, false);
+    if (phits.length) {
+      const p = phits[0].object.userData.parcel;
+      popup.style.display = 'block';
+      popup.style.left = Math.min(e.clientX, innerWidth - 280) + 'px';
+      popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
+      popup.innerHTML = `
+        <span class="close" id="popup-close">&times;</span>
+        <h3>Parcela ${p.label}</h3>
+        <div class="row"><span class="label">Druh:</span> ${p.use_label}</div>
+        <div class="row"><span class="label">Výměra:</span> ${p.area_m2} m²</div>
+        <div class="row"><span class="label">RÚIAN ID:</span> ${p.id}</div>
+        <a href="https://nahlizenidokn.cuzk.cz/VyberParcelu/Parcela/InformaceO?id=${p.id}" target="_blank">Nahlížení do KN</a>
+      `;
+      // Close button works again because innerHTML wiped the listener.
+      document.getElementById('popup-close').addEventListener('click', () => {
+        popup.style.display = 'none';
+      });
+      return;   // skip the building hit-test
+    }
+  }
+
+  // Raycast on terrain mesh
+  const hits = raycaster.intersectObjects(allMeshes);
+  if (hits.length === 0) return;
+
+  const pt = hits[0].point;
+  marker.position.copy(pt);
+  marker.visible = true;
+
+  // Check if click point is inside any building footprint (with 1.5m buffer for walls)
+  let clickedBuilding = null;
+  for (const b of ruianBuildings) {
+    if (isPointInPolygon(pt.x, pt.z, b.coords, 1.5)) {
+      clickedBuilding = b;
+      break;
+    }
+  }
+
+  if (clickedBuilding) {
+    const b = clickedBuilding;
+
+    // Highlight building on 3D surface
+    highlightBuilding(b);
+
+    // Popup
+    popup.style.display = 'block';
+    popup.style.left = Math.min(e.clientX, innerWidth - 250) + 'px';
+    popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
+    const title = b.cislo ? ('Hnojice č.p. ' + b.cislo) : ('SO-' + b.kod);
+    const mapyHref = 'https://mapy.com/en/letecka?x=' + b.wgs84[0].toFixed(7) + '&y=' + b.wgs84[1].toFixed(7) + '&z=20&m3d=1&height=92&yaw=0&pitch=-45';
+    const ruianHref = 'https://vdp.cuzk.cz/vdp/ruian/stavebniobjekty/' + b.kod;
+    popup.innerHTML = `
+      <span class="close" id="popup-close">&times;</span>
+      <h3>${title}</h3>
+      <div class="row"><span class="label">Č.p.:</span> ${b.cislo || '—'}</div>
+      <div class="row"><span class="label">Plocha:</span> ${b.plocha} m²</div>
+      <div class="row"><span class="label">Kód:</span> ${b.kod}</div>
+      <a href="${mapyHref}" target="_blank">Mapy.cz 3D</a>
+      <a href="${ruianHref}" target="_blank">RÚIAN detail</a>
+      <a href="#" id="popup-video" style="color:#c0392b;font-weight:600">🎬 Vytvořit video</a>
+    `;
+    document.getElementById('popup-close').addEventListener('click', () => {
+      popup.style.display = 'none';
+    });
+    document.getElementById('popup-video').addEventListener('click', async (ev) => {
+      if (_videoState !== 'idle' && _videoState !== 'panel') {
+        ev.preventDefault();
+        return;
+      }
+      ev.preventDefault();
+      const link = ev.currentTarget;
+      link.textContent = '🎬 Načítám parcely…';
+      try {
+        await ensureParcelsData();
+        // Find building footprint centroid in local coords.
+        let cx = 0, cz = 0;
+        if (Array.isArray(b.coords) && b.coords.length >= 3) {
+          for (const [x, z] of b.coords) { cx += x; cz += z; }
+          cx /= b.coords.length; cz /= b.coords.length;
+        }
+        // Find containing parcel.
+        let containingParcel = null;
+        for (const p of _parcels) {
+          if (!p.ring_local || p.ring_local.length < 3) continue;
+          if (pointInPolygon2D(cx, cz, p.ring_local)) {
+            containingParcel = p;
+            break;
+          }
+        }
+        popup.style.display = 'none';
+        if (containingParcel) {
+          openVideoPanel(containingParcel);
+        } else {
+          // No parcel match — building outside any parcel ring, use free flythrough.
+          openVideoPanelFreeMode();
+        }
+      } catch (err) {
+        console.error('video link', err);
+        link.textContent = '🎬 Chyba: ' + err.message;
+      }
+    });
+  }
+
+  // Single-parcel highlight: identify and render the parcel containing the click point.
+  if (hits.length > 0) {
+    const point = hits[0].point;
+    selectParcelAtClick(point.x, point.z);
+  }
+});
+
+renderer.domElement.addEventListener('contextmenu', (e) => {
+  if (!_parcelGroup || !_parcelGroup.visible || !_parcelMeshes.length) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  mouse.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const phits = raycaster.intersectObjects(_parcelMeshes, false);
+  if (!phits.length) return;
+  e.preventDefault();
+  const parcel = phits[0].object.userData.parcel;
+  if (_videoState !== 'idle' && _videoState !== 'panel') return;
+  if (_videoState === 'panel') closeVideoPanel();  // re-target a different parcel
+  openVideoPanel(parcel);
+});
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  if (!_parcelGroup || !_parcelGroup.visible || !_parcelMeshes.length) {
+    if (_parcelHover) { scene.remove(_parcelHover); _parcelHover.geometry.dispose(); _parcelHover.material.dispose(); _parcelHover = null; }
+    return;
+  }
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  mouse.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const phits = raycaster.intersectObjects(_parcelMeshes, false);
+  if (!phits.length) {
+    if (_parcelHover) { scene.remove(_parcelHover); _parcelHover.geometry.dispose(); _parcelHover.material.dispose(); _parcelHover = null; }
+    return;
+  }
+  const ring = phits[0].object.userData.parcel.ring_local;
+  if (_parcelHover) {
+    scene.remove(_parcelHover);
+    _parcelHover.geometry.dispose();
+    _parcelHover.material.dispose();
+  }
+  const pts = ring.map(([x, z, y]) =>
+    new THREE.Vector3(x, y + PARCEL_LIFT + PARCEL_TILE_H + 0.01, z));
+  pts.push(pts[0].clone());
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({ color: 0xfde047, transparent: true, opacity: 0.9 });
+  _parcelHover = new THREE.Line(geo, mat);
+  _parcelHover.renderOrder = 2;
+  scene.add(_parcelHover);
+});
+
+const parcelsBtn = document.getElementById('parcelsBtn');
+parcelsBtn.addEventListener('click', async () => {
+  parcelsBtn.disabled = true;
+  parcelsBtn.textContent = 'Parcely — načítám…';
+  try {
+    const g = await ensureParcels();
+    g.visible = !g.visible;
+    parcelsBtn.classList.toggle('active', g.visible);
+    parcelsBtn.textContent = g.visible
+      ? 'Parcely (RÚIAN) — zap'
+      : 'Parcely (RÚIAN) — vyp';
+  } catch (e) {
+    console.error('parcels', e);
+    parcelsBtn.textContent = 'Parcely — chyba: ' + e.message;
+  } finally {
+    parcelsBtn.disabled = false;
+  }
+});
+
+document.getElementById('freeRecordBtn').addEventListener('click', () => {
+  if (_videoState !== 'idle' && _videoState !== 'panel') return;
+  if (_videoState === 'panel') closeVideoPanel();
+  openVideoPanelFreeMode();
+});
+
+renderer.domElement.addEventListener('dblclick', (e) => {
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(allMeshes);
+  if (hits.length > 0) controls.target.copy(hits[0].point);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function interactiveTick() {
+  controls.update();
+  _sceneOverlay.tick();
+  renderer.render(scene, camera);
+}
+let _currentTick = interactiveTick;
+function tick() {
+  _currentTick();
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>

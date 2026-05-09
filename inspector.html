@@ -1,0 +1,1115 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>GTA OL — Inspector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root {
+    --bg: #111;
+    --bg-panel: #1a1a1a;
+    --bg-toolbar: #2a2a2acc;
+    --fg: #eee;
+    --fg-dim: #888;
+    --border: #333;
+    --accent: #4ade80;
+    --highlight: #fde047;
+    --error: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+         background: var(--bg); color: var(--fg); overflow: hidden; }
+  #map { position: fixed; top: 0; left: 0; right: 360px; bottom: 0; background: #000; }
+  #toolbar {
+    position: absolute; top: 12px; left: 56px; z-index: 1000;
+    background: var(--bg-toolbar); backdrop-filter: blur(8px);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; display: flex; gap: 10px; align-items: center;
+    font-size: 13px;
+  }
+  select { background: #333; color: var(--fg); border: 1px solid #555;
+           padding: 4px 8px; font-family: inherit; font-size: 13px; border-radius: 4px; }
+  #panel {
+    position: fixed; top: 0; right: 0; width: 360px; bottom: 0;
+    background: var(--bg-panel); border-left: 1px solid var(--border);
+    overflow-y: auto; padding: 16px; box-shadow: -4px 0 16px rgba(0,0,0,.4);
+  }
+  h1 { margin: 0 0 12px; font-size: 16px; color: var(--accent); font-weight: 600; }
+  h2 { margin: 18px 0 8px; font-size: 11px; color: var(--fg-dim);
+       text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
+       border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 5px 0; vertical-align: top; font-size: 12.5px; }
+  td:first-child { color: var(--fg-dim); width: 130px; padding-right: 8px; }
+  td:last-child { word-break: break-word; }
+  .empty { color: #555; font-style: italic; font-size: 11.5px; }
+  .hint { color: var(--fg-dim); font-size: 11.5px; line-height: 1.5; margin: 0; }
+  .err { color: var(--error); font-size: 12px; }
+  a { color: #67e8f9; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .tag-pill {
+    display: inline-block; padding: 1px 6px; background: #333; border-radius: 3px;
+    font-size: 11px; margin-right: 3px;
+  }
+  .stat-big {
+    font-size: 22px; color: var(--accent); font-weight: 600;
+  }
+  .stat-row { display: flex; gap: 20px; margin: 8px 0 14px; }
+  .stat-cell { flex: 1; background: #222; padding: 8px 10px; border-radius: 4px;
+               border: 1px solid var(--border); }
+  .stat-label { color: var(--fg-dim); font-size: 10.5px; text-transform: uppercase;
+                letter-spacing: 0.8px; }
+  .model3d-wrap { position: relative; margin: 0 0 14px; }
+  .model3d-wrap.empty { display: none; }
+  #model3d { width: 100%; height: 240px; background: #000; border: 1px solid var(--border);
+             border-radius: 4px; cursor: grab; display: block; }
+  #model3d:active { cursor: grabbing; }
+  #mesh-info {
+    position: absolute; bottom: 6px; right: 8px; pointer-events: none;
+    color: rgba(255,255,255,0.75); font-size: 10.5px;
+    font-family: ui-monospace, "JetBrains Mono", monospace; letter-spacing: 0.4px;
+    background: rgba(0,0,0,0.45); padding: 2px 6px; border-radius: 3px;
+  }
+  .seg-toggle { display: flex; gap: 4px; margin: 6px 0 4px; align-items: center; }
+  .seg-toggle.empty { display: none; }
+  .seg-toggle .seg-label {
+    color: var(--fg-dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.8px; width: 38px;
+  }
+  .seg-toggle button {
+    flex: 1; background: #222; color: var(--fg-dim); border: 1px solid var(--border);
+    padding: 4px 6px; font-family: inherit; font-size: 11px; border-radius: 4px;
+    cursor: pointer; text-transform: uppercase; letter-spacing: 0.6px;
+  }
+  .seg-toggle button.active { background: #1f3344; color: #67e8f9; border-color: #67e8f9; }
+  .seg-toggle button:hover { color: var(--fg); }
+  .seg-toggle button.loading { opacity: 0.5; pointer-events: none; }
+  @media (max-width: 800px) {
+    #map { right: 0; bottom: 50%; }
+    #panel { top: 50%; width: 100%; border-left: none; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="toolbar">
+  <label>Lokace
+    <select id="locSel">
+      <option value="strazek">Strážek</option>
+      <option value="snezka">Sněžka</option>
+      <option value="praha">Praha (Hrad)</option>
+      <option value="hnojice">Hnojice</option>
+      <option value="valcovni">Ostrava — Válcovní</option>
+    </select>
+  </label>
+  <label>Ortofoto
+    <select id="orthoSel">
+      <option value="off">vyp</option>
+      <option value="classic">klasické (tile)</option>
+      <option value="raw">RAW (12.5 cm)</option>
+    </select>
+  </label>
+  <a id="area3dBtn" href="#" target="_blank" style="color:#67e8f9;text-decoration:none;border:1px solid #67e8f9;padding:3px 8px;border-radius:4px;font-size:12px">Oblast 3D ↗</a>
+  <span id="bldCount" style="color:var(--fg-dim)"></span>
+</div>
+
+<div id="panel">
+  <h1>Inspector</h1>
+  <p class="hint">Klikni na budovu na mapě. Backend zjistí RÚIAN atributy + spočítá výšku z DSM rasteru (pokud je v cache).</p>
+  <div id="detail"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/proj4@2.10.0/dist/proj4.js"></script>
+<script src="https://unpkg.com/leaflet-imageoverlay-rotated@0.2.1/Leaflet.ImageOverlay.Rotated.js"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+window.__THREE = THREE;
+window.__OrbitControls = OrbitControls;
+window.dispatchEvent(new Event('three-ready'));
+</script>
+<script>
+proj4.defs(
+  "EPSG:5514",
+  "+proj=krovak +lat_0=49.5 +lon_0=24.83333333333333 +alpha=30.28813975277778 " +
+  "+k=0.9999 +x_0=0 +y_0=0 +ellps=bessel " +
+  "+towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56 +units=m +no_defs"
+);
+const sjtskToWgs = proj4("EPSG:5514", "EPSG:4326");
+
+// Same locations as game.html. WGS centroids derived from S-JTSK.
+const LOCATIONS = {
+  strazek: { wgs: [49.4748, 16.2342], gcx: -625362.12, gcy: -1130203.92, label: "Strážek" },
+  snezka:  { wgs: [50.7345, 15.7397], gcx: -640657,    gcy: -983411,    label: "Sněžka"  },
+  praha:   { wgs: [50.0902, 14.4002], gcx: -744216,    gcy: -1042445,   label: "Praha (Hrad)" },
+  hnojice: { wgs: [49.7165, 17.2246], gcx: -547700,    gcy: -1107700,   label: "Hnojice" },
+  valcovni:{ wgs: [49.818161, 18.262040], gcx: -472241, gcy: -1103364, label: "Ostrava — Válcovní" },
+};
+
+// Pre-baked 3D area viewers (full multi-tile heightfield + buildings).
+// Click "Oblast 3D" in the toolbar to open in a new tab.
+const AREA_VIEWERS = {
+  strazek:  "strazek_multi.html",
+  snezka:   "snezka.html",
+  praha:    "praha.html",
+  hnojice:  "hnojice_multi.html",
+  valcovni: "valcovni_area.html",
+};
+
+const map = L.map('map', { zoomControl: true, preferCanvas: true });
+const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap'
+}).addTo(map);
+
+// Two ortofoto layer flavours, switched via the toolbar dropdown:
+//   classic — Leaflet WMS over our tile-based proxy (z-LOD interpolated)
+//   raw     — single image overlay cropped from cached 12.5 cm/px native JPEG
+const wgsToSjtsk = proj4("EPSG:4326", "EPSG:5514");
+
+const RawOrtofotoLayer = L.Layer.extend({
+  initialize: function () {
+    this._overlay = null;
+    this._abort = null;
+  },
+  onAdd: function (map) {
+    this._map = map;
+    map.on('moveend zoomend', this._update, this);
+    this._update();
+  },
+  onRemove: function (map) {
+    map.off('moveend zoomend', this._update, this);
+    if (this._overlay) { map.removeLayer(this._overlay); this._overlay = null; }
+    if (this._abort) { this._abort.abort(); this._abort = null; }
+  },
+  _update: function () {
+    const map = this._map;
+    if (!map) return;
+    const b = map.getBounds();
+    // 1. Find SJTSK rectangle covering the visible WGS rectangle.
+    const sjCorners = [
+      wgsToSjtsk.forward([b.getWest(),  b.getSouth()]),
+      wgsToSjtsk.forward([b.getEast(),  b.getSouth()]),
+      wgsToSjtsk.forward([b.getWest(),  b.getNorth()]),
+      wgsToSjtsk.forward([b.getEast(),  b.getNorth()]),
+    ];
+    const xs = sjCorners.map(c => c[0]), ys = sjCorners.map(c => c[1]);
+    const xmin = Math.min(...xs), xmax = Math.max(...xs);
+    const ymin = Math.min(...ys), ymax = Math.max(...ys);
+    const span = Math.max(xmax - xmin, ymax - ymin);
+    const nativePx = Math.round(span / 0.125);
+    const size = Math.min(nativePx, 2048);
+    if (this._abort) this._abort.abort();
+    this._abort = new AbortController();
+    const url = `/proxy/ortofoto?source=raw&BBOX=${xmin.toFixed(2)},${ymin.toFixed(2)},${xmax.toFixed(2)},${ymax.toFixed(2)}&size=${size}`;
+    fetch(url, { signal: this._abort.signal })
+      .then(r => (r.ok ? r.blob() : null))
+      .then(blob => {
+        if (!blob || !this._map) return;
+        const objUrl = URL.createObjectURL(blob);
+        if (this._overlay) map.removeLayer(this._overlay);
+        // 2. Place image as a 3-corner rotated overlay so SJTSK→WGS rotation
+        //    (~7.7°) is preserved exactly, no shear.
+        //    Image pixel space: (0,0)=top-left, (W,0)=top-right, (0,H)=bot-left.
+        //    SJTSK px_y is negative (north-up), so SJTSK ymax = top.
+        const sjtskToWgs2 = proj4("EPSG:5514", "EPSG:4326");
+        const tl_lonlat = sjtskToWgs2.forward([xmin, ymax]); // top-left
+        const tr_lonlat = sjtskToWgs2.forward([xmax, ymax]); // top-right
+        const bl_lonlat = sjtskToWgs2.forward([xmin, ymin]); // bot-left
+        const tl = L.latLng(tl_lonlat[1], tl_lonlat[0]);
+        const tr = L.latLng(tr_lonlat[1], tr_lonlat[0]);
+        const bl = L.latLng(bl_lonlat[1], bl_lonlat[0]);
+        this._overlay = L.imageOverlay.rotated(objUrl, tl, tr, bl, {
+          opacity: 1.0, interactive: false,
+          attribution: "© ČÚZK ortofoto (raw 12.5 cm)",
+        }).addTo(map);
+      })
+      .catch(() => { /* aborted or transient */ });
+  },
+});
+
+let orthoClassic = null;
+let orthoRaw = null;
+const orthoSel = document.getElementById('orthoSel');
+function applyOrthoMode(mode) {
+  if (orthoClassic && map.hasLayer(orthoClassic)) map.removeLayer(orthoClassic);
+  if (orthoRaw && map.hasLayer(orthoRaw)) map.removeLayer(orthoRaw);
+  if (mode === 'classic') {
+    if (!orthoClassic) {
+      orthoClassic = L.tileLayer.wms("/proxy/ortofoto", {
+        layers: "GR_ORTFOTORGB", format: "image/jpeg",
+        version: "1.3.0", crs: L.CRS.EPSG3857,
+        attribution: "© ČÚZK ortofoto", maxZoom: 20,
+      });
+    }
+    orthoClassic.addTo(map);
+  } else if (mode === 'raw') {
+    if (!orthoRaw) orthoRaw = new RawOrtofotoLayer();
+    orthoRaw.addTo(map);
+  }
+}
+orthoSel.addEventListener('change', () => applyOrthoMode(orthoSel.value));
+
+const footprintLayer = L.layerGroup().addTo(map);
+const highlightLayer = L.layerGroup().addTo(map);
+
+async function loadLocation(key) {
+  const loc = LOCATIONS[key];
+  map.setView(loc.wgs, 17);
+  // Wire up the area-3D button for this location.
+  const btn = document.getElementById('area3dBtn');
+  if (btn) {
+    const href = AREA_VIEWERS[key];
+    if (href) { btn.href = href; btn.style.display = ''; }
+    else      { btn.removeAttribute('href'); btn.style.display = 'none'; }
+  }
+  footprintLayer.clearLayers();
+  highlightLayer.clearLayers();
+  document.getElementById('bldCount').textContent = "Načítám…";
+  document.getElementById('detail').innerHTML =
+    '<p class="hint">Klikni na obrysovou plochu pro detail budovy.</p>';
+  try {
+    const r = await fetch(`/api/buildings?gcx=${loc.gcx}&gcy=${loc.gcy}&radius=2000`);
+    const buildings = await r.json();
+    let n = 0;
+    for (const b of buildings) {
+      // b.coords are local: lx = sx - gcx, lz = -(sy - gcy)
+      const wgsRing = b.coords.map(([lx, lz]) => {
+        const sx = lx + loc.gcx;
+        const sy = -lz + loc.gcy;
+        const [lon, lat] = sjtskToWgs.forward([sx, sy]);
+        return [lat, lon];
+      });
+      L.polygon(wgsRing, {
+        color: '#4ade80', weight: 1, fillOpacity: 0.06, fillColor: '#4ade80'
+      }).addTo(footprintLayer);
+      n++;
+    }
+    document.getElementById('bldCount').textContent = `${n} budov v okolí 2 km`;
+  } catch (e) {
+    document.getElementById('bldCount').textContent = "Chyba načtení budov";
+  }
+}
+
+map.on('click', async (e) => {
+  const { lat, lng } = e.latlng;
+  const detail = document.getElementById('detail');
+  detail.innerHTML = '<p class="hint">Hledám budovu + DSM výšku…</p>';
+  try {
+    const r = await fetch(`/api/building-detail?lon=${lng}&lat=${lat}`);
+    if (!r.ok) {
+      detail.innerHTML = `<p class="err">HTTP ${r.status}: ${await r.text()}</p>`;
+      return;
+    }
+    const data = await r.json();
+    if (!data.found) {
+      detail.innerHTML = `<p class="empty">${data.reason || 'Žádná budova nenalezena.'}</p>`;
+      highlightLayer.clearLayers();
+      return;
+    }
+    renderPanel(data);
+    highlightLayer.clearLayers();
+    const ring = data.footprint_wgs.map(([lon, lat]) => [lat, lon]);
+    L.polygon(ring, {
+      color: '#fde047', weight: 2.5, fillOpacity: 0.25, fillColor: '#fde047'
+    }).addTo(highlightLayer);
+  } catch (err) {
+    detail.innerHTML = `<p class="err">${err.message}</p>`;
+  }
+});
+
+function fmt(v, fb='—') {
+  if (v == null || v === '') return `<span class="empty">${fb}</span>`;
+  return String(v);
+}
+
+function fmtNum(v, unit='', fb='—') {
+  if (v == null || v === '') return `<span class="empty">${fb}</span>`;
+  return `${v}${unit}`;
+}
+
+function azimuthLabel(deg) {
+  if (deg == null) return '—';
+  // 0/180 = N–S axis, 90 = E–W axis. Halve into a few tags.
+  const d = ((deg % 180) + 180) % 180;
+  let tag = 'S–J';
+  if (d >= 22.5 && d < 67.5) tag = 'SV–JZ';
+  else if (d >= 67.5 && d < 112.5) tag = 'V–Z';
+  else if (d >= 112.5 && d < 157.5) tag = 'JV–SZ';
+  return `${Math.round(deg)}° <span class="tag-pill">${tag}</span>`;
+}
+
+function compactnessLabel(c) {
+  if (c == null) return '—';
+  // 1 = circle, ≈0.785 square, ≈0.6 obdélník 2:1, <0.4 protáhlý/L
+  let tag = 'kruh';
+  if (c < 0.55) tag = 'protáhlý/L';
+  else if (c < 0.7) tag = 'obdélník';
+  else if (c < 0.83) tag = 'čtverec';
+  return `${c} <span class="tag-pill">${tag}</span>`;
+}
+
+function terrainLabel(p) {
+  if (p == null) return '—';
+  let tag = 'rovina';
+  if (p > 12) tag = 'svah';
+  else if (p > 5) tag = 'mírný sklon';
+  return `${p} % <span class="tag-pill">${tag}</span>`;
+}
+
+function renderRoof(r) {
+  if (!r || !r.type) return '';
+  const ridge = r.ridge_azimuth_deg != null
+    ? ` <span class="empty">(hřeben ${Math.round(r.ridge_azimuth_deg)}°)</span>` : '';
+  return `
+    <h2>Střecha</h2>
+    <table>
+      <tr><td>Typ</td><td>${r.type}${ridge}</td></tr>
+      <tr><td>Sklon (průměr)</td><td>${r.mean_slope_deg}°</td></tr>
+      <tr><td>Detekované roviny</td><td>${r.n_planes}</td></tr>
+    </table>
+  `;
+}
+
+function renderGeom(g) {
+  if (!g) return '';
+  return `
+    <h2>Geometrie</h2>
+    <table>
+      <tr><td>Podlaží (odhad)</td><td>${g.floors_est != null ? '~' + g.floors_est : '—'}</td></tr>
+      <tr><td>Objem</td><td>${fmtNum(g.volume_m3, ' m³')}</td></tr>
+      <tr><td>Rozměry (L × Š)</td><td>${g.bbox_length_m != null ? `${g.bbox_length_m} × ${g.bbox_width_m} m` : '—'}</td></tr>
+      <tr><td>Orientace</td><td>${azimuthLabel(g.azimuth_deg)}</td></tr>
+      <tr><td>Tvar (kompaktnost)</td><td>${compactnessLabel(g.compactness)}</td></tr>
+      <tr><td>Sousedé v 30 m</td><td>${g.neighbours_30m} ${g.nearest_neighbour_m != null ? `<span class="empty">(nejbližší ${g.nearest_neighbour_m} m)</span>` : ''}</td></tr>
+      <tr><td>Sklon terénu</td><td>${terrainLabel(g.terrain_slope_pct)}</td></tr>
+    </table>
+  `;
+}
+
+function renderPanel(d) {
+  const cislo = d.cisladomovni ? `č.p. ${d.cisladomovni}` : '(bez čísla)';
+  const ruianLink = d.ruian_id
+    ? `<a href="https://nahlizenidokn.cuzk.cz/VyberBudovu/Stavba/InformaceO?ID=${d.ruian_id}" target="_blank">Nahlížení do KN</a>`
+    : '';
+  const osmLink = d.footprint_wgs && d.footprint_wgs.length
+    ? `<a href="https://www.openstreetmap.org/?mlat=${d.footprint_wgs[0][1]}&mlon=${d.footprint_wgs[0][0]}#map=19/${d.footprint_wgs[0][1]}/${d.footprint_wgs[0][0]}" target="_blank">OpenStreetMap</a>`
+    : '';
+
+  document.getElementById('detail').innerHTML = `
+    <h1>${cislo}</h1>
+
+    <div class="stat-row">
+      <div class="stat-cell">
+        <div class="stat-label">Výška</div>
+        <div class="stat-big">${(d.typical_height_m ?? d.height_m) != null ? (d.typical_height_m ?? d.height_m) + '&nbsp;m' : '—'}</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-label">Plocha</div>
+        <div class="stat-big">${fmtNum(d.plocha_zastavena_m2 || d.plocha_polygon_m2, ' m²')}</div>
+      </div>
+    </div>
+
+    <div id="style-toggle" class="seg-toggle ${d.mesh ? '' : 'empty'}">
+      <span class="seg-label">Styl</span>
+      <button data-style="color">Výška</button>
+      <button data-style="clay">Hlína</button>
+      <button data-style="wire">Drát</button>
+      <button data-style="ortho" ${d.mesh && d.mesh.ortho_bbox ? '' : 'style="display:none"'}>Orto</button>
+    </div>
+    <div id="res-toggle" class="seg-toggle ${d.mesh ? '' : 'empty'}">
+      <span class="seg-label">Krok</span>
+      <button data-cell="0.5">0.5 m</button>
+      <button data-cell="0.75">0.75 m</button>
+      <button data-cell="1.0">1.0 m</button>
+      <button data-cell="2.0">2.0 m</button>
+    </div>
+    <div id="dim-toggle" class="seg-toggle ${d.mesh ? '' : 'empty'}">
+      <span class="seg-label">Koty</span>
+      <button data-dim="krabice">Krabice</button>
+      <button data-dim="vykres">Výkres</button>
+      <button data-dim="stitky">Štítky</button>
+    </div>
+    <div id="overlay-toggle" class="seg-toggle ${d.mesh && d.mesh.parcels && d.mesh.parcels.length ? '' : 'empty'}">
+      <span class="seg-label">Vrstvy</span>
+      <button data-overlay="cadastre">Katastr</button>
+    </div>
+    <div class="model3d-wrap ${d.mesh ? '' : 'empty'}">
+      <canvas id="model3d"></canvas>
+      <div id="mesh-info"></div>
+    </div>
+
+    ${renderRoof(d.roof)}
+    ${renderGeom(d.geom)}
+
+    <h2>Z meshe (DSM)</h2>
+    <table>
+      <tr><td>Výška (typická)</td><td>${d.typical_height_m != null ? d.typical_height_m + ' m' : '<span class="empty">—</span>'}</td></tr>
+      <tr><td>Výška (vrchol)</td><td>${d.height_m != null ? d.height_m + ' m' : '<span class="empty">DSM TIFF nedostupný</span>'}</td></tr>
+      <tr><td>Základ (terén)</td><td>${fmtNum(d.ground_z_m, ' m n.m.')}</td></tr>
+      <tr><td>Vrchol střechy</td><td>${fmtNum(d.roof_z_m, ' m n.m.')}</td></tr>
+      <tr><td>Vrcholy footprintu</td><td>${d.vertex_count} bodů</td></tr>
+      ${d.mesh && d.mesh.align_offset ? `
+      <tr><td>Posun vůči katastru</td><td>${Math.hypot(...d.mesh.align_offset).toFixed(1)} m
+        <span class="empty">(dx=${d.mesh.align_offset[0].toFixed(1)}, dy=${d.mesh.align_offset[1].toFixed(1)})</span></td></tr>` : ''}
+    </table>
+
+    <h2>RÚIAN</h2>
+    <table>
+      <tr><td>Č.p. / č.e.</td><td>${fmt(d.cisladomovni)}</td></tr>
+      <tr><td>Způsob využití</td><td>${fmt(d.zpusob_vyuziti)} <span class="tag-pill">kód ${d.zpusob_vyuziti_kod || '—'}</span></td></tr>
+      <tr><td>Plocha zastavění</td><td>${fmtNum(d.plocha_zastavena_m2, ' m²')}</td></tr>
+      <tr><td>Plocha polygonu</td><td>${fmtNum(d.plocha_polygon_m2, ' m²')}</td></tr>
+      <tr><td>RÚIAN ID</td><td>${fmt(d.ruian_id)}</td></tr>
+    </table>
+
+    <h2>Externí odkazy</h2>
+    <p class="hint">${ruianLink} ${ruianLink && osmLink ? '·' : ''} ${osmLink}</p>
+  `;
+  if (d.mesh) {
+    const meshArg = { ...d.mesh };
+    if (d.geom && d.geom.mrr_local && d.height_m != null) {
+      meshArg.dims = {
+        mrr_local: d.geom.mrr_local,
+        footprint_local: d.mesh.footprint_local,
+        height_m: d.height_m,
+        bbox_length_m: d.geom.bbox_length_m,
+        bbox_width_m: d.geom.bbox_width_m,
+      };
+    }
+    // Image edge bounds in mesh-local frame, computed once at native cell.
+    // Survives resampleMesh (which preserves x0/z0 and the SJTSK area; only
+    // sample density changes), so UVs stay aligned at any Krok value.
+    if (meshArg.ortho_bbox) {
+      meshArg.imageLocal = {
+        xLeft:  meshArg.x0 - 0.5 * meshArg.cell,
+        zTop:   meshArg.z0 - 0.5 * meshArg.cell,
+        width:  meshArg.cols * meshArg.cell,
+        height: meshArg.rows * meshArg.cell,
+      };
+    }
+    // Reset active style on each new building click (matches existing render contract).
+    _activeStyle = 'color';
+    _baseMesh = meshArg;            // store native 0.5 m as base for Krok toggle
+    renderMesh3D(meshArg);
+  }
+}
+
+// Build a sprite that displays a short text label at a given world position.
+function makeLabel(text, color = '#fde047') {
+  const THREE = window.__THREE;
+  const pad = 8, fontSize = 36;
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  ctx.font = `${fontSize}px ui-monospace, SF Mono, Menlo, monospace`;
+  const m = ctx.measureText(text);
+  c.width = Math.ceil(m.width + pad * 2);
+  c.height = fontSize + pad * 2;
+  // Re-set after canvas resize.
+  ctx.font = `${fontSize}px ui-monospace, SF Mono, Menlo, monospace`;
+  ctx.fillStyle = 'rgba(15,15,15,0.85)';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = color;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, pad, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  if ('colorSpace' in tex) tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const s = new THREE.Sprite(mat);
+  // World height ≈ 1.2 m per label so they read cleanly next to a 10 m building.
+  const worldH = 1.2;
+  s.scale.set(worldH * c.width / c.height, worldH, 1);
+  s.renderOrder = 999;
+  return s;
+}
+
+// Build dimension visuals into a fresh group; caller swaps the group on toggle.
+function buildDimensionsGroup(dims, mode) {
+  const THREE = window.__THREE;
+  const group = new THREE.Group();
+  if (!dims) return group;
+  const fp = dims.footprint_local;
+  const mrr = dims.mrr_local;
+  const h = dims.height_m;
+  if (h == null || !fp || fp.length < 3) return group;
+
+  const yGround = 0.05;
+  const yPeak = h;
+  const dimCol = 0x67e8f9;
+  const accentCol = 0xfde047;
+  const lineMat = new THREE.LineBasicMaterial({ color: dimCol, transparent: true, opacity: 0.85 });
+  const ghostMat = new THREE.LineBasicMaterial({ color: dimCol, transparent: true, opacity: 0.45 });
+
+  const addLine = (pts, mat) => {
+    const g = new THREE.BufferGeometry().setFromPoints(pts);
+    group.add(new THREE.Line(g, mat));
+  };
+  const addLabel = (text, color, pos) => {
+    const s = makeLabel(text, color);
+    s.position.copy(pos);
+    group.add(s);
+  };
+
+  // Helpers for mrr edges.
+  const edgeLen = i => {
+    const [ax, az] = mrr[i], [bx, bz] = mrr[(i + 1) % 4];
+    return Math.hypot(bx - ax, bz - az);
+  };
+  const longIdx = mrr && mrr.length === 4 && edgeLen(0) >= edgeLen(1) ? 0 : 1;
+  const shortIdx = longIdx ^ 1;
+  const center = mrr && mrr.length === 4
+    ? [mrr.reduce((s, p) => s + p[0], 0) / 4, mrr.reduce((s, p) => s + p[1], 0) / 4]
+    : [0, 0];
+
+  // ─── A) KRABICE — extruded footprint + vertical edges + 3 inline labels ──
+  if (mode === 'krabice') {
+    const topPts = fp.map(([x, z]) => new THREE.Vector3(x, yPeak, z));
+    addLine(topPts, ghostMat);
+    for (const [x, z] of fp.slice(0, fp.length - 1)) {
+      addLine([new THREE.Vector3(x, yGround, z), new THREE.Vector3(x, yPeak, z)], ghostMat);
+    }
+    if (mrr && mrr.length === 4) {
+      const mid = (i, y) => {
+        const [ax, az] = mrr[i], [bx, bz] = mrr[(i + 1) % 4];
+        return new THREE.Vector3((ax + bx) / 2, y, (az + bz) / 2);
+      };
+      addLabel(`${dims.bbox_length_m} m`, '#67e8f9', mid(longIdx, yGround + 0.4));
+      addLabel(`${dims.bbox_width_m} m`,  '#67e8f9', mid(shortIdx, yGround + 0.4));
+    }
+    addLabel(`${h} m`, '#fde047', new THREE.Vector3(fp[0][0], yPeak / 2, fp[0][1]));
+    return group;
+  }
+
+  // ─── B) VÝKRES — offset dimension lines with extension ticks (CAD style) ──
+  if (mode === 'vykres') {
+    if (!mrr || mrr.length !== 4) return group;
+
+    const offset = 1.6;       // m, distance from building edge to dim line
+    const tickLen = 0.4;
+    const labelLift = 0.15;
+
+    function drawHDim(i, label) {
+      const [ax, az] = mrr[i], [bx, bz] = mrr[(i + 1) % 4];
+      const a = new THREE.Vector2(ax, az);
+      const b = new THREE.Vector2(bx, bz);
+      // Outward perpendicular: rotate dir 90° and pick sign that goes away
+      // from the rectangle centre.
+      const dir = b.clone().sub(a).normalize();
+      const perp = new THREE.Vector2(-dir.y, dir.x);
+      const midEdge = a.clone().add(b).multiplyScalar(0.5);
+      const toCenter = new THREE.Vector2(center[0], center[1]).sub(midEdge);
+      if (perp.dot(toCenter) > 0) perp.multiplyScalar(-1);
+
+      const oA = a.clone().add(perp.clone().multiplyScalar(offset));
+      const oB = b.clone().add(perp.clone().multiplyScalar(offset));
+
+      // Main dimension line.
+      addLine([
+        new THREE.Vector3(oA.x, yGround, oA.y),
+        new THREE.Vector3(oB.x, yGround, oB.y),
+      ], lineMat);
+      // Extension lines from building corners to dim line.
+      addLine([new THREE.Vector3(a.x, yGround, a.y), new THREE.Vector3(oA.x, yGround, oA.y)], ghostMat);
+      addLine([new THREE.Vector3(b.x, yGround, b.y), new THREE.Vector3(oB.x, yGround, oB.y)], ghostMat);
+      // Tick marks (45° style — short lines parallel to dir).
+      const tA1 = oA.clone().add(dir.clone().multiplyScalar(-tickLen / 2));
+      const tA2 = oA.clone().add(dir.clone().multiplyScalar( tickLen / 2));
+      const tB1 = oB.clone().add(dir.clone().multiplyScalar(-tickLen / 2));
+      const tB2 = oB.clone().add(dir.clone().multiplyScalar( tickLen / 2));
+      addLine([new THREE.Vector3(tA1.x, yGround, tA1.y), new THREE.Vector3(tA2.x, yGround, tA2.y)], lineMat);
+      addLine([new THREE.Vector3(tB1.x, yGround, tB1.y), new THREE.Vector3(tB2.x, yGround, tB2.y)], lineMat);
+      // Label at midpoint.
+      const mid3 = new THREE.Vector3((oA.x + oB.x) / 2, yGround + labelLift, (oA.y + oB.y) / 2);
+      addLabel(label, '#67e8f9', mid3);
+    }
+
+    drawHDim(longIdx, `${dims.bbox_length_m} m`);
+    drawHDim(shortIdx, `${dims.bbox_width_m} m`);
+
+    // Vertical (height) dimension at one corner of the rotated rect.
+    const [cx, cz] = mrr[longIdx];                   // start of longest edge
+    const [nx, nz] = mrr[(longIdx + 3) % 4];         // along the SHORT edge from this corner
+    const sideDir = new THREE.Vector2(nx - cx, nz - cz).normalize();
+    const outward = sideDir.clone().multiplyScalar(-offset);  // away from building, along short axis
+    const baseX = cx + outward.x, baseZ = cz + outward.y;
+    addLine([
+      new THREE.Vector3(baseX, yGround, baseZ),
+      new THREE.Vector3(baseX, yPeak, baseZ),
+    ], lineMat);
+    // Extension lines: from corner ground to dim base, from corner top (same x,z) to dim top.
+    addLine([new THREE.Vector3(cx, yGround, cz), new THREE.Vector3(baseX, yGround, baseZ)], ghostMat);
+    addLine([new THREE.Vector3(cx, yPeak,   cz), new THREE.Vector3(baseX, yPeak,   baseZ)], ghostMat);
+    // Ticks (horizontal short lines along outward direction).
+    const tDX = sideDir.x * tickLen / 2, tDZ = sideDir.y * tickLen / 2;
+    addLine([new THREE.Vector3(baseX - tDX, yGround, baseZ - tDZ), new THREE.Vector3(baseX + tDX, yGround, baseZ + tDZ)], lineMat);
+    addLine([new THREE.Vector3(baseX - tDX, yPeak,   baseZ - tDZ), new THREE.Vector3(baseX + tDX, yPeak,   baseZ + tDZ)], lineMat);
+    addLabel(`${h} m`, '#fde047', new THREE.Vector3(baseX, yPeak / 2, baseZ));
+    return group;
+  }
+
+  // ─── C) ŠTÍTKY — three labels only, no lines ──────────────────────────────
+  if (mode === 'stitky') {
+    if (mrr && mrr.length === 4) {
+      const mid = (i, y) => {
+        const [ax, az] = mrr[i], [bx, bz] = mrr[(i + 1) % 4];
+        return new THREE.Vector3((ax + bx) / 2, y, (az + bz) / 2);
+      };
+      addLabel(`${dims.bbox_length_m} m`, '#67e8f9', mid(longIdx, yGround + 0.6));
+      addLabel(`${dims.bbox_width_m} m`,  '#67e8f9', mid(shortIdx, yGround + 0.6));
+    }
+    addLabel(`${h} m`, '#fde047', new THREE.Vector3(0, yPeak + 0.8, 0));
+    return group;
+  }
+
+  return group;
+}
+
+// Resample a mesh to a new cell size via bilinear interpolation.
+// Supports non-integer ratios (e.g. 0.5 → 0.75 m at ratio 1.5). Preserves
+// footprint reference frame (origin = pixel (0,0) center).
+function resampleMesh(mesh, newCellSize) {
+  const ratio = newCellSize / mesh.cell;
+  if (Math.abs(ratio - 1) < 1e-6) return mesh;     // no change
+  const newRows = Math.max(2, Math.floor(mesh.rows / ratio));
+  const newCols = Math.max(2, Math.floor(mesh.cols / ratio));
+  const elevs = [];
+  for (let i = 0; i < newRows; i++) {
+    const row = [];
+    const srcI = i * ratio;
+    const i0 = Math.min(mesh.rows - 1, Math.floor(srcI));
+    const i1 = Math.min(mesh.rows - 1, i0 + 1);
+    const ti = srcI - i0;
+    for (let j = 0; j < newCols; j++) {
+      const srcJ = j * ratio;
+      const j0 = Math.min(mesh.cols - 1, Math.floor(srcJ));
+      const j1 = Math.min(mesh.cols - 1, j0 + 1);
+      const tj = srcJ - j0;
+      const e00 = mesh.elevations[i0][j0];
+      const e01 = mesh.elevations[i0][j1];
+      const e10 = mesh.elevations[i1][j0];
+      const e11 = mesh.elevations[i1][j1];
+      // If any corner is nodata, fall back to first non-null neighbour
+      // (keeps mesh topology intact at footprint edges).
+      if (e00 == null || e01 == null || e10 == null || e11 == null) {
+        row.push(e00 ?? e01 ?? e10 ?? e11);
+      } else {
+        const top = e00 * (1 - tj) + e01 * tj;
+        const bot = e10 * (1 - tj) + e11 * tj;
+        row.push(top * (1 - ti) + bot * ti);
+      }
+    }
+    elevs.push(row);
+  }
+  return {
+    ...mesh,
+    rows: newRows, cols: newCols,
+    cell: newCellSize,
+    elevations: elevs,
+  };
+}
+
+// 3D heightfield viewer for the building DSM patch.
+let _modelState = null;
+let _baseMesh = null;       // original 0.5 m mesh; downsampled copies derive from this
+let _activeStyle = 'color'; // 'color' | 'clay' | 'wire' | 'ortho' — survives Krok rerender
+let _renderGen = 0;         // bumped on every renderMesh3D entry; invalidates stale fetches
+const _orthoCache = new Map();   // key = "xmin,ymin,xmax,ymax" → THREE.Texture
+
+async function loadOrthoTexture(bbox, renderer) {
+  const THREE = window.__THREE;
+  const key = bbox.join(',');
+  if (_orthoCache.has(key)) return _orthoCache.get(key);
+  const [xmin, ymin, xmax, ymax] = bbox;
+  const span = Math.max(xmax - xmin, ymax - ymin);
+  const size = Math.min(2048, Math.max(256, Math.round(span / 0.125)));
+  const tryFetch = (src) => fetch(
+    `/proxy/ortofoto?source=${src}&BBOX=${xmin},${ymin},${xmax},${ymax}&size=${size}`
+  ).then(r => r.ok ? r.blob() : Promise.reject(`HTTP ${r.status}`));
+  let blob;
+  try { blob = await tryFetch('raw'); }
+  catch { blob = await tryFetch('classic'); }
+  const bitmap = await createImageBitmap(blob);
+  const tex = new THREE.CanvasTexture(bitmap);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  _orthoCache.set(key, tex);
+  return tex;
+}
+
+function renderMesh3D(mesh) {
+  if (!window.__THREE) {
+    window.addEventListener('three-ready', () => renderMesh3D(mesh), { once: true });
+    return;
+  }
+  const myGen = ++_renderGen;
+  const THREE = window.__THREE;
+  const OrbitControls = window.__OrbitControls;
+  const canvas = document.getElementById('model3d');
+  if (!canvas) return;
+
+  if (_modelState) {
+    _modelState.renderer.dispose();
+    _modelState.controls.dispose();
+    _modelState = null;
+  }
+
+  const { rows, cols, cell, x0, z0, elevations, footprint_local } = mesh;
+  // Show mesh resolution + grid size in the canvas overlay.
+  const meshInfoEl = document.getElementById('mesh-info');
+  if (meshInfoEl) {
+    let validVerts = 0;
+    for (const row of elevations) for (const v of row) if (v != null) validVerts++;
+    meshInfoEl.textContent =
+      `${cell.toFixed(2)} m / ${cols}×${rows} cells / ${validVerts} verts`;
+  }
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  if ('outputColorSpace' in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
+  else if ('outputEncoding' in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+  // ACES tonemapping for natural exposure of bright textures vs shadows.
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  // Real-time sun shadows so complex roof geometry (ridges, hips, dormers)
+  // pops visually instead of disappearing into uniform fill light.
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setSize(w, h, false);
+  renderer.setClearColor(0x0a0a0a, 1);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(40, w / h, 0.5, 500);
+
+  // Determine vertical range for color ramp.
+  let zMax = 0;
+  for (const row of elevations) for (const v of row) if (v != null && v > zMax) zMax = v;
+  if (zMax < 1) zMax = 1;
+
+  const positions = new Float32Array(rows * cols * 3);
+  const colors = new Float32Array(rows * cols * 3);
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      const idx = (i * cols + j) * 3;
+      const e = elevations[i][j];
+      const x = x0 + j * cell;
+      const z = z0 + i * cell;
+      const y = e == null ? 0 : e;
+      positions[idx] = x;
+      positions[idx + 1] = y;
+      positions[idx + 2] = z;
+      // Height ramp: deep green (terrain) → straw → terracotta (roof peak).
+      const t = Math.max(0, Math.min(1, y / zMax));
+      if (t < 0.5) {
+        const u = t * 2;            // 0..1 across terrain → eaves
+        colors[idx]     = 0.20 + 0.60 * u;
+        colors[idx + 1] = 0.40 + 0.30 * u;
+        colors[idx + 2] = 0.18 + 0.10 * u;
+      } else {
+        const u = (t - 0.5) * 2;    // 0..1 across eaves → ridge
+        colors[idx]     = 0.80 + 0.10 * u;
+        colors[idx + 1] = 0.70 - 0.30 * u;
+        colors[idx + 2] = 0.28 - 0.10 * u;
+      }
+    }
+  }
+
+  // UV mapping for the optional 'ortho' material. Computed eagerly because
+  // it's cheap and lets us swap to ortho without re-uploading geometry.
+  // Uses imageLocal (captured at native cell) so resampled meshes stay
+  // aligned to the same SJTSK texture rectangle.
+  let uvs = null;
+  if (mesh.imageLocal) {
+    uvs = new Float32Array(rows * cols * 2);
+    const { xLeft, zTop, width, height } = mesh.imageLocal;
+    for (let i = 0; i < rows; i++) {
+      for (let j = 0; j < cols; j++) {
+        const idx = (i * cols + j) * 2;
+        const xLocal = x0 + j * cell;
+        const zLocal = z0 + i * cell;
+        uvs[idx]     = (xLocal - xLeft) / width;       // 0..1, west→east
+        uvs[idx + 1] = 1 - (zLocal - zTop) / height;   // image top (north) = v=1
+      }
+    }
+  }
+
+  const indices = [];
+  for (let i = 0; i < rows - 1; i++) {
+    for (let j = 0; j < cols - 1; j++) {
+      const a = i * cols + j;
+      const b = a + 1;
+      const c = a + cols;
+      const d = c + 1;
+      // Skip cells that have any nodata corner.
+      if (elevations[i][j] == null || elevations[i][j+1] == null ||
+          elevations[i+1][j] == null || elevations[i+1][j+1] == null) continue;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  if (uvs) geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  // Three swappable visual styles. The geometry stays put; only the material
+  // (and an optional wireframe overlay) changes when the user picks a tab.
+  let currentMesh = null;
+  let currentWire = null;
+  function applyStyle(style, tex /* required for 'ortho' */) {
+    if (currentMesh) { scene.remove(currentMesh); currentMesh.material.dispose(); currentMesh = null; }
+    if (currentWire) { scene.remove(currentWire); currentWire.material.dispose(); currentWire = null; }
+    let mat;
+    if (style === 'color') {
+      mat = new THREE.MeshStandardMaterial({
+        vertexColors: true, flatShading: false, roughness: 0.85, metalness: 0.0,
+      });
+    } else if (style === 'clay') {
+      mat = new THREE.MeshStandardMaterial({
+        color: 0xe6dcc8, flatShading: false, roughness: 0.7, metalness: 0.0,
+      });
+    } else if (style === 'ortho') {
+      mat = new THREE.MeshStandardMaterial({
+        map: tex, roughness: 0.95, metalness: 0.0,
+      });
+    } else {  // 'wire'
+      mat = new THREE.MeshStandardMaterial({
+        color: 0x111418, flatShading: false, roughness: 0.95, metalness: 0.0,
+      });
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.85 });
+      currentWire = new THREE.LineSegments(new THREE.WireframeGeometry(geo), wireMat);
+      scene.add(currentWire);
+    }
+    currentMesh = new THREE.Mesh(geo, mat);
+    currentMesh.castShadow = true;
+    currentMesh.receiveShadow = true;
+    scene.add(currentMesh);
+  }
+  // Wire up style buttons. The initial applyStyle call happens at the end
+  // of renderMesh3D so it can read _activeStyle (Krok-rerender persistence).
+  const toolbar = document.getElementById('style-toggle');
+  if (toolbar) {
+    toolbar.querySelectorAll('button').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.style === _activeStyle);
+      btn.onclick = async () => {
+        const target = btn.dataset.style;
+        // Optimistic UI: highlight chosen button immediately.
+        toolbar.querySelectorAll('button').forEach(b =>
+          b.classList.toggle('active', b === btn));
+        _activeStyle = target;
+
+        if (target === 'ortho') {
+          btn.classList.add('loading');
+          try {
+            const t = await loadOrthoTexture(mesh.ortho_bbox, renderer);
+            if (myGen !== _renderGen || _activeStyle !== 'ortho') return;  // stale
+            applyStyle('ortho', t);
+          } catch (e) {
+            if (myGen === _renderGen && _activeStyle === 'ortho') {
+              if (meshInfoEl) meshInfoEl.textContent = `ortofoto: ${e}`;
+              _activeStyle = 'color';
+              toolbar.querySelectorAll('button').forEach(b =>
+                b.classList.toggle('active', b.dataset.style === 'color'));
+              applyStyle('color');
+            }
+          } finally {
+            btn.classList.remove('loading');
+          }
+        } else {
+          applyStyle(target);
+        }
+      };
+    });
+  }
+
+  // Cadastre footprint outline (yellow) — official RÚIAN polygon.
+  if (footprint_local && footprint_local.length >= 3) {
+    const pts = footprint_local.map(([x, z]) => new THREE.Vector3(x, 0.05, z));
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    scene.add(new THREE.Line(lineGeo,
+      new THREE.LineBasicMaterial({ color: 0xfde047, linewidth: 2 })));
+  }
+  // DSM-aligned footprint (orange dashed) — where the building actually
+  // stands, when RÚIAN and DSM disagree by >0.5 m.
+  if (mesh.aligned_footprint_local && mesh.aligned_footprint_local.length >= 3) {
+    const pts = mesh.aligned_footprint_local.map(([x, z]) => new THREE.Vector3(x, 0.08, z));
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    const dashMat = new THREE.LineDashedMaterial({
+      color: 0xff9a3c, dashSize: 0.6, gapSize: 0.3, transparent: true, opacity: 0.95,
+    });
+    const line = new THREE.Line(lineGeo, dashMat);
+    line.computeLineDistances();  // required for dashed material
+    scene.add(line);
+  }
+
+  // Cadastre overlay — RÚIAN parcel boundaries draped on the heightfield.
+  // Sample the local elevation grid at each vertex and cap so lines don't
+  // climb building walls (cadastre lines live on the ground).
+  function sampleGroundY(x, z, capAbove = 1.0) {
+    const j = (x - x0) / cell;
+    const i = (z - z0) / cell;
+    const ii = Math.max(0, Math.min(rows - 1, Math.round(i)));
+    const jj = Math.max(0, Math.min(cols - 1, Math.round(j)));
+    const e = elevations[ii][jj];
+    if (e == null) return 0;
+    return Math.min(e, capAbove) + 0.05;  // tiny lift to win z-fighting
+  }
+  let cadGroup = null;
+  function buildCadastreGroup() {
+    if (!mesh.parcels || mesh.parcels.length === 0) return null;
+    const g = new THREE.Group();
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xff6b8b, transparent: true, opacity: 0.95, depthTest: true,
+    });
+    for (const ring of mesh.parcels) {
+      const pts = ring.map(([x, z]) => new THREE.Vector3(x, sampleGroundY(x, z), z));
+      g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+    }
+    return g;
+  }
+  function setCadastreVisible(on) {
+    if (on && !cadGroup) {
+      cadGroup = buildCadastreGroup();
+      if (cadGroup) scene.add(cadGroup);
+    } else if (!on && cadGroup) {
+      scene.remove(cadGroup);
+      cadGroup.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      });
+      cadGroup = null;
+    }
+  }
+  const overlayBar = document.getElementById('overlay-toggle');
+  if (overlayBar) {
+    overlayBar.querySelectorAll('button').forEach(btn => {
+      btn.classList.remove('active');
+      btn.onclick = () => {
+        const on = !btn.classList.contains('active');
+        btn.classList.toggle('active', on);
+        if (btn.dataset.overlay === 'cadastre') setCadastreVisible(on);
+      };
+    });
+  }
+
+  // Koty — three swappable styles via the dim-toggle row.
+  let dimGroup = null;
+  function applyDimMode(modeName) {
+    if (dimGroup) { scene.remove(dimGroup); dimGroup.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    }); dimGroup = null; }
+    if (!mesh.dims) return;
+    dimGroup = buildDimensionsGroup(mesh.dims, modeName);
+    scene.add(dimGroup);
+  }
+  applyDimMode('krabice');
+  const dimToolbar = document.getElementById('dim-toggle');
+  if (dimToolbar) {
+    dimToolbar.querySelectorAll('button').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.dim === 'krabice');
+      btn.onclick = () => {
+        dimToolbar.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        applyDimMode(btn.dataset.dim);
+      };
+    });
+  }
+
+  // Krok (mesh resolution) toggle — re-render with bilinear-resampled grid.
+  const resBar = document.getElementById('res-toggle');
+  if (resBar && _baseMesh) {
+    resBar.querySelectorAll('button').forEach(btn => {
+      const target = parseFloat(btn.dataset.cell);
+      btn.classList.toggle('active', Math.abs(cell - target) < 0.05);
+      btn.onclick = () => {
+        renderMesh3D(resampleMesh(_baseMesh, target));
+      };
+    });
+  }
+
+  // Frame the bbox first so the sun shadow camera can be sized to it.
+  const halfX = cols * cell / 2;
+  const halfZ = rows * cell / 2;
+  const radius = Math.max(halfX, halfZ);
+
+  // Outdoor lighting: dim hemi/ambient + a strong key sun that casts shadows.
+  // Lower fill makes ridges and hip valleys read clearly.
+  scene.add(new THREE.HemisphereLight(0xfff4e0, 0x2c3a44, 0.85));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.10));
+  const sun = new THREE.DirectionalLight(0xfff0d8, 2.6);
+  // Position scales with the patch so shadows reach the far edge regardless
+  // of building size; angle ≈ 45° elevation from the south-west.
+  const sunDist = radius * 2.5;
+  sun.position.set(-sunDist * 0.6, sunDist * 1.2, sunDist * 0.8);
+  sun.target.position.set(0, 0, 0);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  const sCam = sun.shadow.camera;
+  const sExt = radius * 1.4;
+  sCam.left = -sExt; sCam.right = sExt;
+  sCam.top  =  sExt; sCam.bottom = -sExt;
+  sCam.near = 0.5;   sCam.far    = sunDist * 3;
+  sun.shadow.bias = -0.0008;
+  sun.shadow.normalBias = 0.05;
+  scene.add(sun);
+  scene.add(sun.target);
+  camera.position.set(radius * 1.3, radius * 1.6, radius * 1.3);
+  camera.lookAt(0, zMax / 2, 0);
+
+  const controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, zMax / 2, 0);
+  controls.enableDamping = true;
+  controls.update();
+
+  // Apply the user's previously-selected style (survives Krok rerender).
+  // For ortho we expect the cache to be populated because the only path to
+  // _activeStyle='ortho' goes through the click handler that fills the cache.
+  if (_activeStyle === 'ortho') {
+    const key = mesh.ortho_bbox?.join(',');
+    if (key && _orthoCache.has(key)) {
+      applyStyle('ortho', _orthoCache.get(key));
+    } else {
+      _activeStyle = 'color';
+      const tb = document.getElementById('style-toggle');
+      if (tb) tb.querySelectorAll('button').forEach(b =>
+        b.classList.toggle('active', b.dataset.style === 'color'));
+      applyStyle('color');
+    }
+  } else {
+    applyStyle(_activeStyle);
+  }
+
+  let raf = 0;
+  const tick = () => {
+    controls.update();
+    renderer.render(scene, camera);
+    raf = requestAnimationFrame(tick);
+  };
+  tick();
+
+  _modelState = {
+    renderer, controls,
+    dispose() { cancelAnimationFrame(raf); renderer.dispose(); controls.dispose(); }
+  };
+}
+
+// Bootstrap
+const sel = document.getElementById('locSel');
+sel.addEventListener('change', () => loadLocation(sel.value));
+loadLocation(sel.value);
+</script>
+</body>
+</html>

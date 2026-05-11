@@ -1447,12 +1447,45 @@ window.addEventListener('resize', () => {{
   renderer.setSize(innerWidth, innerHeight);
 }});
 
-function animate() {{
-  requestAnimationFrame(animate);
+// Tick loop (single source of truth)
+function interactiveTick() {{
   controls.update();
   renderer.render(scene, camera);
 }}
-animate();
+let _mainTick = interactiveTick;
+const _tickHooks = [];
+function tick() {{
+  _mainTick();
+  for (const hook of _tickHooks) hook();
+  requestAnimationFrame(tick);
+}}
+tick();
+
+// Tick API exposed to the realtor overlay.
+const addTickHook    = fn => {{ _tickHooks.push(fn); }};
+const removeTickHook = fn => {{ const i = _tickHooks.indexOf(fn); if (i >= 0) _tickHooks.splice(i, 1); }};
+const setMainTick    = fn => {{ _mainTick = fn; }};
+const resetMainTick  = ()  => {{ _mainTick = interactiveTick; }};
+
+// ─── Realtor overlay try-import ─────────────────────────────────────
+// Optional: loads viewer-realtor-overlay.js if present, otherwise the
+// base viewer continues as a plain 3D village viewer.
+// Deferred to dataLoaded.then so ruianBuildings / allMeshes are populated
+// before init destructures them by value.
+dataLoaded.then(async () => {{
+  try {{
+    const overlay = await import('./viewer-realtor-overlay.js');
+    overlay.init({{
+      THREE, scene, camera, renderer, controls,
+      allMeshes, ruianBuildings, gcx, gcy,
+      addTickHook, removeTickHook, setMainTick, resetMainTick,
+      getBuildingPopup: () => document.getElementById('building-popup'),
+      getTerrainHeightAt,
+    }});
+  }} catch (e) {{
+    console.warn('[viewer] realtor overlay not loaded:', e);
+  }}
+}});
 </script>
 </body>
 </html>"""

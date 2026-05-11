@@ -1038,7 +1038,6 @@ function videoTick() {
   const tgt = _videoCurves.targetCurve.getPointAt(t);
   camera.position.copy(pos);
   camera.lookAt(tgt);
-  _sceneOverlay.tick();
   renderer.render(scene, camera);
   if (_videoOverlay) blitOverlay();         // defined in Task 6
   if (tRaw >= 1) _onVideoComplete();        // defined/overridden in Task 8
@@ -1049,11 +1048,11 @@ function startVideoTick(curves, durationMs) {
   _videoCurves = curves;
   _videoDurationMs = durationMs;
   _videoStartTs = performance.now();
-  _currentTick = videoTick;
+  setMainTick(videoTick);
 }
 
 function stopVideoTick() {
-  _currentTick = interactiveTick;
+  resetMainTick();
   if (typeof controls !== 'undefined' && controls && _videoCurves) {
     const endTgt = _videoCurves.targetCurve.getPointAt(1);
     controls.target.copy(endTgt);
@@ -1067,7 +1066,7 @@ function pauseVideoTick() {
   if (_videoState !== 'preview' && _videoState !== 'recording') return;
   _videoPrevMode = _videoState;
   _videoPauseElapsed = performance.now() - _videoStartTs;
-  _currentTick = interactiveTick;
+  setMainTick(interactiveTick);
   if (_videoState === 'recording' && _currentRecorder && _currentRecorder.state === 'recording') {
     try { _currentRecorder.pause(); } catch (e) { console.warn('pause failed', e); }
   }
@@ -1078,7 +1077,7 @@ function resumeVideoTick() {
   if (_videoPauseElapsed === null || !_videoPrevMode) return;
   _videoStartTs = performance.now() - _videoPauseElapsed;
   _videoPauseElapsed = null;
-  _currentTick = videoTick;
+  setMainTick(videoTick);
   const wasMode = _videoPrevMode;
   _videoState = wasMode;
   _videoPrevMode = null;
@@ -2685,15 +2684,24 @@ window.addEventListener('resize', () => {
 
 function interactiveTick() {
   controls.update();
-  _sceneOverlay.tick();
   renderer.render(scene, camera);
 }
-let _currentTick = interactiveTick;
+let _mainTick = interactiveTick;
+const _tickHooks = [];
 function tick() {
-  _currentTick();
+  _mainTick();
+  for (const hook of _tickHooks) hook();
   requestAnimationFrame(tick);
 }
 tick();
+
+// Tick API exposed to the realtor overlay.
+const addTickHook    = fn => { _tickHooks.push(fn); };
+const removeTickHook = fn => { const i = _tickHooks.indexOf(fn); if (i >= 0) _tickHooks.splice(i, 1); };
+const setMainTick    = fn => { _mainTick = fn; };
+const resetMainTick  = ()  => { _mainTick = interactiveTick; };
+
+addTickHook(() => _sceneOverlay.tick());
 </script>
 </body>
 </html>

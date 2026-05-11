@@ -2702,6 +2702,22 @@ const setMainTick    = fn => { _mainTick = fn; };
 const resetMainTick  = ()  => { _mainTick = interactiveTick; };
 
 addTickHook(() => _sceneOverlay.tick());
+
+// ─── Realtor overlay try-import ─────────────────────────────────────
+// Optional: loads viewer-realtor-overlay.js if present, otherwise the
+// base viewer continues as a plain 3D village viewer.
+try {
+  const overlay = await import('./viewer-realtor-overlay.js');
+  overlay.init({
+    THREE, scene, camera, renderer, controls,
+    allMeshes, ruianBuildings, gcx, gcy,
+    addTickHook, removeTickHook, setMainTick, resetMainTick,
+    getBuildingPopup: () => document.getElementById('building-popup'),
+    getTerrainHeightAt,
+  });
+} catch (e) {
+  console.warn('[viewer] realtor overlay not loaded:', e);
+}
 </script>
 </body>
 </html>

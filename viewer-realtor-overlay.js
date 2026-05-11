@@ -25,6 +25,8 @@ let _parcels = null;
 let _parcelGroup = null;
 const _parcelMeshes = [];
 let _parcelHover = null;
+let _selectedParcelMesh = null;   // THREE.Group with painted yellow outline overlay
+let _selectClickSeq = 0;          // monotonic in-flight selectParcelAtClick debounce
 
 export function init(args) {
   const { THREE, scene, camera, renderer, controls,
@@ -123,6 +125,181 @@ export function init(args) {
     return _parcelGroup;
   }
 
+  // ── Single-parcel click highlight (painted-on-mesh outline) ───────
+
+  function buildSelectedParcelMesh(parcel) {
+    const ring = parcel.ring_local;
+    if (!ring || ring.length < 3) return null;
+
+    // ── 1. Compute parcel bbox in LOCAL coords ─────────────────────────
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const [x, z] of ring) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    // Pad bbox so the outline stroke isn't clipped at edges of the texture.
+    const PAD = 6;   // meters
+    const bxMin = minX - PAD, bxMax = maxX + PAD;
+    const bzMin = minZ - PAD, bzMax = maxZ + PAD;
+    const bWidth = bxMax - bxMin, bHeight = bzMax - bzMin;
+
+    // ── 2. Generate the outline texture on a Canvas ────────────────────
+    // Resolution: ~10 px per meter, capped to keep memory reasonable.
+    const PX_PER_M = 10;
+    const TEX_W = Math.min(2048, Math.ceil(bWidth * PX_PER_M));
+    const TEX_H = Math.min(2048, Math.ceil(bHeight * PX_PER_M));
+    const canvas = document.createElement('canvas');
+    canvas.width = TEX_W; canvas.height = TEX_H;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, TEX_W, TEX_H);
+    // Map ring vertices from world coords to canvas pixel coords.
+    const toCanvas = ([x, z]) => {
+      const cx = ((x - bxMin) / bWidth) * TEX_W;
+      const cy = ((z - bzMin) / bHeight) * TEX_H;
+      return [cx, cy];
+    };
+    // Draw the outline (closed polygon stroke).
+    ctx.lineWidth = 6;                    // pixels of canvas → ~0.6 m at 10 px/m
+    ctx.strokeStyle = '#fde047';          // yellow
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    const [x0, y0] = toCanvas(ring[0]);
+    ctx.moveTo(x0, y0);
+    for (let i = 1; i < ring.length; i++) {
+      const [px, py] = toCanvas(ring[i]);
+      ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    // Optional dark inner stroke for readability against bright ortho.
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(60,30,0,0.85)';
+    ctx.stroke();
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+
+    // ── 3. Find terrain tiles that overlap the parcel bbox ─────────────
+    const overlapTiles = [];
+    for (const m of allMeshes) {
+      if (!m.geometry) continue;
+      if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
+      const bb = m.geometry.boundingBox;
+      if (!bb) continue;
+      if (bb.max.x < bxMin || bb.min.x > bxMax) continue;
+      if (bb.max.z < bzMin || bb.min.z > bzMax) continue;
+      overlapTiles.push(m);
+    }
+    if (overlapTiles.length === 0) return null;
+
+    // ── 4. For each overlap tile, build a face-filtered, UV-mapped mesh
+    //      that paints the outline texture onto the terrain surface. ──
+    const group = new THREE.Group();
+    for (const tileMesh of overlapTiles) {
+      const tileGeo = tileMesh.geometry;
+      const pos = tileGeo.attributes.position.array;
+      const idx = tileGeo.index ? tileGeo.index.array : null;
+      if (!idx) continue;   // expecting indexed geometry (GLB tiles are)
+
+      // Filter faces: keep only those with |normal.y| > 0.5 AND that have
+      // at least one vertex inside the parcel bbox (to keep mesh small).
+      const keepFaces = [];
+      for (let f = 0; f < idx.length; f += 3) {
+        const a = idx[f], b = idx[f+1], c = idx[f+2];
+        const ax = pos[a*3], ay = pos[a*3+1], az = pos[a*3+2];
+        const bx = pos[b*3], by = pos[b*3+1], bz = pos[b*3+2];
+        const cx = pos[c*3], cy = pos[c*3+1], cz = pos[c*3+2];
+        // Bbox quick reject (any vertex outside expanded bbox by PAD)
+        const bxMinTri = Math.min(ax, bx, cx), bxMaxTri = Math.max(ax, bx, cx);
+        const bzMinTri = Math.min(az, bz, cz), bzMaxTri = Math.max(az, bz, cz);
+        if (bxMaxTri < bxMin || bxMinTri > bxMax) continue;
+        if (bzMaxTri < bzMin || bzMinTri > bzMax) continue;
+        // Normal Y filter
+        const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+        const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+        const nx = e1y*e2z - e1z*e2y;
+        const ny = e1z*e2x - e1x*e2z;
+        const nz = e1x*e2y - e1y*e2x;
+        const nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+        if (nlen < 1e-6) continue;
+        const nyNorm = Math.abs(ny) / nlen;
+        if (nyNorm <= 0.5) continue;     // skip walls
+        keepFaces.push(a, b, c);
+      }
+      if (keepFaces.length === 0) continue;
+
+      // Compute UVs for ALL vertices (we share the position buffer; unused
+      // vertices have arbitrary UV — they're not referenced via index).
+      const uvs = new Float32Array((pos.length / 3) * 2);
+      for (let i = 0; i < pos.length / 3; i++) {
+        const vx = pos[i*3];
+        const vz = pos[i*3+2];
+        uvs[i*2]     = (vx - bxMin) / bWidth;
+        uvs[i*2 + 1] = 1.0 - (vz - bzMin) / bHeight;
+      }
+
+      const overlayGeo = new THREE.BufferGeometry();
+      overlayGeo.setAttribute('position', tileGeo.attributes.position.clone());
+      overlayGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      overlayGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(keepFaces), 1));
+
+      const overlayMat = new THREE.MeshBasicMaterial({
+        map: tex,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        alphaTest: 0.05,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+      });
+      const overlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
+      overlayMesh.renderOrder = 101;     // above cadastre overlay (100)
+      overlayMesh.userData = { selectedParcel: parcel };
+      group.add(overlayMesh);
+    }
+    if (group.children.length === 0) return null;
+    return group;
+  }
+
+  function clearSelectedParcel() {
+    if (_selectedParcelMesh) {
+      scene.remove(_selectedParcelMesh);
+      _selectedParcelMesh.traverse(node => {
+        if (node.geometry) node.geometry.dispose();
+        if (node.material) node.material.dispose();
+      });
+      _selectedParcelMesh = null;
+    }
+  }
+
+  async function selectParcelAtClick(localX, localZ) {
+    const seq = ++_selectClickSeq;
+    const sx = localX + gcx;
+    const sy = -localZ + gcy;
+    try {
+      const r = await fetch(`/api/parcel-at-point?gcx=${gcx}&gcy=${gcy}&sx=${sx}&sy=${sy}`);
+      if (seq !== _selectClickSeq) return null;   // stale, drop
+      if (r.status === 404) {
+        clearSelectedParcel();
+        return null;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const parcel = await r.json();
+      if (seq !== _selectClickSeq) return null;   // also stale
+      clearSelectedParcel();
+      const mesh = buildSelectedParcelMesh(parcel);
+      if (mesh) {
+        _selectedParcelMesh = mesh;
+        scene.add(mesh);
+      }
+      return parcel;
+    } catch (err) {
+      console.error('selectParcelAtClick', err);
+      return null;
+    }
+  }
+
   // ── Inject Parcely button into base #info panel + its CSS ─────────
   const info = document.getElementById('info');
   if (info) {
@@ -210,32 +387,46 @@ export function init(args) {
   renderer.domElement.addEventListener('click', (e) => {
     // TODO(task-5): re-introduce _videoState gate (idle|panel) once the
     // drone video subsystem migrates here — clicks during preview/recording
-    // must not open the parcel popup.
-    if (!_parcelGroup || !_parcelGroup.visible || !_parcelMeshes.length) return;
+    // must not open the parcel popup or trigger single-parcel highlight.
+
     const r = renderer.domElement.getBoundingClientRect();
     mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;
     mouse.y = -((e.clientY - r.top) / r.height) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
-    const phits = raycaster.intersectObjects(_parcelMeshes, false);
-    if (!phits.length) return;
-    const p = phits[0].object.userData.parcel;
-    const popup = getBuildingPopup();
-    if (!popup) return;
-    popup.style.display = 'block';
-    popup.style.left = Math.min(e.clientX, innerWidth - 280) + 'px';
-    popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
-    popup.innerHTML = `
-      <span class="close" id="popup-close">&times;</span>
-      <h3>Parcela ${p.label}</h3>
-      <div class="row"><span class="label">Druh:</span> ${p.use_label}</div>
-      <div class="row"><span class="label">Výměra:</span> ${p.area_m2} m²</div>
-      <div class="row"><span class="label">RÚIAN ID:</span> ${p.id}</div>
-      <a href="https://nahlizenidokn.cuzk.cz/VyberParcelu/Parcela/InformaceO?id=${p.id}" target="_blank">Nahlížení do KN</a>
-    `;
-    document.getElementById('popup-close').addEventListener('click', () => {
-      popup.style.display = 'none';
-    });
-    e.stopPropagation();   // don't trigger base's building-popup
+
+    // Parcels visible? Try parcel-tile hit first — if hit, show popup and stop.
+    if (_parcelGroup && _parcelGroup.visible && _parcelMeshes.length) {
+      const phits = raycaster.intersectObjects(_parcelMeshes, false);
+      if (phits.length) {
+        const p = phits[0].object.userData.parcel;
+        const popup = getBuildingPopup();
+        if (popup) {
+          popup.style.display = 'block';
+          popup.style.left = Math.min(e.clientX, innerWidth - 280) + 'px';
+          popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
+          popup.innerHTML = `
+            <span class="close" id="popup-close">&times;</span>
+            <h3>Parcela ${p.label}</h3>
+            <div class="row"><span class="label">Druh:</span> ${p.use_label}</div>
+            <div class="row"><span class="label">Výměra:</span> ${p.area_m2} m²</div>
+            <div class="row"><span class="label">RÚIAN ID:</span> ${p.id}</div>
+            <a href="https://nahlizenidokn.cuzk.cz/VyberParcelu/Parcela/InformaceO?id=${p.id}" target="_blank">Nahlížení do KN</a>
+          `;
+          document.getElementById('popup-close').addEventListener('click', () => {
+            popup.style.display = 'none';
+          });
+        }
+        e.stopPropagation();   // don't trigger base's building-popup
+        return;
+      }
+    }
+
+    // No parcel hit — try terrain raycast for single-parcel highlight.
+    // (Base's bubble-phase building-popup handler still runs after this for buildings.)
+    const hits = raycaster.intersectObjects(allMeshes);
+    if (hits.length > 0) {
+      selectParcelAtClick(hits[0].point.x, hits[0].point.z);
+    }
   }, { capture: true });
 
   // TODO in subsequent tasks: single-parcel highlight, drone video panel, etc.

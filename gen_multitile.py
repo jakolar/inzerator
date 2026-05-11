@@ -736,6 +736,10 @@ def main():
   <div class="row"><span class="label">WGS84:</span> <span id="ci-wgs">—</span></div>
   <div class="row" style="margin-top:6px"><a id="ci-mapy" href="#" target="_blank">Mapy.cz 3D</a></div>
 </div>
+<!-- viewer-realtor-overlay.js depends on the #popup-kod span and the
+     #building-popup id existing — the overlay's MutationObserver looks
+     up containing parcels by querying #popup-kod's textContent. Don't
+     rename without updating the overlay. -->
 <div id="building-popup">
   <span class="close" id="popup-close">&times;</span>
   <h3 id="popup-title"></h3>

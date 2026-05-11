@@ -1859,8 +1859,10 @@ export function init(args) {
   if (popupEl) {
     const observer = new MutationObserver(() => {
       if (popupEl.style.display !== 'block') return;
-      if (popupEl.querySelector('#popup-video')) return;          // already added
       if (!popupEl.querySelector('#popup-kod')) return;            // not a building popup
+      // Reset stale link text from a prior session ("Načítám parcely…" / "Chyba: …").
+      const existing = popupEl.querySelector('#popup-video');
+      if (existing) { existing.textContent = '🎬 Vytvořit video'; return; }
       popupEl.insertAdjacentHTML('beforeend',
         `<a href="#" id="popup-video" style="color:#c0392b;font-weight:600">🎬 Vytvořit video</a>`);
       const link = document.getElementById('popup-video');

@@ -794,8 +794,6 @@ renderer.domElement.addEventListener('click', (e) => {
     document.getElementById('popup-kod').textContent = b.kod;
     document.getElementById('popup-mapy').href = 'https://mapy.com/en/letecka?x=' + b.wgs84[0].toFixed(7) + '&y=' + b.wgs84[1].toFixed(7) + '&z=20&m3d=1&height=92&yaw=0&pitch=-45';
     document.getElementById('popup-ruian').href = 'https://vdp.cuzk.cz/vdp/ruian/stavebniobjekty/' + b.kod;
-    const videoLink = document.getElementById('popup-video');
-    if (videoLink) videoLink.textContent = '🎬 Vytvořit video';
   }
 });
 

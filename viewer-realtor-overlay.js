@@ -417,6 +417,28 @@ export function init(args) {
     scene.add(_parcelHover);
   });
 
+  // Inject a static parcel-popup template (separate from base's static
+  // #building-popup so neither handler clobbers the other's DOM).
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="parcel-popup" style="
+      position: absolute; z-index: 20;
+      background: rgba(255,255,255,0.97); padding: 14px 18px; border-radius: 8px;
+      font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); min-width: 200px;
+      display: none; pointer-events: auto;
+    ">
+      <span class="close" id="parcel-popup-close" style="position:absolute;top:6px;right:10px;cursor:pointer;color:#999;font-size:18px">&times;</span>
+      <h3 id="parcel-popup-title" style="margin:0 0 8px;color:#1a73e8;font-size:15px"></h3>
+      <div class="row" style="margin:4px 0"><span class="label" style="color:#888">Druh:</span> <span id="parcel-popup-druh"></span></div>
+      <div class="row" style="margin:4px 0"><span class="label" style="color:#888">Výměra:</span> <span id="parcel-popup-area"></span> m²</div>
+      <div class="row" style="margin:4px 0"><span class="label" style="color:#888">RÚIAN ID:</span> <span id="parcel-popup-id"></span></div>
+      <a id="parcel-popup-link" href="#" target="_blank" style="color:#1a73e8;text-decoration:none;display:block;margin-top:8px">Nahlížení do KN</a>
+    </div>
+  `);
+  const parcelPopup = document.getElementById('parcel-popup');
+  document.getElementById('parcel-popup-close').addEventListener('click', () => {
+    parcelPopup.style.display = 'none';
+  });
+
   renderer.domElement.addEventListener('click', (e) => {
     // Don't react to clicks while a video is in flight — would contaminate
     // the recording with parcel highlights / popup state changes.
@@ -432,23 +454,14 @@ export function init(args) {
       const phits = raycaster.intersectObjects(_parcelMeshes, false);
       if (phits.length) {
         const p = phits[0].object.userData.parcel;
-        const popup = getBuildingPopup();
-        if (popup) {
-          popup.style.display = 'block';
-          popup.style.left = Math.min(e.clientX, innerWidth - 280) + 'px';
-          popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
-          popup.innerHTML = `
-            <span class="close" id="popup-close">&times;</span>
-            <h3>Parcela ${p.label}</h3>
-            <div class="row"><span class="label">Druh:</span> ${p.use_label}</div>
-            <div class="row"><span class="label">Výměra:</span> ${p.area_m2} m²</div>
-            <div class="row"><span class="label">RÚIAN ID:</span> ${p.id}</div>
-            <a href="https://nahlizenidokn.cuzk.cz/VyberParcelu/Parcela/InformaceO?id=${p.id}" target="_blank">Nahlížení do KN</a>
-          `;
-          document.getElementById('popup-close').addEventListener('click', () => {
-            popup.style.display = 'none';
-          });
-        }
+        parcelPopup.style.display = 'block';
+        parcelPopup.style.left = Math.min(e.clientX, innerWidth - 280) + 'px';
+        parcelPopup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
+        document.getElementById('parcel-popup-title').textContent = `Parcela ${p.label}`;
+        document.getElementById('parcel-popup-druh').textContent = p.use_label;
+        document.getElementById('parcel-popup-area').textContent = p.area_m2;
+        document.getElementById('parcel-popup-id').textContent = p.id;
+        document.getElementById('parcel-popup-link').href = `https://nahlizenidokn.cuzk.cz/VyberParcelu/Parcela/InformaceO?id=${p.id}`;
         e.stopPropagation();   // don't trigger base's building-popup
         return;
       }

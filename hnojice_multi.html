@@ -784,25 +784,18 @@ renderer.domElement.addEventListener('click', (e) => {
     // Highlight building on 3D surface
     highlightBuilding(b);
 
-    // Popup
+    // Popup — assign into the static template (preserves stable IDs for MutationObserver)
     popup.style.display = 'block';
     popup.style.left = Math.min(e.clientX, innerWidth - 250) + 'px';
     popup.style.top = Math.min(e.clientY, innerHeight - 200) + 'px';
-    const title = b.cislo ? ('Hnojice č.p. ' + b.cislo) : ('SO-' + b.kod);
-    const mapyHref = 'https://mapy.com/en/letecka?x=' + b.wgs84[0].toFixed(7) + '&y=' + b.wgs84[1].toFixed(7) + '&z=20&m3d=1&height=92&yaw=0&pitch=-45';
-    const ruianHref = 'https://vdp.cuzk.cz/vdp/ruian/stavebniobjekty/' + b.kod;
-    popup.innerHTML = `
-      <span class="close" id="popup-close">&times;</span>
-      <h3>${title}</h3>
-      <div class="row"><span class="label">Č.p.:</span> ${b.cislo || '—'}</div>
-      <div class="row"><span class="label">Plocha:</span> ${b.plocha} m²</div>
-      <div class="row"><span class="label">Kód:</span> ${b.kod}</div>
-      <a href="${mapyHref}" target="_blank">Mapy.cz 3D</a>
-      <a href="${ruianHref}" target="_blank">RÚIAN detail</a>
-    `;
-    document.getElementById('popup-close').addEventListener('click', () => {
-      popup.style.display = 'none';
-    });
+    document.getElementById('popup-title').textContent = b.cislo ? ('Hnojice č.p. ' + b.cislo) : ('SO-' + b.kod);
+    document.getElementById('popup-cislo').textContent = b.cislo || '—';
+    document.getElementById('popup-plocha').textContent = b.plocha;
+    document.getElementById('popup-kod').textContent = b.kod;
+    document.getElementById('popup-mapy').href = 'https://mapy.com/en/letecka?x=' + b.wgs84[0].toFixed(7) + '&y=' + b.wgs84[1].toFixed(7) + '&z=20&m3d=1&height=92&yaw=0&pitch=-45';
+    document.getElementById('popup-ruian').href = 'https://vdp.cuzk.cz/vdp/ruian/stavebniobjekty/' + b.kod;
+    const videoLink = document.getElementById('popup-video');
+    if (videoLink) videoLink.textContent = '🎬 Vytvořit video';
   }
 });
 

@@ -165,6 +165,7 @@ dir.castShadow = true;
 scene.add(dir);
 
 const allMeshes = [];
+const allSimpMeshes = [];
 let origPositions = [];
 const texLoader = new THREE.TextureLoader();
 const gltfLoader = new GLTFLoader();
@@ -712,7 +713,6 @@ function highlightBuilding(building) {
 const popup = document.getElementById('building-popup');
 document.getElementById('popup-close').addEventListener('click', () => {
   popup.style.display = 'none';
-  restoreMeshColors();
 });
 
 function isPointInPolygon(px, pz, coords, buffer) {

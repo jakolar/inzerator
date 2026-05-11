@@ -208,6 +208,9 @@ export function init(args) {
   });
 
   renderer.domElement.addEventListener('click', (e) => {
+    // TODO(task-5): re-introduce _videoState gate (idle|panel) once the
+    // drone video subsystem migrates here — clicks during preview/recording
+    // must not open the parcel popup.
     if (!_parcelGroup || !_parcelGroup.visible || !_parcelMeshes.length) return;
     const r = renderer.domElement.getBoundingClientRect();
     mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;

@@ -850,6 +850,14 @@ After HTML injection, add ALL panel handlers verbatim from base (around lines 11
 
 Plus contextmenu on `renderer.domElement` for right-click → openVideoPanel.
 
+⚠️ **Re-introduce video-state gate on parcel-click + parcel-mousemove listeners** (left over from Task 3). Now that `_videoState` lives in the overlay, add to BOTH the existing parcel-click listener (around line 210, marked `TODO(task-5)`) and the existing mousemove listener:
+
+```js
+if (_videoState !== 'idle' && _videoState !== 'panel') return;
+```
+
+This restores the pre-refactor behavior where clicks/hovers during recording or preview don't contaminate the recording with parcel popups / yellow outlines. Remove the `TODO(task-5)` comment after wiring.
+
 Plus `freeRecordBtn` click handler:
 ```js
 const freeBtn = document.getElementById('freeRecordBtn');

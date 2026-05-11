@@ -884,7 +884,13 @@ function applySunsetTint() {
       }
     });
   }
-  // TODO(task-5): re-add tint of selected-parcel highlight; lives in overlay now.
+  // TODO(task-5): when applySunsetTint moves to overlay, traverse _selectedParcelMesh
+  // the same way _parcelGroup is traversed above:
+  //   - push { material, hex: material.color.getHex() } into _sunsetTintRestore
+  //     so restoreSunsetTint reverts it on toggle-off.
+  //   - setRGB(orig.r * tint.r, orig.g * tint.g, orig.b * tint.b) — multiply, not setHex,
+  //     so the yellow base is preserved.
+  // Original block removed in commit b5cfbcc; reference: git show 6469ca6:hnojice_multi.html L891-L899
 }
 
 function restoreSunsetTint() {

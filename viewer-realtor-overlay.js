@@ -429,5 +429,5 @@ export function init(args) {
     }
   }, { capture: true });
 
-  // TODO in subsequent tasks: single-parcel highlight, drone video panel, etc.
+  // TODO in subsequent tasks: drone video panel + presets + highlights, sunset tint, free flythrough.
 }

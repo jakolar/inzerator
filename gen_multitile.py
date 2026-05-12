@@ -126,7 +126,7 @@ def _snap_vertices_to_footprints(vertices, footprints, cx, cy, snap_dist=1.2, fr
     return verts
 
 
-def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian_footprints=None, simplify=True, flat=False, max_height=50, smooth_sigma=0):
+def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian_footprints=None, simplify=True, flat=False, max_height=50, smooth_sigma=0, apply_max_filter=True):
     """Extract one tile mesh + UV data.
 
     `dmp_paths` may be a single path (legacy) or a list of paths covering the
@@ -178,7 +178,7 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
     # When step > 2, plain stride-sample drops tall thin features (towers,
     # narrow trees) that fall between sample centres. Apply a max filter at
     # the step radius first so any peak in the window survives the subsample.
-    if step > 2:
+    if step > 2 and apply_max_filter:
         from scipy.ndimage import maximum_filter
         patch_norm = maximum_filter(patch_norm, size=step)
     patch_ds = patch_norm[start:end:step, start:end:step]
@@ -707,7 +707,8 @@ def main():
                                 simplify=not args.no_simplify,
                                 flat=args.flat,
                                 max_height=max_height,
-                                smooth_sigma=args.smooth)
+                                smooth_sigma=args.smooth,
+                                apply_max_filter=(lod_profile is None))
             if tile:
                 tile["grid_col"] = gc
                 tile["grid_row"] = gr

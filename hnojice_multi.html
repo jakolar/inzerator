@@ -168,7 +168,7 @@ controls.dampingFactor = 0.15;
 controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
 controls.screenSpacePanning = true;
 controls.minDistance = 1;
-controls.maxDistance = 2000;
+controls.maxDistance = 15000;   // match camera far clip — required to see the LOD panorama
 controls.maxPolarAngle = Math.PI / 2.05;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.8));
@@ -194,10 +194,12 @@ dataLoaded.then(() => {
         scene.add(mesh);
         allMeshes.push(mesh);
   
-        // Load ortofoto
+        // Load ortofoto. Panorama tiles cover ~3000m and force-use a low res
+        // (256 px → ~11.7m/px) — full-res would be a 12× heavier texture for
+        // a tile that's typically viewed from >1km away.
         const bbox = tile.sjtsk_bbox;
         const wbbox = tile.wgs_bbox;
-        const ortSize = document.getElementById('ortho-quality').value;
+        const ortSize = tile.is_panorama ? '256' : document.getElementById('ortho-quality').value;
         const ortUrl = `/proxy/ortofoto?BBOX=${bbox[0]},${bbox[1]},${bbox[2]},${bbox[3]}&WBBOX=${wbbox[0]},${wbbox[1]},${wbbox[2]},${wbbox[3]}&size=${ortSize}`;
         texLoader.load(ortUrl, (texture) => {
           texture.colorSpace = THREE.SRGBColorSpace;

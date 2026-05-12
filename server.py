@@ -863,9 +863,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except ValueError:
             zoom = 19
         # zoom 23 is the deepest LOD ČÚZK serves (~1.87 cm/px effective).
-        # Beyond zoom 21 the data is server-side interpolated, but tiles still
-        # load fine — accept anything in 17–23.
-        zoom = max(17, min(23, zoom))
+        # Beyond zoom 21 the data is server-side interpolated.
+        # Below 17 is for panoramic / horizon use (LOD outer rings) — z=10
+        # is ~80m/px, z=11 ~40m/px, z=12 ~20m/px. Min z=7 prevents
+        # accidentally fetching a single tile covering an entire country.
+        zoom = max(7, min(23, zoom))
         n = 2 ** zoom
 
         def deg2tile(lat, lon):

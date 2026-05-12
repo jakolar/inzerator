@@ -1048,7 +1048,12 @@ dataLoaded.then(() => {{
       Math.max(...panoramaTiles.map(t => t.wgs_bbox[2])),
       Math.max(...panoramaTiles.map(t => t.wgs_bbox[3])),
     ];
-    const panUrl = `/proxy/ortofoto?BBOX=${{panBbox.join(',')}}&WBBOX=${{panWgsBbox.join(',')}}&size=1024`;
+    // zoom=11 is critical: panorama covers ~9km × 9km. Server default zoom=19
+    // would require ~14000 XYZ tile fetches from ČÚZK for this bbox; the
+    // request would hang and ultimately fail. z=11 (~78m/px ČÚZK source)
+    // composited to size=1024 gives ~9m/px effective resolution — plenty
+    // for tiles viewed from 1.5km+ away.
+    const panUrl = `/proxy/ortofoto?BBOX=${{panBbox.join(',')}}&WBBOX=${{panWgsBbox.join(',')}}&size=1024&zoom=11`;
     sharedPanTexPromise = new Promise((resolve, reject) => {{
       texLoader.load(panUrl, resolve, undefined, reject);
     }});

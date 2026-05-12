@@ -363,6 +363,139 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
     }
 
 
+def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_height, skirt_depth):
+    """Extract a coarse outer-ring panorama tile mesh + UV data.
+
+    Samples DMP directly at `step` metre resolution via rasterio.merge, builds a
+    regular n×n vertex grid, adds a 4-edge skirt wall (vertical drop of
+    skirt_depth metres) along all tile borders, and returns the same
+    {"vertices", "faces", "uvs"} dict that save_tile_glb() expects.
+    """
+    from rasterio.merge import merge
+
+    bounds = (cx - half, cy - half, cx + half, cy + half)
+    srcs = [rasterio.open(p) for p in dmp_paths]
+    try:
+        merged, transform = merge(srcs, bounds=bounds, res=(step, step), nodata=-9999.0)
+    finally:
+        for s in srcs:
+            s.close()
+
+    data = merged[0]  # shape (n, n)
+    valid_mask = (data > 0) & (data != -9999.0)
+
+    n = round(2 * half / step) + 1  # e.g. 61 for half=1500, step=50
+
+    # Build terrain grid vertices: local_x = -half + c*step, local_z = -half + r*step
+    vertices = []
+    for r in range(n):
+        for c in range(n):
+            local_x = -half + c * step
+            local_z = -half + r * step
+            # data row 0 = south (cy-half), row n-1 = north (cy+half);
+            # but rasterio merge with S-JTSK (northing increases upward) flips rows,
+            # so row 0 in the array = northern edge. Mirror to match local_z convention.
+            dr = (n - 1) - r
+            dc = c
+            if dr < data.shape[0] and dc < data.shape[1] and valid_mask[dr, dc]:
+                raw_y = float(data[dr, dc]) - global_ground_z
+                y = float(max(0.0, min(raw_y, max_height)))
+            else:
+                y = 0.0
+            vertices.append([local_x, y, local_z])
+
+    # Terrain faces (two tris per quad)
+    faces = []
+    for r in range(n - 1):
+        for c in range(n - 1):
+            i = r * n + c
+            # quad: (r,c), (r+1,c), (r,c+1), (r+1,c+1)
+            faces.append([i,         i + n,     i + 1])
+            faces.append([i + 1,     i + n,     i + n + 1])
+
+    # Skirt rim — add n bottom vertices per edge (4 edges), then quad strips.
+    # Edge order: top (r=0), bottom (r=n-1), left (c=0), right (c=n-1).
+    # Each skirt bottom vertex sits directly below its terrain edge vertex at y - skirt_depth.
+    base_vert_count = len(vertices)
+
+    def skirt_bottom_y(vi):
+        return vertices[vi][1] - skirt_depth
+
+    # Top edge (r=0, c=0..n-1)  — outward normal faces -Z direction
+    top_skirt_start = base_vert_count
+    for c in range(n):
+        vi = 0 * n + c
+        vx, vy, vz = vertices[vi]
+        vertices.append([vx, vy - skirt_depth, vz])
+    for c in range(n - 1):
+        ti = 0 * n + c          # terrain top-edge vertex at (r=0, c)
+        si = top_skirt_start + c  # skirt bottom vertex below it
+        # quad: terrain[c], terrain[c+1], skirt[c], skirt[c+1]
+        # outward normal = -Z → wind CW from -Z side → CCW from outside
+        faces.append([ti,     ti + 1,     si])
+        faces.append([si,     ti + 1,     si + 1])
+
+    # Bottom edge (r=n-1, c=0..n-1) — outward normal faces +Z
+    bot_skirt_start = len(vertices)
+    for c in range(n):
+        vi = (n - 1) * n + c
+        vx, vy, vz = vertices[vi]
+        vertices.append([vx, vy - skirt_depth, vz])
+    for c in range(n - 1):
+        ti = (n - 1) * n + c
+        si = bot_skirt_start + c
+        # outward normal = +Z → wind opposite order
+        faces.append([ti + 1, ti,     si + 1])
+        faces.append([si + 1, ti,     si])
+
+    # Left edge (c=0, r=0..n-1) — outward normal faces -X
+    left_skirt_start = len(vertices)
+    for r in range(n):
+        vi = r * n + 0
+        vx, vy, vz = vertices[vi]
+        vertices.append([vx, vy - skirt_depth, vz])
+    for r in range(n - 1):
+        ti = r * n + 0
+        si = left_skirt_start + r
+        # outward normal = -X
+        faces.append([ti + n, ti,     si + 1])
+        faces.append([si + 1, ti,     si])
+
+    # Right edge (c=n-1, r=0..n-1) — outward normal faces +X
+    right_skirt_start = len(vertices)
+    for r in range(n):
+        vi = r * n + (n - 1)
+        vx, vy, vz = vertices[vi]
+        vertices.append([vx, vy - skirt_depth, vz])
+    for r in range(n - 1):
+        ti = r * n + (n - 1)
+        si = right_skirt_start + r
+        # outward normal = +X
+        faces.append([ti,     ti + n,     si])
+        faces.append([si,     ti + n,     si + 1])
+
+    # UVs: uniform [0..1] for terrain grid; skirt verts copy their parent edge UV
+    all_sx = np.array([cx + v[0] for v in vertices])
+    # Note: in S-JTSK, northing = cy - local_z (Z increases southward in local space)
+    all_sy = np.array([cy - v[2] for v in vertices])
+    all_lon, all_lat = SJTSK_TO_WGS.transform(all_sx, all_sy)
+
+    lon_min = float(all_lon[:base_vert_count].min())
+    lon_max = float(all_lon[:base_vert_count].max())
+    lat_min = float(all_lat[:base_vert_count].min())
+    lat_max = float(all_lat[:base_vert_count].max())
+    lon_range = max(lon_max - lon_min, 1e-10)
+    lat_range = max(lat_max - lat_min, 1e-10)
+
+    uvs = []
+    for i in range(len(vertices)):
+        u = float((all_lon[i] - lon_min) / lon_range)
+        v_uv = float((all_lat[i] - lat_min) / lat_range)
+        uvs.append([u, v_uv])
+
+    return {"vertices": vertices, "faces": faces, "uvs": uvs}
+
+
 LOCATIONS = {
     "hnojice":  {"cx": -547700,   "cy": -1107700,   "output": "hnojice_multi.html", "label": "Hnojice"},
     "santovka": {"cx": -546820.8, "cy": -1121852.6, "output": "santovka_multi.html", "label": "Šantovka"},
@@ -399,6 +532,10 @@ def main():
         help="Override ground reference (m). 0 = absolute heights above sea level. Default: auto (5th percentile)")
     parser.add_argument("--max-height", type=float, default=None,
         help="Override max height clip (m). Default: area_max - ground_z + 30. Use higher value for sharp peaks with tall structures.")
+    parser.add_argument("--add-panorama", action="store_true",
+        help="Generate 8 outer-ring panorama tiles (3000m, 50m step) around the existing 25x25 inner grid and APPEND them to the existing data.json. Skips inner tile generation.")
+    parser.add_argument("--tiles-dir", default=None,
+        help="Override tile output directory (default: tiles_<location>). Use tiles_hnojice_multi for the existing Hnojice viewer with symlinked tile data.")
     args = parser.parse_args()
 
     loc = LOCATIONS[args.location]
@@ -463,6 +600,83 @@ def main():
         max_height = float(args.max_height)
         print(f"  max_height: {max_height:.1f}m (override)")
     print(f"  Global ground_z: {global_ground_z:.1f}m, max_height: {max_height:.1f}m (area_max={area_max:.1f}m, {len(area_paths)} TIFs)")
+
+    # --add-panorama: generate 8 outer-ring tiles and append to existing data.json
+    if args.add_panorama:
+        tiles_dir = args.tiles_dir or f"tiles_{args.location}"
+        data_path = Path(tiles_dir) / f"{args.location}_data.json"
+        if not data_path.exists():
+            raise SystemExit(f"data.json not found at {data_path} — run full tile generation first.")
+        existing_data = json.loads(data_path.read_text())
+        if "tiles" not in existing_data or not isinstance(existing_data["tiles"], list):
+            raise SystemExit(f"{data_path} does not contain a 'tiles' array.")
+
+        PANORAMA_OFFSETS = [
+            (-3000, +3000),  # NW
+            (    0, +3000),  # N
+            (+3000, +3000),  # NE
+            (-3000,     0),  # W
+            (+3000,     0),  # E
+            (-3000, -3000),  # SW
+            (    0, -3000),  # S
+            (+3000, -3000),  # SE
+        ]
+        PANO_HALF = 1500   # 3000m tile, half = 1500m
+        PANO_STEP = 50
+        SKIRT_DEPTH = 40
+
+        pano_count = 0
+        for i, (offset_x, offset_z) in enumerate(PANORAMA_OFFSETS):
+            pcx = grid_cx + offset_x
+            pcy = grid_cy - offset_z  # Z-axis inversion
+
+            dmp_paths = find_tiffs(pcx, pcy, half_m=PANO_HALF)
+            if not dmp_paths:
+                print(f"  Skipping panorama tile at offset ({offset_x}, {offset_z}) — no DMP coverage")
+                continue
+
+            print(f"  Generating panorama tile {i} at offset ({offset_x:+d}, {offset_z:+d}), center=({pcx:.0f}, {pcy:.0f}) [{len(dmp_paths)} TIFs]")
+            tile = extract_panorama_tile(
+                dmp_paths, pcx, pcy,
+                half=PANO_HALF, step=PANO_STEP,
+                global_ground_z=global_ground_z,
+                max_height=max_height,
+                skirt_depth=SKIRT_DEPTH,
+            )
+
+            glb_name = f"panorama_{i}.glb"
+            glb_path = Path(tiles_dir) / glb_name
+            size = save_tile_glb(tile, offset_x=offset_x, offset_z=offset_z, output_path=str(glb_path))
+            print(f"    → {glb_path} ({size // 1024} KB, {len(tile['vertices'])} verts, {len(tile['faces'])} faces)")
+
+            # WGS84 bbox via pyproj (same transformer used elsewhere)
+            sjtsk_bbox = [pcx - PANO_HALF, pcy - PANO_HALF, pcx + PANO_HALF, pcy + PANO_HALF]
+            corners_sx = np.array([sjtsk_bbox[0], sjtsk_bbox[2], sjtsk_bbox[0], sjtsk_bbox[2]])
+            corners_sy = np.array([sjtsk_bbox[1], sjtsk_bbox[1], sjtsk_bbox[3], sjtsk_bbox[3]])
+            corners_lon, corners_lat = SJTSK_TO_WGS.transform(corners_sx, corners_sy)
+            wgs_bbox = [
+                float(corners_lon.min()), float(corners_lat.min()),
+                float(corners_lon.max()), float(corners_lat.max()),
+            ]
+
+            panorama_meta = {
+                "grid_col": None,
+                "grid_row": None,
+                "offset_x": offset_x,
+                "offset_z": offset_z,
+                "center_sjtsk": [float(pcx), float(pcy)],
+                "ground_z": global_ground_z,
+                "wgs_bbox": wgs_bbox,
+                "sjtsk_bbox": sjtsk_bbox,
+                "glb_url": f"{tiles_dir}/{glb_name}",
+                "is_panorama": True,
+            }
+            existing_data["tiles"].append(panorama_meta)
+            pano_count += 1
+
+        data_path.write_text(json.dumps(existing_data))
+        print(f"Added {pano_count} panorama tiles to {data_path}")
+        return
 
     # Pre-fetch RÚIAN footprints for vertex snapping
     import requests as req

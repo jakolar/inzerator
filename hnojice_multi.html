@@ -211,6 +211,29 @@ const gltfLoader = new GLTFLoader();
 const useGLB = true;
 
 dataLoaded.then(() => {
+  // ── Phase 3B: shared panorama texture (1 fetch, UV remap per mesh) ──
+  const panoramaTiles = tiles.filter(t => t.is_panorama);
+  let sharedPanTexPromise = null;
+  let panBbox = null;   // [xmin, ymin, xmax, ymax] in S-JTSK
+  if (panoramaTiles.length > 0) {
+    panBbox = [
+      Math.min(...panoramaTiles.map(t => t.sjtsk_bbox[0])),
+      Math.min(...panoramaTiles.map(t => t.sjtsk_bbox[1])),
+      Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[2])),
+      Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[3])),
+    ];
+    const panWgsBbox = [
+      Math.min(...panoramaTiles.map(t => t.wgs_bbox[0])),
+      Math.min(...panoramaTiles.map(t => t.wgs_bbox[1])),
+      Math.max(...panoramaTiles.map(t => t.wgs_bbox[2])),
+      Math.max(...panoramaTiles.map(t => t.wgs_bbox[3])),
+    ];
+    const panUrl = `/proxy/ortofoto?BBOX=${panBbox.join(',')}&WBBOX=${panWgsBbox.join(',')}&size=1024`;
+    sharedPanTexPromise = new Promise((resolve, reject) => {
+      texLoader.load(panUrl, resolve, undefined, reject);
+    });
+  }
+
   for (const tile of tiles) {
     if (useGLB && tile.glb_url) {
       const setupMesh = (geometry) => {
@@ -219,7 +242,34 @@ dataLoaded.then(() => {
         mesh.userData = { tile, mat, geo: geometry, ortofotoTexture: null, ortofotoLoaded: false };
         scene.add(mesh);
         allMeshes.push(mesh);
-  
+
+        // Phase 3B: panorama tiles use the single shared texture with UV remap.
+        if (tile.is_panorama && sharedPanTexPromise) {
+          const FLIP_V = true;  // ČÚZK image Y=0 is top (north); Three.js V=0 is bottom
+          sharedPanTexPromise.then(sharedTex => {
+            sharedTex.colorSpace = THREE.SRGBColorSpace;
+            sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
+            const tex = sharedTex.clone();
+            tex.needsUpdate = true;
+            const panWidth  = panBbox[2] - panBbox[0];
+            const panHeight = panBbox[3] - panBbox[1];
+            tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / panWidth;
+            tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / panHeight;
+            if (FLIP_V) {
+              tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
+              tex.offset.y = 1 - (tile.sjtsk_bbox[3] - panBbox[1]) / panHeight;
+            } else {
+              tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
+              tex.offset.y = (tile.sjtsk_bbox[1] - panBbox[1]) / panHeight;
+            }
+            mesh.material.map = tex;
+            mesh.material.needsUpdate = true;
+            mesh.userData.ortofotoLoaded = true;
+            mesh.userData.ortofotoTexture = tex;
+          }).catch(e => console.warn('panorama shared texture failed:', e));
+          return;   // skip per-tile ortho fetch
+        }
+
         // Load ortofoto. Panorama tiles cover ~3000m and force-use a low res
         // (256 px → ~11.7m/px) — full-res would be a 12× heavier texture for
         // a tile that's typically viewed from >1km away.

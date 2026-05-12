@@ -125,6 +125,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { Sky } from 'three/addons/objects/Sky.js';
 
 proj4.defs("EPSG:5514", "+proj=krovak +lat_0=49.5 +lon_0=24.83333333333333 +alpha=30.28813975277778 +k=0.9999 +x_0=0 +y_0=0 +ellps=bessel +towgs84=570.8,85.7,462.8,4.998,1.587,5.261,3.56 +units=m +no_defs");
 
@@ -141,11 +142,36 @@ const dataLoaded = fetch('tiles_hnojice_multi/hnojice_data.json', { cache: 'no-s
 
 
 const scene = new THREE.Scene();
-// Haze blue — matched to fog so horizon blends seamlessly into background.
-scene.background = new THREE.Color(0xb0c4d8);
-// Exponential fog: 50% density at ~5.5km, full fade by ~10km. Masks the
-// (future) LOD ring boundaries and gives atmospheric perspective.
-scene.fog = new THREE.FogExp2(0xb0c4d8, 0.00012);
+// Sky: physically-based atmospheric scattering. Sun position drives
+// realistic horizon colors and lighting hue. Replaces the previous
+// flat scene.background (was 0xb0c4d8 haze). The sky mesh is huge
+// (450km radius) so it always lies beyond every tile.
+const sky = new Sky();
+sky.scale.setScalar(450000);
+scene.add(sky);
+const skyU = sky.material.uniforms;
+skyU.turbidity.value = 8;        // atmospheric haze; 10 = thick, 2 = clear
+skyU.rayleigh.value = 2;          // blue scattering; lower = paler sky
+skyU.mieCoefficient.value = 0.005;
+skyU.mieDirectionalG.value = 0.8;
+const SUN_ELEVATION_DEG = 35;     // midday default; sunset preset will animate this lower
+const SUN_AZIMUTH_DEG = 180;      // south
+const sunVec = new THREE.Vector3().setFromSphericalCoords(
+  1,
+  THREE.MathUtils.degToRad(90 - SUN_ELEVATION_DEG),
+  THREE.MathUtils.degToRad(SUN_AZIMUTH_DEG),
+);
+skyU.sunPosition.value.copy(sunVec);
+// Expose so the drone-video overlay can animate the sun for sunset preset.
+// (TODO Phase 3A-extension: wire applySunsetTint to ramp sky.material.uniforms.sunPosition.)
+window._viewerSky = sky;
+
+// Match fog color to the sky's horizon haze so terrain blends seamlessly
+// into the sky at distance. The horizon is roughly the sky's haze color
+// at low sun elevations; using a slightly tinted version of the sun's
+// scattering color (warm-ish at sunset, blue-ish at midday) prevents the
+// hard "fog wall" effect.
+scene.fog = new THREE.FogExp2(0xb8c8d8, 0.00012);
 
 // near=1.0 (was 0.1) reclaims depth precision; far=15000 (was 5000) makes
 // room for the future L3 panorama ring at ~7.2km. Linear depth buffer

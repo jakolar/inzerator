@@ -781,12 +781,15 @@ scene.background = new THREE.Color(0xb0c4d8);
 scene.fog = new THREE.FogExp2(0xb0c4d8, 0.00012);
 
 // near=1.0 (was 0.1) reclaims depth precision; far=15000 (was 5000) makes
-// room for the future L3 panorama ring at ~7.2km. Both required by the
-// logarithmicDepthBuffer renderer setting below.
+// room for the future L3 panorama ring at ~7.2km. Linear depth buffer
+// (logarithmicDepthBuffer was tried but broke cadastre + parcel polygonOffset
+// overlays — see commit history). Parcels + cadastre live only in L0/L1
+// (within 900m of subject) where 24-bit depth precision is still ~0.05m;
+// distant L3 terrain accepts ~1m precision since fog masks z-fighting there.
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 15000);
 camera.position.set(200, 150, 200);
 
-const renderer = new THREE.WebGLRenderer({{ antialias: true, logarithmicDepthBuffer: true }});
+const renderer = new THREE.WebGLRenderer({{ antialias: true }});
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(devicePixelRatio);
 renderer.shadowMap.enabled = true;

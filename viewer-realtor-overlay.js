@@ -140,7 +140,11 @@ export function init(args) {
 
   async function ensureParcelsData() {
     if (_parcels) return _parcels;
-    const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=2000`);
+    // cache: 'no-store' bypasses browser disk cache — without it, an older
+    // server response with stale Y values (e.g. from before DMP TIFFs were
+    // cached) could persist across sessions and cause parcels to render
+    // buried under the terrain at Y=0.17 instead of at their proper elevation.
+    const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=2000`, { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _parcels = await r.json();
     return _parcels;

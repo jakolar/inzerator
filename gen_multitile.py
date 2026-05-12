@@ -983,7 +983,10 @@ const gcx = {gcx};
 const gcy = {gcy};
 let tiles = [];
 let ruianBuildings = [];
-const dataLoaded = fetch('tiles_{args.location}/{args.location}_data.json')
+// cache: 'no-store' — data.json gets appended-to (e.g. when adding panorama
+// LOD tiles via gen_multitile.py --add-panorama). Disk caching would mask
+// the new tiles until a hard refresh.
+const dataLoaded = fetch('tiles_{args.location}/{args.location}_data.json', {{ cache: 'no-store' }})
   .then(r => {{ if (!r.ok) throw new Error(`HTTP ${{r.status}}`); return r.json(); }})
   .then(d => {{ tiles = d.tiles; ruianBuildings = d.ruianBuildings; }});
 

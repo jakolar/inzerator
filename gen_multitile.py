@@ -265,91 +265,15 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
             "wgs_bbox": [lon_min, lat_min, lon_max, lat_max],
             "sjtsk_bbox": [cx - half, cy - half, cx + half, cy + half],
         }
-    try:
-        mesh_o3d = o3d.geometry.TriangleMesh()
-        mesh_o3d.vertices = o3d.utility.Vector3dVector(np.array(vertices))
-        mesh_o3d.triangles = o3d.utility.Vector3iVector(np.array(faces))
-        mesh_o3d.compute_vertex_normals()
-
-        # Adaptive simplification based on content complexity
-        heights = np.array([v[1] for v in vertices])
-        max_height = heights.max()
-        height_std = heights.std()
-
-        if height_std > 2.0:
-            divisor = 8
-        elif height_std > 0.5:
-            divisor = 12
-        else:
-            divisor = 20
-        target = max(len(faces) // divisor, 100)
-        # boundary_weight=1000 asks Open3D to preserve topological boundary
-        # (outer edge of tile grid) — prevents thin gaps on seams with adjacent
-        # tiles after simplification.
-        simplified = mesh_o3d.simplify_quadric_decimation(target, boundary_weight=1000.0)
-
-        # Clean up artifacts from decimation that cause micro-holes in render:
-        # degenerate triangles (zero area), duplicated/overlapping triangles,
-        # duplicated vertices at same position, non-manifold edges.
-        simplified.remove_degenerate_triangles()
-        simplified.remove_duplicated_triangles()
-        simplified.remove_duplicated_vertices()
-        simplified.remove_non_manifold_edges()
-
-        sv = np.asarray(simplified.vertices)
-        sf = np.asarray(simplified.triangles)
-
-        # Clip negative heights from simplification interpolation
-        sv[:, 1] = np.clip(sv[:, 1], 0, 50)
-
-        # Snap boundary vertices back to exact seam positions AND restore
-        # height from source raster. Both adjacent tiles sample the same
-        # world-space raster at the seam, so Y values match exactly → no
-        # visible blue-line gap at tile edges.
-        lx_min_edge = local0
-        lx_max_edge = local0 + (ds_cols - 1) * local_step
-        lz_min_edge = local0
-        lz_max_edge = local0 + (ds_rows - 1) * local_step
-        SNAP_TOL = 0.5
-        for vi in range(len(sv)):
-            x, _, z = sv[vi]
-            on_x_edge = abs(x - lx_min_edge) < SNAP_TOL or abs(x - lx_max_edge) < SNAP_TOL
-            on_z_edge = abs(z - lz_min_edge) < SNAP_TOL or abs(z - lz_max_edge) < SNAP_TOL
-            if on_x_edge:
-                sv[vi, 0] = lx_min_edge if abs(x - lx_min_edge) < abs(x - lx_max_edge) else lx_max_edge
-            if on_z_edge:
-                sv[vi, 2] = lz_min_edge if abs(z - lz_min_edge) < abs(z - lz_max_edge) else lz_max_edge
-            # For any vertex on the tile boundary, restore its height from the
-            # source raster at nearest grid cell. This guarantees that both
-            # adjacent tiles assign the SAME Y to shared seam vertices.
-            if on_x_edge or on_z_edge:
-                c_i = int(round((sv[vi, 0] - local0) / local_step))
-                r_i = int(round((sv[vi, 2] - local0) / local_step))
-                c_i = max(0, min(ds_cols - 1, c_i))
-                r_i = max(0, min(ds_rows - 1, r_i))
-                # Seam vertices MUST match between adjacent tiles. Each tile
-                # reads its own rasterio.merge output with different bounds, so
-                # negative values (pits) can mismatch across the seam and create
-                # vertical walls. Clip seam height to ≥ 0 — pit depth is lost
-                # exactly on tile edges but is preserved in the tile interior.
-                sv[vi, 1] = float(max(0, patch_ds[r_i, c_i]))
-
-        simp_vertices = sv.tolist()
-        simp_faces = sf.tolist()
-
-        # Recompute UV for simplified vertices
-        s_sx = np.array([cx + v[0] for v in simp_vertices])
-        s_sy = np.array([cy - v[2] for v in simp_vertices])
-        s_lon, s_lat = SJTSK_TO_WGS.transform(s_sx, s_sy)
-        simp_uvs = []
-        for i in range(len(simp_vertices)):
-            u = (s_lon[i] - lon_min) / max(lon_max - lon_min, 1e-10)
-            v = (s_lat[i] - lat_min) / max(lat_max - lat_min, 1e-10)
-            simp_uvs.append([float(u), float(v)])
-    except Exception as e:
-        print(f"    Simplification failed: {e}")
-
-    print(f"    Full: {len(vertices)} verts → Simplified: {len(simp_vertices)} verts ({100-len(simp_vertices)/len(vertices)*100:.0f}% reduction)")
+    # open3d simplify_quadric_decimation segfaults on this macOS / Python 3.9
+    # environment with open3d 0.18.0 regardless of mesh size — confirmed broken.
+    # Use the raw subsampled grid directly. For LOD Phase 2 this is correct:
+    # each ring already has the intended mesh density from step_px, so additional
+    # decimation would only discard carefully-placed vertices.
+    simp_vertices = vertices
+    simp_faces = faces
+    simp_uvs = uvs
+    print(f"    Full: {len(vertices)} verts (raw grid, open3d decimation skipped)")
 
     return {
         "vertices": simp_vertices,
@@ -502,6 +426,29 @@ LOCATIONS = {
     "strazek":  {"cx": -625362.12, "cy": -1130203.92, "output": "strazek_multi.html", "label": "Strážek č.p. 52"},
 }
 
+LOD_PROFILES = {
+    "village_flat": {
+        # Rings ordered inner → outer. Each tile picks the FIRST ring whose
+        # r_max is >= its distance from the grid center.
+        "rings": [
+            {"r_max": 360,  "step_m": 0.5, "step_px": 1, "snap_buildings": True,  "buildings_min_m2": 0},
+            {"r_max": 900,  "step_m": 1.0, "step_px": 2, "snap_buildings": True,  "buildings_min_m2": 30},
+            {"r_max": 2400, "step_m": 4.0, "step_px": 8, "snap_buildings": False, "buildings_min_m2": None},
+        ],
+        "fog_density": 0.00012,
+        "fog_color": "0xb0c4d8",
+        "far_clip": 15000,
+    },
+}
+
+
+def get_lod_ring(profile, distance_m):
+    """Return the ring config that applies to a tile at the given distance from anchor."""
+    for ring in profile["rings"]:
+        if distance_m <= ring["r_max"]:
+            return ring
+    return profile["rings"][-1]  # fallback to outermost ring
+
 
 def discover_tiffs():
     """Scan cache/dmpok_tiff_*/ and return list of (path, bbox) for each TIF."""
@@ -536,6 +483,8 @@ def main():
         help="Generate 8 outer-ring panorama tiles (3000m, 50m step) around the existing 25x25 inner grid and APPEND them to the existing data.json. Skips inner tile generation.")
     parser.add_argument("--tiles-dir", default=None,
         help="Override tile output directory (default: tiles_<location>). Use tiles_hnojice_multi for the existing Hnojice viewer with symlinked tile data.")
+    parser.add_argument("--lod-profile", choices=list(LOD_PROFILES.keys()), default=None,
+        help="Apply a graduated LOD profile to inner tiles: per-tile mesh step picked from the profile's rings based on distance from grid center. Without this flag, uniform mesh step is used (--step value).")
     args = parser.parse_args()
 
     loc = LOCATIONS[args.location]
@@ -699,6 +648,8 @@ def main():
     except Exception as e:
         print(f"  RÚIAN fetch failed: {e}")
 
+    lod_profile = LOD_PROFILES[args.lod_profile] if args.lod_profile else None
+
     tiles = []
     for gr in range(grid_rows):
         for gc in range(grid_cols):
@@ -718,7 +669,6 @@ def main():
                 continue
 
             tiff_names = ", ".join(Path(p).stem for p in dmp_paths)
-            print(f"  Tile ({gc},{gr}): center=({cx:.0f}, {cy:.0f}) → [{tiff_names}]")
 
             # Convert RÚIAN footprints to this tile's local coords
             tile_fps = []
@@ -734,9 +684,26 @@ def main():
                 if in_tile:
                     tile_fps.append({"coords": local_coords})
 
-            tile = extract_tile(dmp_paths, cx, cy, half, step=args.step,
+            # Pick per-tile step and building snap from LOD profile if active
+            if lod_profile:
+                tile_offset_x = (gc - (grid_cols - 1) / 2) * tile_size
+                tile_offset_z = ((grid_rows - 1) / 2 - gr) * tile_size
+                distance_m = (tile_offset_x ** 2 + tile_offset_z ** 2) ** 0.5
+                ring = get_lod_ring(lod_profile, distance_m)
+                effective_step = ring["step_px"]
+                effective_footprints = tile_fps if ring["snap_buildings"] and not args.no_snap else None
+                tile_lod_label = f"L{lod_profile['rings'].index(ring)}"
+            else:
+                effective_step = args.step
+                effective_footprints = tile_fps if not args.no_snap else None
+                tile_lod_label = ""
+
+            lod_suffix = f" [{tile_lod_label} step={effective_step}px]" if tile_lod_label else ""
+            print(f"  Tile ({gc},{gr}): center=({cx:.0f}, {cy:.0f}) → [{tiff_names}]{lod_suffix}")
+
+            tile = extract_tile(dmp_paths, cx, cy, half, step=effective_step,
                                 global_ground_z=global_ground_z,
-                                ruian_footprints=tile_fps if not args.no_snap else None,
+                                ruian_footprints=effective_footprints,
                                 simplify=not args.no_simplify,
                                 flat=args.flat,
                                 max_height=max_height,
@@ -811,9 +778,12 @@ def main():
         t["offset_x"] = t["center_sjtsk"][0] - gcx
         t["offset_z"] = -(t["center_sjtsk"][1] - gcy)  # negate Y→Z
 
+    # Resolve tile output directory (--tiles-dir overrides default)
+    tiles_dir_name = args.tiles_dir or f"tiles_{args.location}"
+
     # Export .glb files if requested
     if args.glb:
-        glb_dir = Path(output_path).parent / f"tiles_{Path(output_path).stem}"
+        glb_dir = Path(tiles_dir_name)
         glb_dir.mkdir(exist_ok=True)
         total_glb = 0
         for t in tiles:
@@ -986,7 +956,7 @@ let ruianBuildings = [];
 // cache: 'no-store' — data.json gets appended-to (e.g. when adding panorama
 // LOD tiles via gen_multitile.py --add-panorama). Disk caching would mask
 // the new tiles until a hard refresh.
-const dataLoaded = fetch('tiles_{args.location}/{args.location}_data.json', {{ cache: 'no-store' }})
+const dataLoaded = fetch('{tiles_dir_name}/{args.location}_data.json', {{ cache: 'no-store' }})
   .then(r => {{ if (!r.ok) throw new Error(`HTTP ${{r.status}}`); return r.json(); }})
   .then(d => {{ tiles = d.tiles; ruianBuildings = d.ruianBuildings; }});
 
@@ -1722,7 +1692,7 @@ dataLoaded.then(async () => {{
 </html>"""
 
     # Write sibling JSON data file (gitignored, lives next to GLB tiles)
-    data_path = Path(f"tiles_{args.location}") / f"{args.location}_data.json"
+    data_path = Path(tiles_dir_name) / f"{args.location}_data.json"
     data_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.write_text(json.dumps({
         "tiles": json.loads(tiles_json),

@@ -774,12 +774,19 @@ const dataLoaded = fetch('tiles_{args.location}/{args.location}_data.json')
   .then(d => {{ tiles = d.tiles; ruianBuildings = d.ruianBuildings; }});
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
+// Haze blue — matched to fog so horizon blends seamlessly into background.
+scene.background = new THREE.Color(0xb0c4d8);
+// Exponential fog: 50% density at ~5.5km, full fade by ~10km. Masks the
+// (future) LOD ring boundaries and gives atmospheric perspective.
+scene.fog = new THREE.FogExp2(0xb0c4d8, 0.00012);
 
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 5000);
+// near=1.0 (was 0.1) reclaims depth precision; far=15000 (was 5000) makes
+// room for the future L3 panorama ring at ~7.2km. Both required by the
+// logarithmicDepthBuffer renderer setting below.
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 15000);
 camera.position.set(200, 150, 200);
 
-const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+const renderer = new THREE.WebGLRenderer({{ antialias: true, logarithmicDepthBuffer: true }});
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(devicePixelRatio);
 renderer.shadowMap.enabled = true;

@@ -798,11 +798,16 @@ def main():
                 else:
                     print(f"  Generating {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
                           f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs]")
+                    # Horizon tiles need a much bigger max_height clamp than
+                    # the inner grid: Jeseníky's Praděd is 1491m ASL = ~1266m
+                    # above ground_z. The inner max_height (~50m) was set
+                    # to suppress raster outliers near the property, not to
+                    # clip real mountains 28km away.
                     flat_tile = extract_panorama_tile(
                         dmp_paths, pcx, pcy,
                         half=half, step=step,
                         global_ground_z=global_ground_z,
-                        max_height=max_height,
+                        max_height=1500.0,
                         skirt_depth=skirt,
                     )
 

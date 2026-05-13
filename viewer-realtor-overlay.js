@@ -633,12 +633,16 @@ export function init(args) {
     }
 
     if (preset === 'lateralflyby') {
-      const ZOFF = 80;
+      // Tighter framing — was 220m alt + ±350m horizontal + 80m N offset
+      // which framed entire village; subject parcel was a small feature.
+      // 120m alt + ±180m horizontal + 50m N puts the subject around 1/3
+      // of frame height with neighbouring buildings still visible.
+      const ZOFF = 50;
       const posPts = [
-        new THREE.Vector3(cx - 350, gy + 220, cz + ZOFF),
-        new THREE.Vector3(cx - 100, gy + 220, cz + ZOFF),
-        new THREE.Vector3(cx + 100, gy + 220, cz + ZOFF),
-        new THREE.Vector3(cx + 350, gy + 220, cz + ZOFF),
+        new THREE.Vector3(cx - 180, gy + 120, cz + ZOFF),
+        new THREE.Vector3(cx -  60, gy + 120, cz + ZOFF),
+        new THREE.Vector3(cx +  60, gy + 120, cz + ZOFF),
+        new THREE.Vector3(cx + 180, gy + 120, cz + ZOFF),
       ];
       const tgtPts = posPts.map(() => tgtAt());
       return {

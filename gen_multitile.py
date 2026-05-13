@@ -1170,8 +1170,10 @@ window._viewerSky = sky;
 // hard "fog wall" effect.
 // Phase 4: fog density 0.000055 — thin enough for L5 far-horizon tiles at
 // 31.5km to remain visible (exp2 fog at 31500m: e^(-0.000055*31500)≈0.17 opacity).
-// Previous 0.00018 was tuned for the 4.5km panorama ring.
-scene.fog = new THREE.FogExp2(0xb8c8d8, 0.000055);
+// 0.0001 is a compromise — masks the inner→panorama seam at ~5km while
+// keeping L5 distant horizon (Jeseníky at 28km) just barely visible
+// through atmospheric haze (~75% opacity at 28km).
+scene.fog = new THREE.FogExp2(0xb8c8d8, 0.0001);
 
 // near=1.0, far=65000: Phase 4 extends coverage to ±31.5km.  Linear depth
 // buffer was avoided (breaks cadastre overlays). At 24-bit depth and

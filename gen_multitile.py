@@ -330,14 +330,27 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
     }
 
 
-def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_height, skirt_depth):
+def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_height, skirt_depth,
+                          skirt_edges=None):
     """Extract a coarse outer-ring panorama tile mesh + UV data.
 
     Samples DMP directly at `step` metre resolution via rasterio.merge, builds a
-    regular n×n vertex grid, adds a 4-edge skirt wall (vertical drop of
-    skirt_depth metres) along all tile borders, and returns the same
+    regular n×n vertex grid, adds a skirt wall (vertical drop of skirt_depth metres)
+    along the edges specified by skirt_edges, and returns the same
     {"vertices", "faces", "uvs"} dict that save_tile_glb() expects.
+
+    skirt_edges: set of {'N', 'S', 'E', 'W'} indicating which sides get a skirt rim.
+    None means all four sides (backward-compatible default for the outermost ring).
+    Empty set means no skirt at all.
+
+    Convention (matches local_z = -half + r*step in Three.js viewer):
+      'S' = top edge    (r=0,   local_z=-half)
+      'N' = bottom edge (r=n-1, local_z=+half)
+      'W' = left edge   (c=0,   local_x=-half)
+      'E' = right edge  (c=n-1, local_x=+half)
     """
+    if skirt_edges is None:
+        skirt_edges = {'N', 'S', 'E', 'W'}
     from rasterio.merge import merge
 
     bounds = (cx - half, cy - half, cx + half, cy + half)
@@ -380,66 +393,63 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             faces.append([i,         i + n,     i + 1])
             faces.append([i + 1,     i + n,     i + n + 1])
 
-    # Skirt rim — add n bottom vertices per edge (4 edges), then quad strips.
-    # Edge order: top (r=0), bottom (r=n-1), left (c=0), right (c=n-1).
-    # Each skirt bottom vertex sits directly below its terrain edge vertex at y - skirt_depth.
+    # Skirt rim — conditionally emit skirt vertices + quad strips per edge.
+    # Only the edges in skirt_edges get a skirt; inner-facing edges are left plain
+    # so adjacent tiles/rings connect without a visible wall.
+    # Edge order: S (r=0), N (r=n-1), W (c=0), E (c=n-1).
     base_vert_count = len(vertices)
 
-    def skirt_bottom_y(vi):
-        return vertices[vi][1] - skirt_depth
+    # S edge (r=0, c=0..n-1) — local_z=-half, outward normal faces -Z
+    if 'S' in skirt_edges:
+        top_skirt_start = len(vertices)
+        for c in range(n):
+            vi = 0 * n + c
+            vx, vy, vz = vertices[vi]
+            vertices.append([vx, vy - skirt_depth, vz])
+        for c in range(n - 1):
+            ti = 0 * n + c
+            si = top_skirt_start + c
+            faces.append([ti,     ti + 1,     si])
+            faces.append([si,     ti + 1,     si + 1])
 
-    # Top edge (r=0, c=0..n-1)  — outward normal faces -Z direction
-    top_skirt_start = base_vert_count
-    for c in range(n):
-        vi = 0 * n + c
-        vx, vy, vz = vertices[vi]
-        vertices.append([vx, vy - skirt_depth, vz])
-    for c in range(n - 1):
-        ti = 0 * n + c          # terrain top-edge vertex at (r=0, c)
-        si = top_skirt_start + c  # skirt bottom vertex below it
-        # quad: terrain[c], terrain[c+1], skirt[c], skirt[c+1]
-        # outward normal = -Z → wind CW from -Z side → CCW from outside
-        faces.append([ti,     ti + 1,     si])
-        faces.append([si,     ti + 1,     si + 1])
+    # N edge (r=n-1, c=0..n-1) — local_z=+half, outward normal faces +Z
+    if 'N' in skirt_edges:
+        bot_skirt_start = len(vertices)
+        for c in range(n):
+            vi = (n - 1) * n + c
+            vx, vy, vz = vertices[vi]
+            vertices.append([vx, vy - skirt_depth, vz])
+        for c in range(n - 1):
+            ti = (n - 1) * n + c
+            si = bot_skirt_start + c
+            faces.append([ti + 1, ti,     si + 1])
+            faces.append([si + 1, ti,     si])
 
-    # Bottom edge (r=n-1, c=0..n-1) — outward normal faces +Z
-    bot_skirt_start = len(vertices)
-    for c in range(n):
-        vi = (n - 1) * n + c
-        vx, vy, vz = vertices[vi]
-        vertices.append([vx, vy - skirt_depth, vz])
-    for c in range(n - 1):
-        ti = (n - 1) * n + c
-        si = bot_skirt_start + c
-        # outward normal = +Z → wind opposite order
-        faces.append([ti + 1, ti,     si + 1])
-        faces.append([si + 1, ti,     si])
+    # W edge (c=0, r=0..n-1) — local_x=-half, outward normal faces -X
+    if 'W' in skirt_edges:
+        left_skirt_start = len(vertices)
+        for r in range(n):
+            vi = r * n + 0
+            vx, vy, vz = vertices[vi]
+            vertices.append([vx, vy - skirt_depth, vz])
+        for r in range(n - 1):
+            ti = r * n + 0
+            si = left_skirt_start + r
+            faces.append([ti + n, ti,     si + 1])
+            faces.append([si + 1, ti,     si])
 
-    # Left edge (c=0, r=0..n-1) — outward normal faces -X
-    left_skirt_start = len(vertices)
-    for r in range(n):
-        vi = r * n + 0
-        vx, vy, vz = vertices[vi]
-        vertices.append([vx, vy - skirt_depth, vz])
-    for r in range(n - 1):
-        ti = r * n + 0
-        si = left_skirt_start + r
-        # outward normal = -X
-        faces.append([ti + n, ti,     si + 1])
-        faces.append([si + 1, ti,     si])
-
-    # Right edge (c=n-1, r=0..n-1) — outward normal faces +X
-    right_skirt_start = len(vertices)
-    for r in range(n):
-        vi = r * n + (n - 1)
-        vx, vy, vz = vertices[vi]
-        vertices.append([vx, vy - skirt_depth, vz])
-    for r in range(n - 1):
-        ti = r * n + (n - 1)
-        si = right_skirt_start + r
-        # outward normal = +X
-        faces.append([ti,     ti + n,     si])
-        faces.append([si,     ti + n,     si + 1])
+    # E edge (c=n-1, r=0..n-1) — local_x=+half, outward normal faces +X
+    if 'E' in skirt_edges:
+        right_skirt_start = len(vertices)
+        for r in range(n):
+            vi = r * n + (n - 1)
+            vx, vy, vz = vertices[vi]
+            vertices.append([vx, vy - skirt_depth, vz])
+        for r in range(n - 1):
+            ti = r * n + (n - 1)
+            si = right_skirt_start + r
+            faces.append([ti,     ti + n,     si])
+            faces.append([si,     ti + n,     si + 1])
 
     # UVs: uniform [0..1] for terrain grid; skirt verts copy their parent edge UV
     all_sx = np.array([cx + v[0] for v in vertices])
@@ -595,6 +605,25 @@ def main():
         print(f"  max_height: {max_height:.1f}m (override)")
     print(f"  Global ground_z: {global_ground_z:.1f}m, max_height: {max_height:.1f}m (area_max={area_max:.1f}m, {len(area_paths)} TIFs)")
 
+    def outer_edges_for(offset_x, offset_z, ring_max_offset):
+        """Return the set of compass edges that face open sky for a tile in a 3×3-minus-center ring.
+
+        Convention (matches extract_panorama_tile's local_z = -half + r*step):
+          +offset_z = NORTH in real world (pcy = grid_cy - offset_z makes it more north in S-JTSK).
+          +offset_x = EAST.
+          'S' = local_z=-half edge, 'N' = local_z=+half edge, 'W'/'E' = local_x edges.
+        """
+        edges = set()
+        if offset_x == -ring_max_offset:
+            edges.add('W')
+        if offset_x == +ring_max_offset:
+            edges.add('E')
+        if offset_z == +ring_max_offset:
+            edges.add('N')   # +offset_z = north → outer edge is N
+        if offset_z == -ring_max_offset:
+            edges.add('S')   # -offset_z = south → outer edge is S
+        return edges
+
     # --add-panorama: generate 8 outer-ring tiles and append to existing data.json
     if args.add_panorama:
         tiles_dir = args.tiles_dir or f"tiles_{args.location}"
@@ -618,6 +647,7 @@ def main():
         PANO_HALF = 1500   # 3000m tile, half = 1500m
         PANO_STEP = 50
         SKIRT_DEPTH = 40
+        PANO_RING_MAX = 3000
 
         pano_count = 0
         for i, (offset_x, offset_z) in enumerate(PANORAMA_OFFSETS):
@@ -629,13 +659,15 @@ def main():
                 print(f"  Skipping panorama tile at offset ({offset_x}, {offset_z}) — no DMP coverage")
                 continue
 
-            print(f"  Generating panorama tile {i} at offset ({offset_x:+d}, {offset_z:+d}), center=({pcx:.0f}, {pcy:.0f}) [{len(dmp_paths)} TIFs]")
+            skirt_edges = outer_edges_for(offset_x, offset_z, PANO_RING_MAX)
+            print(f"  Generating panorama tile {i} at offset ({offset_x:+d}, {offset_z:+d}), center=({pcx:.0f}, {pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges}")
             tile = extract_panorama_tile(
                 dmp_paths, pcx, pcy,
                 half=PANO_HALF, step=PANO_STEP,
                 global_ground_z=global_ground_z,
                 max_height=max_height,
                 skirt_depth=SKIRT_DEPTH,
+                skirt_edges=skirt_edges,
             )
 
             glb_name = f"panorama_{i}.glb"
@@ -717,11 +749,13 @@ def main():
         L5_STEP = 200    # 200m mesh step → 91×91 verts ≈ 8.3k per tile
         L5_SKIRT = 150
 
-        def _generate_horizon_ring(offsets, half, step, skirt, prefix, flag_key):
+        def _generate_horizon_ring(offsets, half, step, skirt, prefix, flag_key, ring_max_offset):
             count = 0
             for i, (offset_x, offset_z) in enumerate(offsets):
                 pcx = grid_cx + offset_x
                 pcy = grid_cy - offset_z  # Z-axis inversion (same as panorama)
+
+                skirt_edges = outer_edges_for(offset_x, offset_z, ring_max_offset)
 
                 dmp_paths = find_tiffs(pcx, pcy, half_m=half)
                 if not dmp_paths:
@@ -730,10 +764,8 @@ def main():
                         dmp_paths = [dmr_path]
                 if not dmp_paths:
                     print(f"  WARNING: no DMP coverage for {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
-                          f" — generating flat (y=0) terrain")
-                    # Build a flat placeholder tile: single quad stretched to tile size
-                    # Use extract_panorama_tile with a tiny dummy TIFF list trick:
-                    # Without DMP we need to fake it. Create a 2-vert flat grid manually.
+                          f" — generating flat (y=0) terrain, skirt_edges={skirt_edges}")
+                    # Build a flat placeholder tile with selective skirts.
                     n = round(2 * half / step) + 1
                     vertices = []
                     for r in range(n):
@@ -747,47 +779,50 @@ def main():
                             idx = r * n + c
                             faces.append([idx, idx + n, idx + 1])
                             faces.append([idx + 1, idx + n, idx + n + 1])
-                    # Add skirts
-                    base_count = len(vertices)
-                    for c in range(n):
-                        vi = c
-                        vx, vy, vz = vertices[vi]
-                        vertices.append([vx, vy - skirt, vz])
-                    for c in range(n - 1):
-                        ti = c
-                        si = base_count + c
-                        faces.append([ti, ti + 1, si])
-                        faces.append([si, ti + 1, si + 1])
-                    bot_start = len(vertices)
-                    for c in range(n):
-                        vi = (n - 1) * n + c
-                        vx, vy, vz = vertices[vi]
-                        vertices.append([vx, vy - skirt, vz])
-                    for c in range(n - 1):
-                        ti = (n - 1) * n + c
-                        si = bot_start + c
-                        faces.append([ti + 1, ti, si + 1])
-                        faces.append([si + 1, ti, si])
-                    left_start = len(vertices)
-                    for r in range(n):
-                        vi = r * n + 0
-                        vx, vy, vz = vertices[vi]
-                        vertices.append([vx, vy - skirt, vz])
-                    for r in range(n - 1):
-                        ti = r * n + 0
-                        si = left_start + r
-                        faces.append([ti + n, ti, si + 1])
-                        faces.append([si + 1, ti, si])
-                    right_start = len(vertices)
-                    for r in range(n):
-                        vi = r * n + (n - 1)
-                        vx, vy, vz = vertices[vi]
-                        vertices.append([vx, vy - skirt, vz])
-                    for r in range(n - 1):
-                        ti = r * n + (n - 1)
-                        si = right_start + r
-                        faces.append([ti, ti + n, si])
-                        faces.append([si, ti + n, si + 1])
+                    # S edge (r=0) — only if 'S' in skirt_edges
+                    if 'S' in skirt_edges:
+                        base_count = len(vertices)
+                        for c in range(n):
+                            vx, vy, vz = vertices[c]
+                            vertices.append([vx, vy - skirt, vz])
+                        for c in range(n - 1):
+                            ti = c
+                            si = base_count + c
+                            faces.append([ti, ti + 1, si])
+                            faces.append([si, ti + 1, si + 1])
+                    # N edge (r=n-1) — only if 'N' in skirt_edges
+                    if 'N' in skirt_edges:
+                        bot_start = len(vertices)
+                        for c in range(n):
+                            vx, vy, vz = vertices[(n - 1) * n + c]
+                            vertices.append([vx, vy - skirt, vz])
+                        for c in range(n - 1):
+                            ti = (n - 1) * n + c
+                            si = bot_start + c
+                            faces.append([ti + 1, ti, si + 1])
+                            faces.append([si + 1, ti, si])
+                    # W edge (c=0) — only if 'W' in skirt_edges
+                    if 'W' in skirt_edges:
+                        left_start = len(vertices)
+                        for r in range(n):
+                            vx, vy, vz = vertices[r * n + 0]
+                            vertices.append([vx, vy - skirt, vz])
+                        for r in range(n - 1):
+                            ti = r * n + 0
+                            si = left_start + r
+                            faces.append([ti + n, ti, si + 1])
+                            faces.append([si + 1, ti, si])
+                    # E edge (c=n-1) — only if 'E' in skirt_edges
+                    if 'E' in skirt_edges:
+                        right_start = len(vertices)
+                        for r in range(n):
+                            vx, vy, vz = vertices[r * n + (n - 1)]
+                            vertices.append([vx, vy - skirt, vz])
+                        for r in range(n - 1):
+                            ti = r * n + (n - 1)
+                            si = right_start + r
+                            faces.append([ti, ti + n, si])
+                            faces.append([si, ti + n, si + 1])
                     # Simple UVs: world XZ → 0..1
                     uvs = []
                     for v in vertices:
@@ -797,7 +832,7 @@ def main():
                     flat_tile = {"vertices": vertices, "faces": faces, "uvs": uvs}
                 else:
                     print(f"  Generating {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
-                          f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs]")
+                          f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges}")
                     # Horizon tiles need a much bigger max_height clamp than
                     # the inner grid: Jeseníky's Praděd is 1491m ASL = ~1266m
                     # above ground_z. The inner max_height (~50m) was set
@@ -809,6 +844,7 @@ def main():
                         global_ground_z=global_ground_z,
                         max_height=1500.0,
                         skirt_depth=skirt,
+                        skirt_edges=skirt_edges,
                     )
 
                 glb_name = f"{prefix}_{i}.glb"
@@ -845,11 +881,13 @@ def main():
 
         print("Generating L4 mid-horizon ring (8 tiles, 9000m, 100m step) …")
         l4_count = _generate_horizon_ring(L4_OFFSETS, L4_HALF, L4_STEP, L4_SKIRT,
-                                          "horizon_l4", "is_horizon_l4")
+                                          "horizon_l4", "is_horizon_l4",
+                                          ring_max_offset=9000)
 
         print("Generating L5 far-horizon ring (8 tiles, 18000m, 200m step) …")
         l5_count = _generate_horizon_ring(L5_OFFSETS, L5_HALF, L5_STEP, L5_SKIRT,
-                                          "horizon_l5", "is_horizon_l5")
+                                          "horizon_l5", "is_horizon_l5",
+                                          ring_max_offset=22500)
 
         data_path.write_text(json.dumps(existing_data))
         print(f"Added {l4_count} L4 + {l5_count} L5 horizon tiles to {data_path}")

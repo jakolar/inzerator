@@ -14,6 +14,49 @@ from pyproj import Transformer
 SJTSK_TO_WGS = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
 
 
+def fetch_dmr5g_tile(cx, cy, half, step):
+    """Fetch DMR5G elevation TIFF from ČÚZK ImageServer for the given bbox.
+
+    Caches to cache/dmr5g_dynamic/dmr5g_{cx}_{cy}_{half}_{step}.tif for reuse.
+    Returns the local Path to the cached file, or None on failure.
+
+    Unlike SM5 cache (cache/dmpok_tiff_*/), this dynamically fetches just
+    the area we need from ČÚZK's REST endpoint — no ZIP download, no
+    rate-limit risk, works for any bbox in Czechia.
+    """
+    import urllib.request
+
+    cache_dir = Path("cache/dmr5g_dynamic")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"dmr5g_{int(cx)}_{int(cy)}_{int(half)}_{step}.tif"
+    if cache_path.exists() and cache_path.stat().st_size > 1000:
+        return cache_path
+
+    # Compute pixel dimensions: match the mesh resolution we need.
+    n_pixels = int(round(2 * half / step)) + 1
+    n_pixels = max(50, min(2048, n_pixels))  # safety cap
+
+    bbox = f"{cx-half},{cy-half},{cx+half},{cy+half}"
+    url = (
+        f"https://ags.cuzk.gov.cz/arcgis/rest/services/3D/dmr5g/ImageServer/exportImage"
+        f"?bbox={bbox}&bboxSR=5514&size={n_pixels},{n_pixels}"
+        f"&format=tiff&pixelType=F32&f=image"
+    )
+
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r:
+            data = r.read()
+        if len(data) < 1000:
+            print(f"  [dmr5g] suspiciously small response: {len(data)} bytes")
+            return None
+        cache_path.write_bytes(data)
+        print(f"  [dmr5g] fetched {cache_path} ({len(data)//1024} KB, {n_pixels}px)")
+        return cache_path
+    except Exception as e:
+        print(f"  [dmr5g] fetch failed: {e}")
+        return None
+
+
 def save_tile_glb(tile, offset_x, offset_z, output_path):
     """Save tile mesh as .glb with uint16 indices + server-side gzip."""
     import pygltflib
@@ -681,6 +724,10 @@ def main():
                 pcy = grid_cy - offset_z  # Z-axis inversion (same as panorama)
 
                 dmp_paths = find_tiffs(pcx, pcy, half_m=half)
+                if not dmp_paths:
+                    dmr_path = fetch_dmr5g_tile(pcx, pcy, half, step)
+                    if dmr_path:
+                        dmp_paths = [dmr_path]
                 if not dmp_paths:
                     print(f"  WARNING: no DMP coverage for {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
                           f" — generating flat (y=0) terrain")

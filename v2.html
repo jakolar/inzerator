@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<title>Hnojice v2</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; }
+  body { overflow: hidden; background: #87ceeb; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #status {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    transition: opacity 0.4s ease;
+    color: #1a73e8;
+  }
+</style>
+</head>
+<body>
+<div id="status">Loading…</div>
+<script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+const params = new URLSearchParams(location.search);
+const REGION = params.get('region') || 'hnojice';
+const DETAIL_SLUG = params.get('detail') || 'main';
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
+camera.position.set(0, 200, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+// Sky: physically-based atmospheric scattering (same pattern as
+// hnojice_lod_multi.html). 450 km radius so it always sits beyond terrain.
+const sky = new Sky();
+sky.scale.setScalar(450000);
+scene.add(sky);
+const skyU = sky.material.uniforms;
+skyU.turbidity.value = 8;
+skyU.rayleigh.value = 2;
+skyU.mieCoefficient.value = 0.005;
+skyU.mieDirectionalG.value = 0.8;
+const SUN_ELEVATION_DEG = 35;
+const SUN_AZIMUTH_DEG = 180;
+const sunVec = new THREE.Vector3().setFromSphericalCoords(
+  1,
+  THREE.MathUtils.degToRad(90 - SUN_ELEVATION_DEG),
+  THREE.MathUtils.degToRad(SUN_AZIMUTH_DEG),
+);
+skyU.sunPosition.value.copy(sunVec);
+
+// Horizon haze — terrain fades into sky at distance.
+scene.fog = new THREE.FogExp2(0xb0c4d8, 0.00008);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const dir = new THREE.DirectionalLight(0xffffff, 0.5);
+dir.position.copy(sunVec).multiplyScalar(500);
+scene.add(dir);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.maxDistance = 60000;
+controls.update();
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function tick() {
+  requestAnimationFrame(tick);
+  controls.update();
+  renderer.render(scene, camera);
+}
+tick();
+
+// ─── Load manifest + panorama + detail meshes ────────────────────────────
+const status = document.getElementById('status');
+const allMeshes = [];   // populated as meshes load; Task 5 uses this for raycast.
+const gltfLoader = new GLTFLoader();
+const texLoader = new THREE.TextureLoader();
+
+async function loadV2() {
+  const manifest = await fetch(`tiles_v2_${REGION}/manifest.json`, { cache: 'no-store' })
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+  const region = manifest.region;
+  const detail = manifest.details.find(d => d.slug === DETAIL_SLUG);
+  if (!detail) throw new Error(`detail '${DETAIL_SLUG}' not in manifest`);
+
+  // --- Panorama: scene origin, renderOrder 0 ---
+  status.textContent = 'Loading panorama mesh…';
+  await new Promise((resolve, reject) => {
+    gltfLoader.load(`tiles_v2_${REGION}/${region.panorama_glb}?v=v2-1`, (gltf) => {
+      let m = gltf.scene.children[0];
+      if (m && !m.isMesh && m.children[0]) m = m.children[0];
+      const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(m.geometry, mat);
+      mesh.renderOrder = 0;
+      mesh.userData = { kind: 'panorama', meta: region };
+      scene.add(mesh);
+      allMeshes.push(mesh);
+      // Ortho texture covering the panorama's wgs_bbox at zoom 12.
+      const bb = region.sjtsk_bbox;
+      const wb = region.wgs_bbox;
+      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=12`;
+      texLoader.load(url, (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        mat.map = tex;
+        mat.needsUpdate = true;
+      }, undefined, (e) => console.warn('panorama tex failed:', e));
+      resolve();
+    }, undefined, reject);
+  });
+
+  // --- Detail: scene offset = world delta to region anchor, renderOrder 1 ---
+  status.textContent = 'Loading detail mesh…';
+  await new Promise((resolve, reject) => {
+    gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?v=v2-1`, (gltf) => {
+      let m = gltf.scene.children[0];
+      if (m && !m.isMesh && m.children[0]) m = m.children[0];
+      const mat = new THREE.MeshBasicMaterial({
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      });
+      const mesh = new THREE.Mesh(m.geometry, mat);
+      // Cardinal: scene +Z = world +Y. Detail rendered at scene offset = world delta.
+      const offX = detail.center_sjtsk[0] - region.center_sjtsk[0];
+      const offZ = detail.center_sjtsk[1] - region.center_sjtsk[1];
+      mesh.position.set(offX, 0, offZ);
+      mesh.renderOrder = 1;
+      mesh.userData = { kind: 'detail', meta: detail };
+      scene.add(mesh);
+      allMeshes.push(mesh);
+      const bb = detail.sjtsk_bbox;
+      const wb = detail.wgs_bbox;
+      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=2048&zoom=19`;
+      texLoader.load(url, (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        mat.map = tex;
+        mat.needsUpdate = true;
+      }, undefined, (e) => console.warn('detail tex failed:', e));
+      resolve();
+    }, undefined, reject);
+  });
+
+  status.style.opacity = '0';
+  setTimeout(() => { status.style.display = 'none'; }, 500);
+  // Expose for Task 5 + manual debugging.
+  window._v2 = { region, detail, allMeshes, scene, camera, controls, renderer };
+}
+
+loadV2().catch(e => {
+  console.error(e);
+  status.textContent = `ERROR: ${e.message}`;
+  status.style.color = 'red';
+});
+</script>
+</body>
+</html>

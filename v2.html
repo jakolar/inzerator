@@ -40,6 +40,10 @@ const DETAIL_SLUG = params.get('detail') || 'main';
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
+// Camera at (0, 200, 200) looks toward -Z. Combined with mesh.scale.z=-1 on
+// terrain meshes below, scene-Z corresponds to world-Y INVERTED (matching the
+// v1 convention). Result: forward of screen = world north, right of screen =
+// world east. Standard map orientation.
 camera.position.set(0, 200, 200);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
@@ -113,13 +117,17 @@ async function loadV2() {
       const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
       const mesh = new THREE.Mesh(m.geometry, mat);
       mesh.renderOrder = 0;
+      // Flip Z so scene +Z renders as world -Y (south). With default camera
+      // looking toward -Z, the user looks at world NORTH and east is on the
+      // right — standard map orientation.
+      mesh.scale.z = -1;
       mesh.userData = { kind: 'panorama', meta: region };
       scene.add(mesh);
       allMeshes.push(mesh);
       // Ortho texture covering the panorama's wgs_bbox at zoom 12.
       const bb = region.sjtsk_bbox;
       const wb = region.wgs_bbox;
-      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=12`;
+      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=13`;
       texLoader.load(url, (tex) => {
         tex.colorSpace = THREE.SRGBColorSpace;
         mat.map = tex;
@@ -142,17 +150,20 @@ async function loadV2() {
         polygonOffsetUnits: -1,
       });
       const mesh = new THREE.Mesh(m.geometry, mat);
-      // Cardinal: scene +Z = world +Y. Detail rendered at scene offset = world delta.
+      // Detail position: scene +Z is rendered as world -Y by mesh.scale.z=-1
+      // below. So scene_z offset = -(detail_cy - region_cy) so the detail
+      // sits on the panorama at its world-correct location.
       const offX = detail.center_sjtsk[0] - region.center_sjtsk[0];
-      const offZ = detail.center_sjtsk[1] - region.center_sjtsk[1];
+      const offZ = -(detail.center_sjtsk[1] - region.center_sjtsk[1]);
       mesh.position.set(offX, 0, offZ);
+      mesh.scale.z = -1;
       mesh.renderOrder = 1;
       mesh.userData = { kind: 'detail', meta: detail };
       scene.add(mesh);
       allMeshes.push(mesh);
       const bb = detail.sjtsk_bbox;
       const wb = detail.wgs_bbox;
-      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=2048&zoom=19`;
+      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=19`;
       texLoader.load(url, (tex) => {
         tex.colorSpace = THREE.SRGBColorSpace;
         mat.map = tex;

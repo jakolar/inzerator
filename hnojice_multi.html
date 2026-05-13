@@ -171,15 +171,16 @@ window._viewerSky = sky;
 // at low sun elevations; using a slightly tinted version of the sun's
 // scattering color (warm-ish at sunset, blue-ish at midday) prevents the
 // hard "fog wall" effect.
-scene.fog = new THREE.FogExp2(0xb8c8d8, 0.00018);
+// Phase 4: fog density 0.000055 — thin enough for L5 far-horizon tiles at
+// 31.5km to remain visible (exp2 fog at 31500m: e^(-0.000055*31500)≈0.17 opacity).
+// Previous 0.00018 was tuned for the 4.5km panorama ring.
+scene.fog = new THREE.FogExp2(0xb8c8d8, 0.000055);
 
-// near=1.0 (was 0.1) reclaims depth precision; far=15000 (was 5000) makes
-// room for the future L3 panorama ring at ~7.2km. Linear depth buffer
-// (logarithmicDepthBuffer was tried but broke cadastre + parcel polygonOffset
-// overlays — see commit history). Parcels + cadastre live only in L0/L1
-// (within 900m of subject) where 24-bit depth precision is still ~0.05m;
-// distant L3 terrain accepts ~1m precision since fog masks z-fighting there.
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 15000);
+// near=1.0, far=65000: Phase 4 extends coverage to ±31.5km.  Linear depth
+// buffer was avoided (breaks cadastre overlays). At 24-bit depth and
+// near=1/far=65000 ratio, depth precision at 31km is ~10m — acceptable for
+// the coarse L5 terrain mesh viewed through heavy fog.
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
 camera.position.set(200, 150, 200);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -194,7 +195,7 @@ controls.dampingFactor = 0.15;
 controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
 controls.screenSpacePanning = true;
 controls.minDistance = 1;
-controls.maxDistance = 15000;   // match camera far clip — required to see the LOD panorama
+controls.maxDistance = 50000;   // Phase 4: extended to 50km so L5 tiles at 31.5km stay reachable
 controls.maxPolarAngle = Math.PI / 2.05;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.8));
@@ -239,6 +240,55 @@ dataLoaded.then(() => {
     });
   }
 
+  // ── Phase 4: shared L4 + L5 horizon textures (1 fetch per ring, UV remap) ──
+  const l4Tiles = tiles.filter(t => t.is_horizon_l4);
+  let sharedL4TexPromise = null;
+  let l4Bbox = null;
+  if (l4Tiles.length > 0) {
+    l4Bbox = [
+      Math.min(...l4Tiles.map(t => t.sjtsk_bbox[0])),
+      Math.min(...l4Tiles.map(t => t.sjtsk_bbox[1])),
+      Math.max(...l4Tiles.map(t => t.sjtsk_bbox[2])),
+      Math.max(...l4Tiles.map(t => t.sjtsk_bbox[3])),
+    ];
+    const l4WgsBbox = [
+      Math.min(...l4Tiles.map(t => t.wgs_bbox[0])),
+      Math.min(...l4Tiles.map(t => t.wgs_bbox[1])),
+      Math.max(...l4Tiles.map(t => t.wgs_bbox[2])),
+      Math.max(...l4Tiles.map(t => t.wgs_bbox[3])),
+    ];
+    // L4 spans ~27km × 27km total. z=11 (~78m/px ČÚZK source) composited at
+    // 1024px gives ~26m/px effective — adequate for mid-horizon terrain.
+    const l4Url = `/proxy/ortofoto?BBOX=${l4Bbox.join(',')}&WBBOX=${l4WgsBbox.join(',')}&size=1024&zoom=11`;
+    sharedL4TexPromise = new Promise((resolve, reject) => {
+      texLoader.load(l4Url, resolve, undefined, reject);
+    });
+  }
+
+  const l5Tiles = tiles.filter(t => t.is_horizon_l5);
+  let sharedL5TexPromise = null;
+  let l5Bbox = null;
+  if (l5Tiles.length > 0) {
+    l5Bbox = [
+      Math.min(...l5Tiles.map(t => t.sjtsk_bbox[0])),
+      Math.min(...l5Tiles.map(t => t.sjtsk_bbox[1])),
+      Math.max(...l5Tiles.map(t => t.sjtsk_bbox[2])),
+      Math.max(...l5Tiles.map(t => t.sjtsk_bbox[3])),
+    ];
+    const l5WgsBbox = [
+      Math.min(...l5Tiles.map(t => t.wgs_bbox[0])),
+      Math.min(...l5Tiles.map(t => t.wgs_bbox[1])),
+      Math.max(...l5Tiles.map(t => t.wgs_bbox[2])),
+      Math.max(...l5Tiles.map(t => t.wgs_bbox[3])),
+    ];
+    // L5 spans ~63km × 63km total. z=9 (~312m/px ČÚZK source) composited at
+    // 1024px gives ~50m/px effective — suitable for far horizon, fog masks rest.
+    const l5Url = `/proxy/ortofoto?BBOX=${l5Bbox.join(',')}&WBBOX=${l5WgsBbox.join(',')}&size=1024&zoom=9`;
+    sharedL5TexPromise = new Promise((resolve, reject) => {
+      texLoader.load(l5Url, resolve, undefined, reject);
+    });
+  }
+
   for (const tile of tiles) {
     if (useGLB && tile.glb_url) {
       const setupMesh = (geometry) => {
@@ -247,6 +297,41 @@ dataLoaded.then(() => {
         mesh.userData = { tile, mat, geo: geometry, ortofotoTexture: null, ortofotoLoaded: false };
         scene.add(mesh);
         allMeshes.push(mesh);
+
+        // Phase 4: horizon L4/L5 tiles use per-ring shared textures with UV remap.
+        const _applySharedTex = (promise, bbox, label) => {
+          const FLIP_V = true;
+          promise.then(sharedTex => {
+            sharedTex.colorSpace = THREE.SRGBColorSpace;
+            sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
+            const tex = sharedTex.clone();
+            tex.needsUpdate = true;
+            const bWidth  = bbox[2] - bbox[0];
+            const bHeight = bbox[3] - bbox[1];
+            tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / bWidth;
+            tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / bHeight;
+            if (FLIP_V) {
+              tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
+              tex.offset.y = 1 - (tile.sjtsk_bbox[3] - bbox[1]) / bHeight;
+            } else {
+              tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
+              tex.offset.y = (tile.sjtsk_bbox[1] - bbox[1]) / bHeight;
+            }
+            mesh.material.map = tex;
+            mesh.material.needsUpdate = true;
+            mesh.userData.ortofotoLoaded = true;
+            mesh.userData.ortofotoTexture = tex;
+          }).catch(e => console.warn(label + ' shared texture failed:', e));
+        };
+
+        if (tile.is_horizon_l4 && sharedL4TexPromise) {
+          _applySharedTex(sharedL4TexPromise, l4Bbox, 'L4 horizon');
+          return;
+        }
+        if (tile.is_horizon_l5 && sharedL5TexPromise) {
+          _applySharedTex(sharedL5TexPromise, l5Bbox, 'L5 horizon');
+          return;
+        }
 
         // Phase 3B: panorama tiles use the single shared texture with UV remap.
         if (tile.is_panorama && sharedPanTexPromise) {

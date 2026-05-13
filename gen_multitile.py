@@ -481,6 +481,8 @@ def main():
         help="Override max height clip (m). Default: area_max - ground_z + 30. Use higher value for sharp peaks with tall structures.")
     parser.add_argument("--add-panorama", action="store_true",
         help="Generate 8 outer-ring panorama tiles (3000m, 50m step) around the existing 25x25 inner grid and APPEND them to the existing data.json. Skips inner tile generation.")
+    parser.add_argument("--add-horizon", action="store_true",
+        help="Generate L4 mid-horizon + L5 far-horizon outer LOD rings around the existing L0-L3 area. Extends coverage to ±31.5km from grid center (reaches Jeseníky mountains). Appends 16 tiles to data.json.")
     parser.add_argument("--tiles-dir", default=None,
         help="Override tile output directory (default: tiles_<location>). Use tiles_hnojice_multi for the existing Hnojice viewer with symlinked tile data.")
     parser.add_argument("--lod-profile", choices=list(LOD_PROFILES.keys()), default=None,
@@ -625,6 +627,180 @@ def main():
 
         data_path.write_text(json.dumps(existing_data))
         print(f"Added {pano_count} panorama tiles to {data_path}")
+        return
+
+    # --add-horizon: generate L4 + L5 horizon rings and append to existing data.json
+    if args.add_horizon:
+        tiles_dir = args.tiles_dir or f"tiles_{args.location}"
+        data_path = Path(tiles_dir) / f"{args.location}_data.json"
+        if not data_path.exists():
+            raise SystemExit(f"data.json not found at {data_path} — run full tile generation first.")
+        existing_data = json.loads(data_path.read_text())
+        if "tiles" not in existing_data or not isinstance(existing_data["tiles"], list):
+            raise SystemExit(f"{data_path} does not contain a 'tiles' array.")
+
+        # L4 mid-horizon ring: 8 tiles at 9000m × 9000m, 100m step, 80m skirt.
+        # 3×3-minus-center pattern with centers at ±9000m offsets.
+        # Inner edge: ±4500m (matches L3 panorama outer edge at ±4500m exactly).
+        # Outer edge: ±13500m.
+        L4_OFFSETS = [
+            (-9000, +9000),  # NW
+            (    0, +9000),  # N
+            (+9000, +9000),  # NE
+            (-9000,     0),  # W
+            (+9000,     0),  # E
+            (-9000, -9000),  # SW
+            (    0, -9000),  # S
+            (+9000, -9000),  # SE
+        ]
+        L4_HALF = 4500   # 9000m tile, half = 4500m
+        L4_STEP = 100    # 100m mesh step → 91×91 verts ≈ 8.3k per tile
+        L4_SKIRT = 80
+
+        # L5 far-horizon ring: 8 tiles at 18000m × 18000m, 200m step, 150m skirt.
+        # Centers at ±22500m offsets so inner edge = 22500 - 9000 = 13500m (exact L4 outer).
+        # Outer edge: ±31500m. Praděd at 28km from Hnojice falls inside.
+        L5_OFFSETS = [
+            (-22500, +22500),  # NW
+            (     0, +22500),  # N
+            (+22500, +22500),  # NE
+            (-22500,      0),  # W
+            (+22500,      0),  # E
+            (-22500, -22500),  # SW
+            (     0, -22500),  # S
+            (+22500, -22500),  # SE
+        ]
+        L5_HALF = 9000   # 18000m tile, half = 9000m
+        L5_STEP = 200    # 200m mesh step → 91×91 verts ≈ 8.3k per tile
+        L5_SKIRT = 150
+
+        def _generate_horizon_ring(offsets, half, step, skirt, prefix, flag_key):
+            count = 0
+            for i, (offset_x, offset_z) in enumerate(offsets):
+                pcx = grid_cx + offset_x
+                pcy = grid_cy - offset_z  # Z-axis inversion (same as panorama)
+
+                dmp_paths = find_tiffs(pcx, pcy, half_m=half)
+                if not dmp_paths:
+                    print(f"  WARNING: no DMP coverage for {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
+                          f" — generating flat (y=0) terrain")
+                    # Build a flat placeholder tile: single quad stretched to tile size
+                    # Use extract_panorama_tile with a tiny dummy TIFF list trick:
+                    # Without DMP we need to fake it. Create a 2-vert flat grid manually.
+                    n = round(2 * half / step) + 1
+                    vertices = []
+                    for r in range(n):
+                        for c in range(n):
+                            lx = -half + c * step
+                            lz = -half + r * step
+                            vertices.append([lx, 0.0, lz])
+                    faces = []
+                    for r in range(n - 1):
+                        for c in range(n - 1):
+                            idx = r * n + c
+                            faces.append([idx, idx + n, idx + 1])
+                            faces.append([idx + 1, idx + n, idx + n + 1])
+                    # Add skirts
+                    base_count = len(vertices)
+                    for c in range(n):
+                        vi = c
+                        vx, vy, vz = vertices[vi]
+                        vertices.append([vx, vy - skirt, vz])
+                    for c in range(n - 1):
+                        ti = c
+                        si = base_count + c
+                        faces.append([ti, ti + 1, si])
+                        faces.append([si, ti + 1, si + 1])
+                    bot_start = len(vertices)
+                    for c in range(n):
+                        vi = (n - 1) * n + c
+                        vx, vy, vz = vertices[vi]
+                        vertices.append([vx, vy - skirt, vz])
+                    for c in range(n - 1):
+                        ti = (n - 1) * n + c
+                        si = bot_start + c
+                        faces.append([ti + 1, ti, si + 1])
+                        faces.append([si + 1, ti, si])
+                    left_start = len(vertices)
+                    for r in range(n):
+                        vi = r * n + 0
+                        vx, vy, vz = vertices[vi]
+                        vertices.append([vx, vy - skirt, vz])
+                    for r in range(n - 1):
+                        ti = r * n + 0
+                        si = left_start + r
+                        faces.append([ti + n, ti, si + 1])
+                        faces.append([si + 1, ti, si])
+                    right_start = len(vertices)
+                    for r in range(n):
+                        vi = r * n + (n - 1)
+                        vx, vy, vz = vertices[vi]
+                        vertices.append([vx, vy - skirt, vz])
+                    for r in range(n - 1):
+                        ti = r * n + (n - 1)
+                        si = right_start + r
+                        faces.append([ti, ti + n, si])
+                        faces.append([si, ti + n, si + 1])
+                    # Simple UVs: world XZ → 0..1
+                    uvs = []
+                    for v in vertices:
+                        u = (v[0] + half) / (2 * half)
+                        uv = (v[2] + half) / (2 * half)
+                        uvs.append([u, uv])
+                    flat_tile = {"vertices": vertices, "faces": faces, "uvs": uvs}
+                else:
+                    print(f"  Generating {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
+                          f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs]")
+                    flat_tile = extract_panorama_tile(
+                        dmp_paths, pcx, pcy,
+                        half=half, step=step,
+                        global_ground_z=global_ground_z,
+                        max_height=max_height,
+                        skirt_depth=skirt,
+                    )
+
+                glb_name = f"{prefix}_{i}.glb"
+                glb_path = Path(tiles_dir) / glb_name
+                size = save_tile_glb(flat_tile, offset_x=offset_x, offset_z=offset_z,
+                                     output_path=str(glb_path))
+                print(f"    → {glb_path} ({size // 1024} KB, {len(flat_tile['vertices'])} verts, "
+                      f"{len(flat_tile['faces'])} faces)")
+
+                sjtsk_bbox = [pcx - half, pcy - half, pcx + half, pcy + half]
+                corners_sx = np.array([sjtsk_bbox[0], sjtsk_bbox[2], sjtsk_bbox[0], sjtsk_bbox[2]])
+                corners_sy = np.array([sjtsk_bbox[1], sjtsk_bbox[1], sjtsk_bbox[3], sjtsk_bbox[3]])
+                corners_lon, corners_lat = SJTSK_TO_WGS.transform(corners_sx, corners_sy)
+                wgs_bbox = [
+                    float(corners_lon.min()), float(corners_lat.min()),
+                    float(corners_lon.max()), float(corners_lat.max()),
+                ]
+
+                meta = {
+                    "grid_col": None,
+                    "grid_row": None,
+                    "offset_x": offset_x,
+                    "offset_z": offset_z,
+                    "center_sjtsk": [float(pcx), float(pcy)],
+                    "ground_z": global_ground_z,
+                    "wgs_bbox": wgs_bbox,
+                    "sjtsk_bbox": sjtsk_bbox,
+                    "glb_url": f"{tiles_dir}/{glb_name}",
+                    flag_key: True,
+                }
+                existing_data["tiles"].append(meta)
+                count += 1
+            return count
+
+        print("Generating L4 mid-horizon ring (8 tiles, 9000m, 100m step) …")
+        l4_count = _generate_horizon_ring(L4_OFFSETS, L4_HALF, L4_STEP, L4_SKIRT,
+                                          "horizon_l4", "is_horizon_l4")
+
+        print("Generating L5 far-horizon ring (8 tiles, 18000m, 200m step) …")
+        l5_count = _generate_horizon_ring(L5_OFFSETS, L5_HALF, L5_STEP, L5_SKIRT,
+                                          "horizon_l5", "is_horizon_l5")
+
+        data_path.write_text(json.dumps(existing_data))
+        print(f"Added {l4_count} L4 + {l5_count} L5 horizon tiles to {data_path}")
         return
 
     # Pre-fetch RÚIAN footprints for vertex snapping
@@ -992,15 +1168,16 @@ window._viewerSky = sky;
 // at low sun elevations; using a slightly tinted version of the sun's
 // scattering color (warm-ish at sunset, blue-ish at midday) prevents the
 // hard "fog wall" effect.
-scene.fog = new THREE.FogExp2(0xb8c8d8, 0.00018);
+// Phase 4: fog density 0.000055 — thin enough for L5 far-horizon tiles at
+// 31.5km to remain visible (exp2 fog at 31500m: e^(-0.000055*31500)≈0.17 opacity).
+// Previous 0.00018 was tuned for the 4.5km panorama ring.
+scene.fog = new THREE.FogExp2(0xb8c8d8, 0.000055);
 
-// near=1.0 (was 0.1) reclaims depth precision; far=15000 (was 5000) makes
-// room for the future L3 panorama ring at ~7.2km. Linear depth buffer
-// (logarithmicDepthBuffer was tried but broke cadastre + parcel polygonOffset
-// overlays — see commit history). Parcels + cadastre live only in L0/L1
-// (within 900m of subject) where 24-bit depth precision is still ~0.05m;
-// distant L3 terrain accepts ~1m precision since fog masks z-fighting there.
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 15000);
+// near=1.0, far=65000: Phase 4 extends coverage to ±31.5km.  Linear depth
+// buffer was avoided (breaks cadastre overlays). At 24-bit depth and
+// near=1/far=65000 ratio, depth precision at 31km is ~10m — acceptable for
+// the coarse L5 terrain mesh viewed through heavy fog.
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
 camera.position.set(200, 150, 200);
 
 const renderer = new THREE.WebGLRenderer({{ antialias: true }});
@@ -1015,7 +1192,7 @@ controls.dampingFactor = 0.15;
 controls.mouseButtons = {{ LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }};
 controls.screenSpacePanning = true;
 controls.minDistance = 1;
-controls.maxDistance = 15000;   // match camera far clip — required to see the LOD panorama
+controls.maxDistance = 50000;   // Phase 4: extended to 50km so L5 tiles at 31.5km stay reachable
 controls.maxPolarAngle = Math.PI / 2.05;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.8));
@@ -1059,6 +1236,55 @@ dataLoaded.then(() => {{
     }});
   }}
 
+  // ── Phase 4: shared L4 + L5 horizon textures (1 fetch per ring, UV remap) ──
+  const l4Tiles = tiles.filter(t => t.is_horizon_l4);
+  let sharedL4TexPromise = null;
+  let l4Bbox = null;
+  if (l4Tiles.length > 0) {{
+    l4Bbox = [
+      Math.min(...l4Tiles.map(t => t.sjtsk_bbox[0])),
+      Math.min(...l4Tiles.map(t => t.sjtsk_bbox[1])),
+      Math.max(...l4Tiles.map(t => t.sjtsk_bbox[2])),
+      Math.max(...l4Tiles.map(t => t.sjtsk_bbox[3])),
+    ];
+    const l4WgsBbox = [
+      Math.min(...l4Tiles.map(t => t.wgs_bbox[0])),
+      Math.min(...l4Tiles.map(t => t.wgs_bbox[1])),
+      Math.max(...l4Tiles.map(t => t.wgs_bbox[2])),
+      Math.max(...l4Tiles.map(t => t.wgs_bbox[3])),
+    ];
+    // L4 spans ~27km × 27km total. z=11 (~78m/px ČÚZK source) composited at
+    // 1024px gives ~26m/px effective — adequate for mid-horizon terrain.
+    const l4Url = `/proxy/ortofoto?BBOX=${{l4Bbox.join(',')}}&WBBOX=${{l4WgsBbox.join(',')}}&size=1024&zoom=11`;
+    sharedL4TexPromise = new Promise((resolve, reject) => {{
+      texLoader.load(l4Url, resolve, undefined, reject);
+    }});
+  }}
+
+  const l5Tiles = tiles.filter(t => t.is_horizon_l5);
+  let sharedL5TexPromise = null;
+  let l5Bbox = null;
+  if (l5Tiles.length > 0) {{
+    l5Bbox = [
+      Math.min(...l5Tiles.map(t => t.sjtsk_bbox[0])),
+      Math.min(...l5Tiles.map(t => t.sjtsk_bbox[1])),
+      Math.max(...l5Tiles.map(t => t.sjtsk_bbox[2])),
+      Math.max(...l5Tiles.map(t => t.sjtsk_bbox[3])),
+    ];
+    const l5WgsBbox = [
+      Math.min(...l5Tiles.map(t => t.wgs_bbox[0])),
+      Math.min(...l5Tiles.map(t => t.wgs_bbox[1])),
+      Math.max(...l5Tiles.map(t => t.wgs_bbox[2])),
+      Math.max(...l5Tiles.map(t => t.wgs_bbox[3])),
+    ];
+    // L5 spans ~63km × 63km total. z=9 (~312m/px ČÚZK source) composited at
+    // 1024px gives ~50m/px effective — suitable for far horizon, fog masks rest.
+    const l5Url = `/proxy/ortofoto?BBOX=${{l5Bbox.join(',')}}&WBBOX=${{l5WgsBbox.join(',')}}&size=1024&zoom=9`;
+    sharedL5TexPromise = new Promise((resolve, reject) => {{
+      texLoader.load(l5Url, resolve, undefined, reject);
+    }});
+  }}
+
 for (const tile of tiles) {{
   if (useGLB && tile.glb_url) {{
     const setupMesh = (geometry) => {{
@@ -1067,6 +1293,41 @@ for (const tile of tiles) {{
       mesh.userData = {{ tile, mat, geo: geometry, ortofotoTexture: null, ortofotoLoaded: false }};
       scene.add(mesh);
       allMeshes.push(mesh);
+
+      // Phase 4: horizon L4/L5 tiles use per-ring shared textures with UV remap.
+      const _applySharedTex = (promise, bbox, label) => {{
+        const FLIP_V = true;
+        promise.then(sharedTex => {{
+          sharedTex.colorSpace = THREE.SRGBColorSpace;
+          sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
+          const tex = sharedTex.clone();
+          tex.needsUpdate = true;
+          const bWidth  = bbox[2] - bbox[0];
+          const bHeight = bbox[3] - bbox[1];
+          tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / bWidth;
+          tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / bHeight;
+          if (FLIP_V) {{
+            tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
+            tex.offset.y = 1 - (tile.sjtsk_bbox[3] - bbox[1]) / bHeight;
+          }} else {{
+            tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
+            tex.offset.y = (tile.sjtsk_bbox[1] - bbox[1]) / bHeight;
+          }}
+          mesh.material.map = tex;
+          mesh.material.needsUpdate = true;
+          mesh.userData.ortofotoLoaded = true;
+          mesh.userData.ortofotoTexture = tex;
+        }}).catch(e => console.warn(label + ' shared texture failed:', e));
+      }};
+
+      if (tile.is_horizon_l4 && sharedL4TexPromise) {{
+        _applySharedTex(sharedL4TexPromise, l4Bbox, 'L4 horizon');
+        return;
+      }}
+      if (tile.is_horizon_l5 && sharedL5TexPromise) {{
+        _applySharedTex(sharedL5TexPromise, l5Bbox, 'L5 horizon');
+        return;
+      }}
 
       // Phase 3B: panorama tiles use the single shared texture with UV remap.
       if (tile.is_panorama && sharedPanTexPromise) {{

@@ -331,7 +331,7 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
 
 
 def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_height, skirt_depth,
-                          skirt_edges=None):
+                          skirt_edges=None, inner_facing_edges=None):
     """Extract a coarse outer-ring panorama tile mesh + UV data.
 
     Samples DMP directly at `step` metre resolution via rasterio.merge, builds a
@@ -343,6 +343,11 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
     None means all four sides (backward-compatible default for the outermost ring).
     Empty set means no skirt at all.
 
+    inner_facing_edges: set of {'N', 'S', 'E', 'W'} indicating which sides face an
+    adjacent inner ring. Vertices on these edges will be re-sampled at native DMP
+    resolution (0.5m) to match the point-sampled Y values the inner ring sees.
+    Skipped for DMR5G-sourced tiles (paths under cache/dmr5g_dynamic/).
+
     Convention (matches local_z = -half + r*step in Three.js viewer):
       'S' = top edge    (r=0,   local_z=-half)
       'N' = bottom edge (r=n-1, local_z=+half)
@@ -351,6 +356,8 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
     """
     if skirt_edges is None:
         skirt_edges = {'N', 'S', 'E', 'W'}
+    if inner_facing_edges is None:
+        inner_facing_edges = set()
     from rasterio.merge import merge
 
     bounds = (cx - half, cy - half, cx + half, cy + half)
@@ -383,6 +390,57 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             else:
                 y = 0.0
             vertices.append([local_x, y, local_z])
+
+    # Native-resolution resampling for inner-facing edges.
+    # Override Y values of edge vertices with DMP sampled at native 0.5m resolution
+    # so they match the point-sampled values seen by the adjacent inner ring.
+    # Skip if any path is from DMR5G dynamic cache (impractical to fetch at 0.5m).
+    dmr5g_sourced = any("dmr5g_dynamic" in str(p) for p in dmp_paths)
+    if inner_facing_edges and not dmr5g_sourced:
+        native_srcs = [rasterio.open(p) for p in dmp_paths]
+        try:
+            native_merged, _native_transform = merge(
+                native_srcs,
+                bounds=(cx - half, cy - half, cx + half, cy + half),
+                res=(0.5, 0.5),
+                nodata=-9999.0,
+            )
+        finally:
+            for s in native_srcs:
+                s.close()
+
+        native = native_merged[0]  # (H, W) float32 array
+        native_valid = (native > 0) & (native != -9999.0)
+        native_h, native_w = native.shape
+
+        # Native raster: row 0 = top = max northing (cy+half), rows go downward.
+        # world_x runs left→right (col), northing (cy-local_z in S-JTSK) runs top→bottom (row).
+        def world_to_native_px(local_x_v, local_z_v):
+            """Convert local tile coords to (row, col) in the native raster."""
+            world_x = cx + local_x_v
+            world_northing = cy - local_z_v  # S-JTSK northing
+            col = int((world_x - (cx - half)) / 0.5)
+            row = int(((cy + half) - world_northing) / 0.5)
+            return (
+                max(0, min(native_h - 1, row)),
+                max(0, min(native_w - 1, col)),
+            )
+
+        eps = step * 0.1
+        for i, v in enumerate(vertices):
+            local_x_v, _y_v, local_z_v = v
+            on_edge = (
+                ('W' in inner_facing_edges and abs(local_x_v - (-half)) < eps) or
+                ('E' in inner_facing_edges and abs(local_x_v - (+half)) < eps) or
+                ('S' in inner_facing_edges and abs(local_z_v - (-half)) < eps) or
+                ('N' in inner_facing_edges and abs(local_z_v - (+half)) < eps)
+            )
+            if not on_edge:
+                continue
+            row, col = world_to_native_px(local_x_v, local_z_v)
+            if native_valid[row, col]:
+                raw_y = float(native[row, col]) - global_ground_z
+                vertices[i] = [local_x_v, float(max(0.0, min(raw_y, max_height))), local_z_v]
 
     # Terrain faces (two tris per quad)
     faces = []
@@ -624,6 +682,10 @@ def main():
             edges.add('S')   # -offset_z = south → outer edge is S
         return edges
 
+    def inner_facing_for(offset_x, offset_z, ring_max_offset):
+        """Return edges that face the adjacent inner ring (complement of outer_edges_for)."""
+        return {'N', 'S', 'E', 'W'} - outer_edges_for(offset_x, offset_z, ring_max_offset)
+
     # --add-panorama: generate 8 outer-ring tiles and append to existing data.json
     if args.add_panorama:
         tiles_dir = args.tiles_dir or f"tiles_{args.location}"
@@ -660,7 +722,8 @@ def main():
                 continue
 
             skirt_edges = outer_edges_for(offset_x, offset_z, PANO_RING_MAX)
-            print(f"  Generating panorama tile {i} at offset ({offset_x:+d}, {offset_z:+d}), center=({pcx:.0f}, {pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges}")
+            inner_edges = inner_facing_for(offset_x, offset_z, PANO_RING_MAX)
+            print(f"  Generating panorama tile {i} at offset ({offset_x:+d}, {offset_z:+d}), center=({pcx:.0f}, {pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges} inner_facing={inner_edges}")
             tile = extract_panorama_tile(
                 dmp_paths, pcx, pcy,
                 half=PANO_HALF, step=PANO_STEP,
@@ -668,6 +731,7 @@ def main():
                 max_height=max_height,
                 skirt_depth=SKIRT_DEPTH,
                 skirt_edges=skirt_edges,
+                inner_facing_edges=inner_edges,
             )
 
             glb_name = f"panorama_{i}.glb"
@@ -756,6 +820,7 @@ def main():
                 pcy = grid_cy - offset_z  # Z-axis inversion (same as panorama)
 
                 skirt_edges = outer_edges_for(offset_x, offset_z, ring_max_offset)
+                inner_edges = inner_facing_for(offset_x, offset_z, ring_max_offset)
 
                 dmp_paths = find_tiffs(pcx, pcy, half_m=half)
                 if not dmp_paths:
@@ -832,7 +897,7 @@ def main():
                     flat_tile = {"vertices": vertices, "faces": faces, "uvs": uvs}
                 else:
                     print(f"  Generating {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
-                          f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges}")
+                          f", center=({pcx:.0f},{pcy:.0f}) [{len(dmp_paths)} TIFs] skirt_edges={skirt_edges} inner_facing={inner_edges}")
                     # Horizon tiles need a much bigger max_height clamp than
                     # the inner grid: Jeseníky's Praděd is 1491m ASL = ~1266m
                     # above ground_z. The inner max_height (~50m) was set
@@ -845,6 +910,7 @@ def main():
                         max_height=1500.0,
                         skirt_depth=skirt,
                         skirt_edges=skirt_edges,
+                        inner_facing_edges=inner_edges,
                     )
 
                 glb_name = f"{prefix}_{i}.glb"

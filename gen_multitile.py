@@ -13,6 +13,12 @@ from pyproj import Transformer
 
 SJTSK_TO_WGS = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
 
+# Inner grid (extract_tile) uses pixel-center sampling with a 1m buffer overlap.
+# Its outermost vertex is at local ±(half + 0.25) in tile-local coords, not ±half.
+# Panorama tiles bordering the inner grid must shift their inner-facing edge
+# vertices inward by this amount so the shared boundary X/Z matches exactly.
+PANORAMA_INNER_EDGE_OFFSET = 0.25
+
 
 def fetch_dmr5g_tile(cx, cy, half, step):
     """Fetch DMR5G elevation TIFF from ČÚZK ImageServer for the given bbox.
@@ -331,7 +337,7 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
 
 
 def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_height, skirt_depth,
-                          skirt_edges=None, inner_facing_edges=None):
+                          skirt_edges=None, inner_facing_edges=None, inner_edge_offset=0.0):
     """Extract a coarse outer-ring panorama tile mesh + UV data.
 
     Samples DMP directly at `step` metre resolution via rasterio.merge, builds a
@@ -429,18 +435,28 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
         eps = step * 0.1
         for i, v in enumerate(vertices):
             local_x_v, _y_v, local_z_v = v
-            on_edge = (
-                ('W' in inner_facing_edges and abs(local_x_v - (-half)) < eps) or
-                ('E' in inner_facing_edges and abs(local_x_v - (+half)) < eps) or
-                ('S' in inner_facing_edges and abs(local_z_v - (-half)) < eps) or
-                ('N' in inner_facing_edges and abs(local_z_v - (+half)) < eps)
-            )
-            if not on_edge:
+            edge_dir = None
+            new_local_x = local_x_v
+            new_local_z = local_z_v
+            if 'W' in inner_facing_edges and abs(local_x_v - (-half)) < eps:
+                edge_dir = 'W'
+                new_local_x = local_x_v + inner_edge_offset  # shift west edge eastward (toward center)
+            elif 'E' in inner_facing_edges and abs(local_x_v - (+half)) < eps:
+                edge_dir = 'E'
+                new_local_x = local_x_v - inner_edge_offset  # shift east edge westward (toward center)
+            elif 'S' in inner_facing_edges and abs(local_z_v - (-half)) < eps:
+                edge_dir = 'S'
+                new_local_z = local_z_v + inner_edge_offset  # shift south edge northward (toward center)
+            elif 'N' in inner_facing_edges and abs(local_z_v - (+half)) < eps:
+                edge_dir = 'N'
+                new_local_z = local_z_v - inner_edge_offset  # shift north edge southward (toward center)
+            if edge_dir is None:
                 continue
-            row, col = world_to_native_px(local_x_v, local_z_v)
+            row, col = world_to_native_px(new_local_x, new_local_z)
             if native_valid[row, col]:
                 raw_y = float(native[row, col]) - global_ground_z
-                vertices[i] = [local_x_v, float(max(0.0, min(raw_y, max_height))), local_z_v]
+                # Update local_x/z too so the vertex's geometric position shifts
+                vertices[i] = [new_local_x, float(max(0.0, min(raw_y, max_height))), new_local_z]
 
     # Terrain faces (two tris per quad)
     faces = []
@@ -696,6 +712,20 @@ def main():
         if "tiles" not in existing_data or not isinstance(existing_data["tiles"], list):
             raise SystemExit(f"{data_path} does not contain a 'tiles' array.")
 
+        # Use the ground_z from the already-generated inner grid tiles so that
+        # panorama Y values are on the same scale as inner grid Y values.
+        # Recomputing ground_z from area TIFs can yield a different value (the
+        # 5th-percentile shifts depending on which TIFs are present), causing a
+        # visible vertical step at the inner→panorama boundary.
+        inner_gz_values = [t["ground_z"] for t in existing_data["tiles"]
+                           if t.get("grid_col") is not None and "ground_z" in t]
+        if inner_gz_values:
+            pano_ground_z = float(np.median(inner_gz_values))
+            print(f"  Panorama ground_z: {pano_ground_z:.3f}m (from {len(inner_gz_values)} inner tiles, was {global_ground_z:.3f}m computed)")
+        else:
+            pano_ground_z = global_ground_z
+            print(f"  Panorama ground_z: {pano_ground_z:.3f}m (no inner tiles found, using computed value)")
+
         PANORAMA_OFFSETS = [
             (-3000, +3000),  # NW
             (    0, +3000),  # N
@@ -727,11 +757,12 @@ def main():
             tile = extract_panorama_tile(
                 dmp_paths, pcx, pcy,
                 half=PANO_HALF, step=PANO_STEP,
-                global_ground_z=global_ground_z,
+                global_ground_z=pano_ground_z,
                 max_height=max_height,
                 skirt_depth=SKIRT_DEPTH,
                 skirt_edges=skirt_edges,
                 inner_facing_edges=inner_edges,
+                inner_edge_offset=PANORAMA_INNER_EDGE_OFFSET,
             )
 
             glb_name = f"panorama_{i}.glb"
@@ -755,7 +786,7 @@ def main():
                 "offset_x": offset_x,
                 "offset_z": offset_z,
                 "center_sjtsk": [float(pcx), float(pcy)],
-                "ground_z": global_ground_z,
+                "ground_z": pano_ground_z,
                 "wgs_bbox": wgs_bbox,
                 "sjtsk_bbox": sjtsk_bbox,
                 "glb_url": f"{tiles_dir}/{glb_name}",

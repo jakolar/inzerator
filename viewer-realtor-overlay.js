@@ -633,16 +633,15 @@ export function init(args) {
     }
 
     if (preset === 'lateralflyby') {
-      // Tighter framing — was 220m alt + ±350m horizontal + 80m N offset
-      // which framed entire village; subject parcel was a small feature.
-      // 120m alt + ±180m horizontal + 50m N puts the subject around 1/3
-      // of frame height with neighbouring buildings still visible.
-      const ZOFF = 50;
+      // Close cinematic pass — subject fills ~half frame height.
+      // 50m altitude, ±70m horizontal, 25m N offset → endpoint distance ~91m.
+      // Tight enough to feel like a low-altitude drone close-pass.
+      const ZOFF = 25;
       const posPts = [
-        new THREE.Vector3(cx - 180, gy + 120, cz + ZOFF),
-        new THREE.Vector3(cx -  60, gy + 120, cz + ZOFF),
-        new THREE.Vector3(cx +  60, gy + 120, cz + ZOFF),
-        new THREE.Vector3(cx + 180, gy + 120, cz + ZOFF),
+        new THREE.Vector3(cx - 70, gy + 50, cz + ZOFF),
+        new THREE.Vector3(cx - 25, gy + 50, cz + ZOFF),
+        new THREE.Vector3(cx + 25, gy + 50, cz + ZOFF),
+        new THREE.Vector3(cx + 70, gy + 50, cz + ZOFF),
       ];
       const tgtPts = posPts.map(() => tgtAt());
       return {

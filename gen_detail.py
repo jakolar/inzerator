@@ -1,10 +1,11 @@
 """Generate one high-detail mesh for a single address inside a v2 region.
 
-SM5 in the inner core, fade-ring blend to DMR5G at the outer 50 m.
+SM5 in the inner core, fade-ring blend to the panorama mesh at the outer 50 m.
 Cardinal: scene +Z = world +Y.
 """
 import argparse
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,7 @@ import rasterio
 from rasterio.merge import merge
 from pyproj import Transformer
 
-from gen_panorama import fetch_dmr5g, save_glb, add_skirt
+from gen_panorama import save_glb, add_skirt
 
 SJTSK_TO_WGS = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
 
@@ -52,22 +53,60 @@ def load_sm5_patch(sm5_paths, cx, cy, half, step):
     return data, valid
 
 
-def load_dmr5g_patch(cx, cy, half, step):
-    """One DMR5G fetch at the same bbox + step, read into a numpy array."""
-    path = fetch_dmr5g(cx, cy, half, step)
-    with rasterio.open(path) as ds:
-        data = ds.read(1)
-    valid = (data > 0) & (data != -9999.0)
-    return data, valid
+def _load_panorama_grid(manifest_dir, region):
+    """Read the region's panorama GLB and return the regular vertex grid
+    (n x n x 3) for bilinear Y sampling. Skirt verts are stripped."""
+    path = Path(manifest_dir) / region["panorama_glb"]
+    with open(path, "rb") as f:
+        data = f.read()
+    json_len = struct.unpack_from("<I", data, 12)[0]
+    gltf = json.loads(data[20:20 + json_len].decode())
+    bin_data = data[20 + json_len + 8:]
+    prim = gltf["meshes"][0]["primitives"][0]
+    acc = gltf["accessors"][prim["attributes"]["POSITION"]]
+    bv = gltf["bufferViews"][acc["bufferView"]]
+    off = bv.get("byteOffset", 0)
+    count = acc["count"]
+    floats = struct.unpack_from(f"<{count*3}f", bin_data, off)
+    half = region["half"]
+    step = region["step"]
+    n = int(round(2 * half / step)) + 1
+    flat = np.array(floats, dtype=np.float64).reshape(-1, 3)
+    return flat[: n * n].reshape(n, n, 3), half, step
 
 
-def build_detail(cx, cy, half, step, fade_width, ground_z):
+def _panorama_y_at(grid, half, step, region_cx, region_cy, world_x, world_y):
+    """Bilinear panorama Y at a given world position (assumes within bbox)."""
+    plx = world_x - region_cx
+    plz = world_y - region_cy
+    n = grid.shape[0]
+    fx = (plx + half) / step
+    fz = (plz + half) / step
+    ix = int(fx)
+    iz = int(fz)
+    tx = fx - ix
+    tz = fz - iz
+    ix = max(0, min(n - 2, ix))
+    iz = max(0, min(n - 2, iz))
+    y00 = grid[iz, ix, 1]
+    y10 = grid[iz + 1, ix, 1]
+    y01 = grid[iz, ix + 1, 1]
+    y11 = grid[iz + 1, ix + 1, 1]
+    return (1 - tx) * (1 - tz) * y00 + tx * (1 - tz) * y01 + (1 - tx) * tz * y10 + tx * tz * y11
+
+
+def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, region):
     """Build the detail mesh. Y = SM5 in the inner core, linear blend with
-    DMR5G across the fade band, exact DMR5G match at the outer edge.
+    the panorama mesh's Y across the fade band, exact panorama Y match at
+    the outer edge.
 
-    ground_z is the panorama's ground_z (from manifest.json) — both SM5 and
-    DMR5G Y values are normalized against the SAME ground reference so the
-    boundary with the panorama beneath matches exactly.
+    The fade target is the panorama mesh's bilinear-sampled Y at the same
+    world (x, y) — this makes the seam exact by construction, regardless of
+    DMR5G fetch-resolution mismatch.
+
+    ground_z is the panorama's ground_z (from manifest.json) — SM5 Y values
+    are normalized against the SAME ground reference; panorama Y is already
+    normalized at build time.
     """
     sm5_paths = discover_sm5(cx, cy, half)
     if not sm5_paths:
@@ -76,11 +115,11 @@ def build_detail(cx, cy, half, step, fade_width, ground_z):
             f"does not cover this address bbox. Add SM5 tiles or pick a different centre."
         )
     sm5_data, sm5_valid = load_sm5_patch(sm5_paths, cx, cy, half, step)
-    dmr_data, dmr_valid = load_dmr5g_patch(cx, cy, half, step)
+    pano_grid, pano_half, pano_step = _load_panorama_grid(manifest_dir, region)
+    region_cx, region_cy = region["center_sjtsk"]
 
     n = int(round(2 * half / step)) + 1
     sm5_h, sm5_w = sm5_data.shape
-    dmr_h, dmr_w = dmr_data.shape
 
     inner_radius = half - fade_width
 
@@ -90,6 +129,8 @@ def build_detail(cx, cy, half, step, fade_width, ground_z):
         for c in range(n):
             local_x = -half + c * step
             local_z = -half + r * step
+            world_x = cx + local_x
+            world_y = cy + local_z
 
             # Sample SM5 (clamped rasterio rows). data row 0 = top of bbox = max world_y.
             dr_sm = min((n - 1) - r, sm5_h - 1)
@@ -97,25 +138,26 @@ def build_detail(cx, cy, half, step, fade_width, ground_z):
             sm5_y = (float(sm5_data[dr_sm, dc_sm]) - ground_z
                      if sm5_valid[dr_sm, dc_sm] else None)
 
-            dr_dm = min((n - 1) - r, dmr_h - 1)
-            dc_dm = min(c, dmr_w - 1)
-            dmr_y = (float(dmr_data[dr_dm, dc_dm]) - ground_z
-                     if dmr_valid[dr_dm, dc_dm] else 0.0)
+            # Fade target = panorama mesh's actual Y at this world pos.
+            # By construction the outer edge of the detail matches the
+            # panorama exactly (no fetch-resolution mismatch).
+            pano_y = float(_panorama_y_at(pano_grid, pano_half, pano_step,
+                                          region_cx, region_cy, world_x, world_y))
 
-            d = max(abs(local_x), abs(local_z))  # L∞ distance from centre
+            d = max(abs(local_x), abs(local_z))  # L-infinity distance from centre
             if d <= inner_radius:
-                y = sm5_y if sm5_y is not None else dmr_y
+                y = sm5_y if sm5_y is not None else pano_y
             elif d >= half:
-                y = dmr_y
+                y = pano_y
             else:
                 t = (d - inner_radius) / fade_width
                 if sm5_y is None:
-                    y = dmr_y
+                    y = pano_y
                 else:
-                    y = (1.0 - t) * sm5_y + t * dmr_y
+                    y = (1.0 - t) * sm5_y + t * pano_y
 
             vertices.append([local_x, y, local_z])
-            world_coords.append((cx + local_x, cy + local_z))
+            world_coords.append((world_x, world_y))
 
     # Faces — 2 triangles per quad, no grid_valid mask
     faces = []
@@ -174,7 +216,8 @@ def main():
 
     print(f"Generating detail '{args.slug}' at ({cx}, {cy}) — {args.half*2}m square, "
           f"step {args.step}m, fade {args.fade}m …")
-    tile = build_detail(cx, cy, args.half, args.step, args.fade, region_ground_z)
+    tile = build_detail(cx, cy, args.half, args.step, args.fade,
+                        region_ground_z, out_dir, manifest["region"])
     add_skirt(tile, args.skirt, args.half, args.step)
 
     details_dir = out_dir / "details"

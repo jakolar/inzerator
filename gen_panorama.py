@@ -2,7 +2,7 @@
 
 DMR5G only; one GLB per region. Cardinal: scene +Z = world +Y (north).
 """
-import argparse, json, struct, urllib.request
+import argparse, json, urllib.request
 from pathlib import Path
 import numpy as np
 import pygltflib
@@ -25,8 +25,10 @@ def fetch_dmr5g(cx, cy, half, step, cache_dir="cache/dmr5g_v2"):
         f"?bbox={bbox}&bboxSR=5514&imageSR=5514&size={n},{n}"
         f"&format=tiff&pixelType=F32&f=image"
     )
+    tmp_path = cache_path.with_suffix('.tif.tmp')
     with urllib.request.urlopen(url, timeout=120) as r:
-        cache_path.write_bytes(r.read())
+        tmp_path.write_bytes(r.read())
+    tmp_path.replace(cache_path)
     return cache_path
 
 
@@ -38,6 +40,11 @@ def build_panorama(dmr5g_path, cx, cy, half, step):
     with rasterio.open(dmr5g_path) as ds:
         data = ds.read(1)
     valid = (data > 0) & (data != -9999.0)
+    if not valid.any():
+        raise RuntimeError(
+            f"No valid DMR5G pixels in {dmr5g_path}; "
+            f"bbox may be outside Czechia or fetch returned blank tile"
+        )
     ground_z = float(np.percentile(data[valid], 5))
 
     n = int(round(2 * half / step)) + 1
@@ -91,7 +98,10 @@ def build_panorama(dmr5g_path, cx, cy, half, step):
 
 
 def add_skirt(tile, depth, half, step):
-    """Emit four skirt strips (S/N/W/E) dropped by `depth`. UVs duplicated from parent."""
+    """Emit four skirt strips (S/N/W/E) dropped by `depth`. UVs duplicated from parent.
+
+    Mutates `tile` in place (appends to its vertices/faces/uvs lists).
+    """
     n = int(round(2 * half / step)) + 1
     vertices = tile["vertices"]
     faces = tile["faces"]
@@ -146,7 +156,18 @@ def save_glb(tile, output_path):
     verts_bytes = verts.tobytes()
     faces_bytes = faces_packed.tobytes()
     uvs_bytes = uvs.tobytes()
-    all_bytes = verts_bytes + faces_bytes + uvs_bytes
+
+    # GLB spec: bufferViews containing FLOAT data must start at 4-byte aligned
+    # offsets. Pad each block to a multiple of 4; bufferView byteOffset uses the
+    # padded cumulative size, byteLength stays at the unpadded data size.
+    def _pad4(b):
+        pad = (-len(b)) % 4
+        return b + b'\x00' * pad
+
+    verts_bytes_p = _pad4(verts_bytes)
+    faces_bytes_p = _pad4(faces_bytes)
+    uvs_bytes_p = _pad4(uvs_bytes)
+    all_bytes = verts_bytes_p + faces_bytes_p + uvs_bytes_p
 
     gltf = pygltflib.GLTF2(
         scene=0,
@@ -172,11 +193,11 @@ def save_glb(tile, output_path):
             pygltflib.BufferView(buffer=0, byteOffset=0,
                                  byteLength=len(verts_bytes),
                                  target=pygltflib.ARRAY_BUFFER),
-            pygltflib.BufferView(buffer=0, byteOffset=len(verts_bytes),
+            pygltflib.BufferView(buffer=0, byteOffset=len(verts_bytes_p),
                                  byteLength=len(faces_bytes),
                                  target=pygltflib.ELEMENT_ARRAY_BUFFER),
             pygltflib.BufferView(buffer=0,
-                                 byteOffset=len(verts_bytes) + len(faces_bytes),
+                                 byteOffset=len(verts_bytes_p) + len(faces_bytes_p),
                                  byteLength=len(uvs_bytes),
                                  target=pygltflib.ARRAY_BUFFER),
         ],
@@ -189,7 +210,8 @@ def save_glb(tile, output_path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--region", required=True)
-    p.add_argument("--center-sjtsk", required=True, help="cx,cy")
+    p.add_argument("--center-sjtsk", required=True,
+                   help="cx,cy (use --center-sjtsk=cx,cy for negative ČÚZK coords)")
     p.add_argument("--half", type=int, default=15000)
     p.add_argument("--step", type=int, default=50)
     p.add_argument("--skirt", type=int, default=200)
@@ -217,7 +239,9 @@ def main():
         "wgs_bbox": tile["wgs_bbox"],
         "panorama_glb": "panorama.glb",
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest_tmp = manifest_path.with_suffix('.json.tmp')
+    manifest_tmp.write_text(json.dumps(manifest, indent=2))
+    manifest_tmp.replace(manifest_path)
     print(f"Wrote {glb_path} ({glb_path.stat().st_size // 1024} KB) and {manifest_path}")
 
 

@@ -224,3 +224,42 @@ def test_list_active_jobs_queued(clean_jobs):
     assert active[0]["queue_position"] == 0
     assert active[1]["job_id"] == b
     assert active[1]["queue_position"] == 1
+
+
+def test_retry_resets_failed_steps(clean_jobs):
+    """Retry odebere `fail` stepy zpět na `pending` a vrátí job_id do fronty."""
+    job_id = locations.enqueue_job("t", "T", 0.0, 0.0)
+    # Simuluj že job už proběhl a closeup selhal:
+    locations.JOB_QUEUE.clear()
+    job = locations.JOBS[job_id]
+    job["steps"][0]["state"] = "ok"      # panorama
+    job["steps"][1]["state"] = "ok"      # outer
+    job["steps"][2]["state"] = "fail"    # closeup
+    job["steps"][2]["error"] = "test error"
+    job["steps"][3]["state"] = "pending" # inner stayed
+    assert locations.retry_job(job_id) is True
+    assert locations.JOB_QUEUE == [job_id]
+    # Failed se reset; ok zůstane (worker je preskočí přes existenci .glb)
+    assert job["steps"][2]["state"] == "pending"
+    assert job["steps"][2]["error"] is None
+    assert job["steps"][0]["state"] == "ok"   # ok zůstane
+
+
+def test_retry_unknown_job_returns_false(clean_jobs):
+    assert locations.retry_job("nonexistent") is False
+
+
+def test_cancel_queued_removes_from_queue(clean_jobs):
+    a = locations.enqueue_job("a", "A", 0.0, 0.0)
+    b = locations.enqueue_job("b", "B", 0.0, 0.0)
+    assert locations.cancel_job(a) is True
+    assert locations.JOB_QUEUE == [b]
+    assert locations.JOBS[a]["cancelled"] is True
+
+
+def test_cancel_already_done_returns_false(clean_jobs):
+    job_id = locations.enqueue_job("t", "T", 0.0, 0.0)
+    locations.JOB_QUEUE.clear()
+    for s in locations.JOBS[job_id]["steps"]:
+        s["state"] = "ok"
+    assert locations.cancel_job(job_id) is False

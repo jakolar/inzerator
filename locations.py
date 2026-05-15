@@ -206,3 +206,53 @@ def list_active_jobs() -> list[dict]:
             if jid in JOBS:
                 out.append({**JOBS[jid], "queue_position": i})
         return out
+
+
+def retry_job(job_id: str) -> bool:
+    """Reset `fail` stepy zpět na `pending`, znovu zařadit do fronty.
+    Worker resume-skipne hotové stepy (existence .glb na disku).
+    Vrátí True pokud nalezeno, False pokud job_id neznámé."""
+    with JOB_CV:
+        job = JOBS.get(job_id)
+        if job is None:
+            return False
+        # Neretrujeme job, který je právě běžící (CURRENT_JOB)
+        if CURRENT_JOB == job_id:
+            return False
+        if job_id in JOB_QUEUE:
+            return True   # už je ve frontě, idempotent
+        for step in job["steps"]:
+            if step["state"] in ("fail", "cancelled"):
+                step["state"] = "pending"
+                step["error"] = None
+                step["started_at"] = None
+                step["finished_at"] = None
+        job["cancelled"] = False
+        JOB_QUEUE.append(job_id)
+        JOB_CV.notify()
+        return True
+
+
+def cancel_job(job_id: str) -> bool:
+    """Zruší job. Pokud queued: vyhodí z fronty. Pokud running: nastaví
+    `cancelled = True`, worker zabije proces po dokončení aktuálního I/O
+    polling cyklu (max 10 s po terminate(), pak kill()).
+    Vrátí False pokud job už hotový (ok / fail final state)."""
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return False
+        if all(s["state"] in ("ok", "fail", "cancelled", "skipped") for s in job["steps"]):
+            return False   # už hotový
+        job["cancelled"] = True
+        if job_id in JOB_QUEUE:
+            JOB_QUEUE.remove(job_id)
+        # Pokud běží: worker si všimne `cancelled` na další iteraci.
+        # Skutečný subprocess.terminate() jde z worker threadu (CURRENT_PROC).
+        global _CANCEL_REQUESTED
+        if CURRENT_JOB == job_id:
+            _CANCEL_REQUESTED = True
+        return True
+
+
+_CANCEL_REQUESTED = False

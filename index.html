@@ -85,6 +85,9 @@
                  style="width:60%; padding:6px;">
           <button class="btn" id="search-btn">Hledat</button>
         </div>
+        <div style="font-size:11px; color:#888; margin-top:4px;">
+          Tip: piš s diakritikou (Hnojice, Strážek). RUIAN bez diakritiky nehledá.
+        </div>
         <div id="search-results" style="margin-top:12px;"></div>
         <div id="selected-fields" style="margin-top:12px; display:none;">
           <p><b>Vybráno:</b> <span id="selected-label"></span></p>
@@ -119,7 +122,25 @@
       }
       const data = await r.json();
       if (data.length === 0) {
-        resultsEl.innerHTML = '<div class="error">Nic nenalezeno. Zkus i s diakritikou (Strážek, ne Strazek).</div>';
+        resultsEl.innerHTML = `
+          <div class="error">Nic nenalezeno. Zkus i s diakritikou.</div>
+          <details style="margin-top:8px;">
+            <summary style="cursor:pointer; color:#1a73e8;">Zadat S-JTSK ručně</summary>
+            <div style="margin-top:8px;">
+              cx: <input id="manual-cx" type="number" step="0.01" style="width:120px">
+              cy: <input id="manual-cy" type="number" step="0.01" style="width:120px">
+              <button class="btn" id="manual-ok-btn">Použít</button>
+            </div>
+          </details>
+        `;
+        setTimeout(() => {
+          document.getElementById('manual-ok-btn')?.addEventListener('click', () => {
+            const cx = parseFloat(document.getElementById('manual-cx').value);
+            const cy = parseFloat(document.getElementById('manual-cy').value);
+            if (isNaN(cx) || isNaN(cy)) { alert('Zadej platná čísla'); return; }
+            selectHit({label: `Manual ${cx}, ${cy}`, sjtsk_cx: cx, sjtsk_cy: cy, obec: 'lokace'});
+          });
+        }, 0);
         return;
       }
       resultsEl.innerHTML = data.map((hit, i) => `

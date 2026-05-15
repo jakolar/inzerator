@@ -552,10 +552,25 @@ function setupParcelSelection(region) {
     // tube into a glowing neon perimeter through UnrealBloomPass's
     // threshold (~0.85). Tube radius dropped from 0.3 m to 0.12 m so
     // the bloom halo dominates over the geometry.
-    const tubeMat = new THREE.MeshBasicMaterial({
+    // Dual-pass parcel outline: bright neon when the boundary is on
+    // visible ground, faint ghost where buildings/trees occlude it.
+    //   tubeMatBright — depthTest:true, HDR color (3,3,3) feeds bloom →
+    //     glowing neon on visible terrain. Hidden behind 3D occluders.
+    //   tubeMatGhost — depthTest:false, dim semi-transparent → faint
+    //     trace shows parcel extent through buildings without the
+    //     full X-ray glow that drew the line *across* roofs at full
+    //     brightness in the single-pass version.
+    const tubeMatBright = new THREE.MeshBasicMaterial({
       color: new THREE.Color(3.0, 3.0, 3.0),
       toneMapped: false,
       transparent: false,
+      depthTest: true,
+    });
+    const tubeMatGhost = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(1.0, 1.0, 1.0),
+      toneMapped: true,
+      transparent: true,
+      opacity: 0.18,
       depthTest: false,
     });
     for (const ring of parcelRings) {
@@ -569,9 +584,14 @@ function setupParcelSelection(region) {
           path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
         }
         const tubeGeo = new THREE.TubeGeometry(path, pts.length, 0.45, 6, false);
-        const tube = new THREE.Mesh(tubeGeo, tubeMat);
-        tube.renderOrder = 99;
-        outlineGroup.add(tube);
+        // Bright pass (renders first, depth-tested)
+        const bright = new THREE.Mesh(tubeGeo, tubeMatBright);
+        bright.renderOrder = 99;
+        outlineGroup.add(bright);
+        // Ghost pass (shares geometry; renders after at depthTest:false)
+        const ghost = new THREE.Mesh(tubeGeo, tubeMatGhost);
+        ghost.renderOrder = 100;
+        outlineGroup.add(ghost);
       }
     }
     countEl.textContent = String(selected.size);
@@ -879,9 +899,15 @@ function setupVideoCapture(sel) {
     const fmt = VIDEO_FORMATS[chosenFormat] || VIDEO_FORMATS['yt-1080'];
     const origPR = renderer.getPixelRatio();
     const origAspect = camera.aspect;
-    renderer.setPixelRatio(1);
+    // Keep retina pixelRatio (don't drop to 1) — rendering at
+    // `fmt × devicePixelRatio` internal pixels means the GPU samples a
+    // finer mipmap level, so textures stay as crisp as they look outside
+    // recording. VideoEncoder downsamples the captured VideoFrame back to
+    // the configured fmt.w × fmt.h, which gives a higher-quality result
+    // than rendering at fmt directly. Cost: 4× more shading work per
+    // frame, acceptable because the recording loop is deterministic.
     renderer.setSize(fmt.w, fmt.h, false);
-    composer.setSize(fmt.w, fmt.h);
+    composer.setSize(Math.round(fmt.w * origPR), Math.round(fmt.h * origPR));
     camera.aspect = fmt.w / fmt.h;
     camera.updateProjectionMatrix();
     renderPass.enabled = false;

@@ -5,7 +5,10 @@ import json
 import re
 import threading
 import unicodedata
+import urllib.parse
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 TILES_DIR_PREFIX = "tiles_v2_"
 JOB_LOG_DIR = Path("cache/jobs")
@@ -102,5 +105,55 @@ def list_locations() -> list[dict]:
             "has_outer":    expected_glb(slug, "outer").exists(),
             "has_closeup":  expected_glb(slug, "closeup").exists(),
             "has_inner":    expected_glb(slug, "inner").exists(),
+        })
+    return out
+
+
+RUIAN_ADRESNI_MISTO_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/1/query"
+
+
+class RuianUnavailable(Exception):
+    """ČÚZK RUIAN AdresniMisto service nedostupný (network / 5xx)."""
+
+
+def _escape_like(q: str) -> str:
+    """Escapuje single-quote (SQL injection) a procento/podtržítko (LIKE wildcardy)."""
+    return q.replace("'", "''").replace("%", r"\%").replace("_", r"\_")
+
+
+def ruian_search(q: str) -> list[dict]:
+    """Volá ČÚZK RUIAN AdresniMisto LIKE query. Vrací list {label, sjtsk_cx,
+    sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx."""
+    if not q.strip():
+        return []
+    escaped = _escape_like(q.strip())
+    params = {
+        "where": f"UPPER(adresa) LIKE UPPER('%{escaped}%')",
+        "outFields": "adresa,psc,cislodomovni,kod",
+        "outSR": "5514",
+        "returnGeometry": "true",
+        "resultRecordCount": "10",
+        "f": "json",
+    }
+    url = RUIAN_ADRESNI_MISTO_URL + "?" + urllib.parse.urlencode(params)
+    req = Request(url, headers={"User-Agent": "inzerator/1.0"})
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except (URLError, HTTPError, TimeoutError, OSError) as e:
+        raise RuianUnavailable(str(e)) from e
+
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry", {})
+        adresa = attrs.get("adresa", "")
+        if not adresa or "x" not in geom or "y" not in geom:
+            continue
+        out.append({
+            "label": adresa,
+            "sjtsk_cx": float(geom["x"]),
+            "sjtsk_cy": float(geom["y"]),
+            "obec": parse_obec(adresa),
         })
     return out

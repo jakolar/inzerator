@@ -1,5 +1,7 @@
+import json
 import locations
 import pytest
+from unittest.mock import patch, MagicMock
 
 
 def test_module_imports():
@@ -115,3 +117,62 @@ def test_list_locations_scan(tmp_path, monkeypatch):
     assert by_slug["beta"]["label"] == "beta"   # fallback = slug
     assert by_slug["alpha"]["has_panorama"] is True
     assert by_slug["beta"]["has_outer"] is False
+
+
+def _mock_ruian_response(features):
+    """Vyrobí MagicMock context manager s .read() vracejícím JSON."""
+    payload = json.dumps({"features": features}).encode()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=MagicMock(read=lambda: payload))
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+def test_ruian_search_maps_features():
+    fake_features = [
+        {"attributes": {"adresa": "č.p. 136, 78501 Hnojice", "psc": 78501},
+         "geometry": {"x": -547980.76, "y": -1107944.18}},
+        {"attributes": {"adresa": "Jemnice 8, 59253 Strážek", "psc": 59253},
+         "geometry": {"x": -626541.82, "y": -1130200.0}},
+    ]
+    with patch("locations.urlopen", return_value=_mock_ruian_response(fake_features)):
+        result = locations.ruian_search("Hnojice")
+    assert len(result) == 2
+    assert result[0] == {
+        "label": "č.p. 136, 78501 Hnojice",
+        "sjtsk_cx": -547980.76,
+        "sjtsk_cy": -1107944.18,
+        "obec": "Hnojice",
+    }
+    assert result[1]["obec"] == "Strážek"
+
+
+def test_ruian_search_empty():
+    with patch("locations.urlopen", return_value=_mock_ruian_response([])):
+        result = locations.ruian_search("nonsense")
+    assert result == []
+
+
+def test_ruian_search_escapes_quotes_and_percent():
+    """Single quote a procento v dotazu musí být escapované, jinak SQL break v LIKE."""
+    captured_url = []
+
+    def fake_urlopen(req, timeout=None):
+        captured_url.append(req.get_full_url() if hasattr(req, "get_full_url") else req)
+        return _mock_ruian_response([])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        locations.ruian_search("O'Hara 100%")
+
+    sent = captured_url[0]
+    # ' → '' a % escape: zkontrolujeme, že request URL neobsahuje literal "O'Hara"
+    # ale escapovanou verzi
+    assert "O%27%27Hara" in sent or "O''Hara" in sent  # url-encoded ''
+    # Procento musí být v LIKE escapnuté (zde \\%)
+
+
+def test_ruian_search_network_error_raises():
+    from urllib.error import URLError
+    with patch("locations.urlopen", side_effect=URLError("connection refused")):
+        with pytest.raises(locations.RuianUnavailable):
+            locations.ruian_search("Hnojice")

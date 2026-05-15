@@ -55,3 +55,10 @@ def test_ruian_search_empty_query_returns_empty():
     status, data = _get("/api/ruian/search?q=")
     assert status == 200
     assert data == []
+
+
+def test_resume_from_disk_missing_manifest_400():
+    """Resume bez panorama.glb / manifest.json → 400."""
+    status, data = _post("/api/jobs", {"slug": "nonexistent-partial", "resume_from_disk": True})
+    assert status == 400
+    assert "manifest" in data.get("error", "").lower()

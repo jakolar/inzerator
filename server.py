@@ -2351,10 +2351,33 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         body = self._read_json_body()
         slug = body.get("slug", "").strip()
         label = body.get("label", slug).strip() or slug
-        cx = body.get("cx")
-        cy = body.get("cy")
+
+        # Resume-from-disk: cx/cy read from manifest.json. Used when the
+        # original job_id is lost (server restart) and a partial location
+        # has the panorama.glb step done — manifest.json has region.center_sjtsk.
+        if body.get("resume_from_disk"):
+            manifest_path = Path(f"tiles_v2_{slug}") / "manifest.json"
+            if not manifest_path.exists():
+                self._send_json(400, {"error": "no manifest.json — partial location must have panorama.glb step done"})
+                return
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                self._send_json(400, {"error": f"manifest unreadable: {e}"})
+                return
+            region = manifest.get("region", {})
+            center = region.get("center_sjtsk") or [None, None]
+            cx, cy = center[0], center[1]
+            label = region.get("label") or slug
+            if cx is None or cy is None:
+                self._send_json(400, {"error": "manifest missing region.center_sjtsk"})
+                return
+        else:
+            cx = body.get("cx")
+            cy = body.get("cy")
+
         if not slug or cx is None or cy is None:
-            self._send_json(400, {"error": "required fields: slug, cx, cy"})
+            self._send_json(400, {"error": "required fields: slug, cx, cy (or resume_from_disk=true)"})
             return
         if not locations.is_valid_slug(slug):
             self._send_json(400, {"error": "slug must match ^[a-z0-9-]+$"})

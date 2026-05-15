@@ -53,11 +53,30 @@
       <div class="location-row" data-slug="${loc.slug}">
         <span class="label">${escapeHtml(loc.label)}</span>
         <span class="status status-${loc.status}">${statusLabel(loc)}</span>
+        ${loc.status === 'partial'
+          ? `<button class="btn" data-action="retry-from-disk" data-slug="${loc.slug}">Retry</button>`
+          : ''}
         ${loc.status === 'ready'
           ? `<a class="btn" href="/v2.html?region=${loc.slug}">Otevřít</a>`
           : ''}
       </div>
     `).join('');
+    el.querySelectorAll('[data-action="retry-from-disk"]').forEach(btn => {
+      btn.onclick = async () => {
+        const slug = btn.dataset.slug;
+        const r = await fetch('/api/jobs', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({slug, resume_from_disk: true}),
+        });
+        const data = await r.json();
+        if (r.status !== 200) {
+          alert(`Retry selhal (${r.status}): ${data.error || 'unknown'}`);
+          return;
+        }
+        startPolling();
+      };
+    });
   }
 
   function statusLabel(loc) {

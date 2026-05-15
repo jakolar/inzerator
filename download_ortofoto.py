@@ -30,9 +30,15 @@ ATOM_INDEX = "https://atom.cuzk.gov.cz/Ortofoto/Ortofoto.xml"
 
 
 def _http_get(url: str, timeout: int = 60) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # `requests` rather than urllib so we benefit from urllib3's per-attempt
+    # Happy Eyeballs implementation — Python stdlib urllib here on macOS prefers
+    # IPv6 and ČÚZK's v6 path is currently broken from some networks
+    # (Errno 61 Connection refused), so the IPv4 fallback that urllib3 tries
+    # is what makes this reliable.
+    import requests
+    resp = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content
 
 
 def find_dataset_feed_url(mapnom: str) -> str:
@@ -101,20 +107,22 @@ def download(mapnom: str, dest_root: Path, force: bool = False) -> Path:
     zip_url = extract_zip_url(feed_xml)
     print(f"  Downloading: {zip_url}")
 
+    # Same `requests` rationale as _http_get — IPv4 fallback on macOS.
+    import requests
     zip_path = out_dir / f"{mapnom}.zip"
-    req = urllib.request.Request(zip_url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with requests.get(zip_url, headers={"User-Agent": UA}, stream=True, timeout=600) as resp:
+        resp.raise_for_status()
         total = int(resp.headers.get("Content-Length") or 0)
         downloaded = 0
         chunk_log = max(total // 14, 1)
         with open(zip_path, "wb") as f:
-            while True:
-                buf = resp.read(64 * 1024)
+            for buf in resp.iter_content(chunk_size=64 * 1024):
                 if not buf:
-                    break
+                    continue
                 f.write(buf)
+                prev = downloaded
                 downloaded += len(buf)
-                if total and downloaded // chunk_log != (downloaded - len(buf)) // chunk_log:
+                if total and downloaded // chunk_log != prev // chunk_log:
                     print(f"    {downloaded * 100 // total}% ({downloaded // (1024*1024)} MB)",
                           end="\r", flush=True)
     print(f"  Wrote {zip_path} ({zip_path.stat().st_size // (1024*1024)} MB)")

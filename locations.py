@@ -218,10 +218,12 @@ def _resolve_sm5_codes(cx: float, cy: float, half: float = 2500) -> list[str]:
 
 
 def _do_sm5_download(job: dict, log_path: Path) -> bool:
-    """In-process SM5 step: resolve sheet codes for outer-ring bbox
-    (half=2500), download missing ones via download_tiff.download_tiff,
-    touch sentinel. Returns True on success, False on any failure (writes
-    error to log_path)."""
+    """In-process 'sheets' step: resolve MAPNOM codes for outer-ring bbox
+    (half=2500), then download BOTH DMPOK-TIFF (SM5 height data used by
+    gen_detail.py) AND raw ortofoto JPEGs (consumed at runtime by
+    server.py _proxy_ortofoto_raw — the tile service / ESRI / Google
+    fallbacks aren't reliably reachable from every network, raw files
+    sidestep that). Touches `.sm5_ok` sentinel when both are complete."""
     log_lines = []
 
     def log(msg):
@@ -233,7 +235,7 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
             pass
 
     try:
-        log(f"Resolving SM5 sheets for envelope (cx={job['cx']}, cy={job['cy']}, half=2500)…")
+        log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half=2500)…")
         codes = _resolve_sm5_codes(job["cx"], job["cy"], half=2500)
         log(f"ČÚZK returned {len(codes)} sheet(s): {', '.join(codes)}")
     except RuianUnavailable as e:
@@ -244,28 +246,46 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
         log("FAIL: no SM5 sheets cover this envelope — location is outside ČR coverage?")
         return False
 
-    # Import lazily so locations.py doesn't fail to import if `requests`
-    # is missing in a test environment (download_tiff requires it).
+    # Import lazily so locations.py doesn't fail to import if the
+    # downloader dependencies are missing in a test environment.
     import download_tiff
+    import download_ortofoto
 
+    cache_root = Path("cache")
+
+    # 1) DMPOK-TIFF (SM5 DSM with buildings) — needed by gen_detail.py
     for i, code in enumerate(codes, 1):
-        tif_path = Path(f"cache/dmpok_tiff_{code}") / f"{code}.tif"
+        tif_path = cache_root / f"dmpok_tiff_{code}" / f"{code}.tif"
         if tif_path.exists():
-            log(f"[{i}/{len(codes)}] {code} — cached, skip")
+            log(f"[SM5 {i}/{len(codes)}] {code} — cached, skip")
             continue
-        log(f"[{i}/{len(codes)}] {code} — downloading…")
+        log(f"[SM5 {i}/{len(codes)}] {code} — downloading…")
         try:
             download_tiff.download_tiff(code)
-            log(f"[{i}/{len(codes)}] {code} — done")
+            log(f"[SM5 {i}/{len(codes)}] {code} — done")
         except Exception as e:
-            log(f"FAIL: {code} download error: {e}")
+            log(f"FAIL: {code} DMPOK-TIFF download error: {e}")
+            return False
+
+    # 2) Raw ortofoto JPEG — needed by server _proxy_ortofoto_raw at runtime
+    for i, code in enumerate(codes, 1):
+        ortho_dir = cache_root / f"ortofoto_{code}"
+        if ortho_dir.exists() and any(ortho_dir.glob("*.jpg")):
+            log(f"[ORTO {i}/{len(codes)}] {code} — cached, skip")
+            continue
+        log(f"[ORTO {i}/{len(codes)}] {code} — downloading…")
+        try:
+            download_ortofoto.download(code, cache_root)
+            log(f"[ORTO {i}/{len(codes)}] {code} — done")
+        except Exception as e:
+            log(f"FAIL: {code} ortofoto download error: {e}")
             return False
 
     # Write sentinel
     sentinel = expected_glb(job["slug"], "sm5")
     sentinel.parent.mkdir(parents=True, exist_ok=True)
     sentinel.touch()
-    log("OK: all SM5 sheets ready; sentinel written")
+    log("OK: all SM5 + ortofoto sheets ready; sentinel written")
     return True
 
 

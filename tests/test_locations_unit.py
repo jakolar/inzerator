@@ -151,8 +151,11 @@ def test_ruian_search_maps_features():
     ]
     with patch("locations.urlopen", return_value=_mock_ruian_response(fake_features)):
         result = locations.ruian_search("Hnojice")
+    # "Hnojice" has no numeric token → no parcel path, no fold filter.
+    # Both fake features pass through.
     assert len(result) == 2
     assert result[0] == {
+        "kind": "address",
         "label": "č.p. 136, 78501 Hnojice",
         "sjtsk_cx": -547980.76,
         "sjtsk_cy": -1107944.18,
@@ -167,8 +170,9 @@ def test_ruian_search_empty():
     assert result == []
 
 
-def test_ruian_search_escapes_quotes_and_percent():
-    """Single quote a procento v dotazu musí být escapované, jinak SQL break v LIKE."""
+def test_ruian_search_escapes_quotes_in_literal_path():
+    """When input has no numeric token, address search hits the literal-LIKE
+    path. Single-quote in input must be escaped to '' or RUIAN errors."""
     captured_url = []
 
     def fake_urlopen(req, timeout=None):
@@ -176,13 +180,52 @@ def test_ruian_search_escapes_quotes_and_percent():
         return _mock_ruian_response([])
 
     with patch("locations.urlopen", side_effect=fake_urlopen):
-        locations.ruian_search("O'Hara 100%")
+        # No digit anywhere → literal LIKE path, no parcel path.
+        locations.ruian_search("O'Hara")
 
+    assert len(captured_url) == 1
     sent = captured_url[0]
-    # ' → '' a % escape: zkontrolujeme, že request URL neobsahuje literal "O'Hara"
-    # ale escapovanou verzi
-    assert "O%27%27Hara" in sent or "O''Hara" in sent  # url-encoded ''
-    # Procento musí být v LIKE escapnuté (zde \\%)
+    # urlencode turns `''` into `%27%27`
+    assert "O%27%27Hara" in sent
+
+
+def test_ruian_search_diacritic_tolerance():
+    """User types 'Fugnerova 355/16 Decin' (no diacritics). Numeric token
+    '355/16' makes server fetch broad, Python-side ASCII-fold filter
+    must accept 'Fügnerova … 40502 Děčín' as a match."""
+    fake_features = [
+        # The target — should be returned
+        {"attributes": {"adresa": "Fügnerova 355/16, 40502 Děčín I-Děčín, Děčín"},
+         "geometry": {"x": -750000.0, "y": -960000.0}},
+        # Same parcel-number elsewhere — should be filtered out
+        {"attributes": {"adresa": "Riegrova 355/16, 25001 Brandýs nad Labem"},
+         "geometry": {"x": -740000.0, "y": -1040000.0}},
+    ]
+    with patch("locations.urlopen", return_value=_mock_ruian_response(fake_features)):
+        result = locations.ruian_search("Fugnerova 355/16 Decin")
+    # Only the Děčín hit survives ASCII-fold filter (Fugnerova + 355/16 + Decin)
+    addresses = [h for h in result if h["kind"] == "address"]
+    assert len(addresses) == 1
+    assert addresses[0]["label"] == "Fügnerova 355/16, 40502 Děčín I-Děčín, Děčín"
+
+
+def test_ruian_search_parcel_hits_emitted():
+    """When input has a parcel-format token (N/N), the parcel layer is
+    queried in addition to addresses and matching features are returned
+    with kind='parcel'. Mock returns the SAME features for both calls;
+    we just verify the parcel branch produces a kind='parcel' entry."""
+    fake_features = [
+        {"attributes": {"cisloparcely": "355/16",
+                        "katastralniuzemicisloparcely": "Libhošť 355/16",
+                        "vymeraparcely": 485.0},
+         "geometry": {"x": -540000.0, "y": -1100000.0}},
+    ]
+    with patch("locations.urlopen", return_value=_mock_ruian_response(fake_features)):
+        result = locations.ruian_search("355/16")
+    parcels = [h for h in result if h["kind"] == "parcel"]
+    assert len(parcels) == 1
+    assert "Libhošť 355/16" in parcels[0]["label"]
+    assert parcels[0]["obec"] == "Libhošť"
 
 
 def test_ruian_search_network_error_raises():

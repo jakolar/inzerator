@@ -127,7 +127,18 @@ def list_locations() -> list[dict]:
 
 
 RUIAN_ADRESNI_MISTO_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/1/query"
+RUIAN_PARCELA_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/0/query"
 SM5_KLADY_URL = "https://ags.cuzk.cz/arcgis/rest/services/KladyMapovychListu/MapServer/25/query"
+
+_NUMERIC_TOKEN_RE = re.compile(r"\d")
+_PARCEL_TOKEN_RE = re.compile(r"^\d+(/\d+)?$")
+
+
+def _ascii_fold(s: str) -> str:
+    """NFD + drop combining marks + lowercase. 'Fügnerova Děčín' →
+    'fugnerova decin'. Used for diacritic-insensitive substring match
+    on RUIAN results — ČÚZK ArcGIS has no UPPER-like fold function."""
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii").lower()
 
 
 class RuianUnavailable(Exception):
@@ -139,40 +150,49 @@ def _escape_like(q: str) -> str:
     return q.replace("'", "''").replace("%", r"\%").replace("_", r"\_")
 
 
-def ruian_search(q: str) -> list[dict]:
-    """Volá ČÚZK RUIAN AdresniMisto LIKE query. Vrací list {label, sjtsk_cx,
-    sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx.
-
-    Multi-token search: input se rozdělí na slova (whitespace + čárky) a
-    spojí AND-řetězcem LIKE klauzulí. Tj. 'Stebno 74 Kryry' najde
-    'Stebno 74, 44101 Kryry' i když uživatel vynechá PSČ. Case-insensitive
-    přes UPPER() na obou stranách."""
-    if not q.strip():
-        return []
-    tokens = [t for t in re.split(r"[\s,]+", q.strip()) if t]
-    if not tokens:
-        return []
-    clauses = [
-        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
-        for t in tokens
-    ]
-    where = " AND ".join(clauses)
-    params = {
-        "where": where,
-        "outFields": "adresa,psc,cislodomovni,kod",
-        "outSR": "5514",
-        "returnGeometry": "true",
-        "resultRecordCount": "10",
-        "f": "json",
-    }
-    url = RUIAN_ADRESNI_MISTO_URL + "?" + urllib.parse.urlencode(params)
+def _ruian_get(url, timeout=15):
     req = Request(url, headers={"User-Agent": "inzerator/1.0"})
     try:
-        with urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
     except (URLError, HTTPError, TimeoutError, OSError) as e:
         raise RuianUnavailable(str(e)) from e
 
+
+def _search_addresses(tokens: list[str]) -> list[dict]:
+    """Address layer (AdresniMisto, MapServer/1) search with diacritic
+    tolerance. RUIAN stores 'Fügnerova 355/16, 40502 Děčín'; user types
+    'Fugnerova 355/16 Decin'. ČÚZK ArcGIS has no fold function, so:
+      1. Narrow the server-side query to a numeric token (e.g. '355/16')
+         which is diacritic-invariant — returns ~100 candidate addresses.
+      2. Python-side ASCII-fold each candidate and require every user
+         token (also folded) to substring-match.
+    When the input has no numeric token, fall back to literal LIKE
+    (no diacritic tolerance — user needs the correct characters)."""
+    if not tokens:
+        return []
+    numeric = [t for t in tokens if _NUMERIC_TOKEN_RE.search(t)]
+    use_folded_filter = bool(numeric)
+    query_tokens = numeric if use_folded_filter else tokens
+
+    clauses = [
+        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
+        for t in query_tokens
+    ]
+    params = {
+        "where": " AND ".join(clauses),
+        "outFields": "adresa,psc,cislodomovni,kod",
+        "outSR": "5514",
+        "returnGeometry": "true",
+        # When we filter Python-side fetch broader; otherwise no filtering
+        # so 10 is plenty for the literal-LIKE path.
+        "resultRecordCount": "1000" if use_folded_filter else "10",
+        "f": "json",
+    }
+    url = RUIAN_ADRESNI_MISTO_URL + "?" + urllib.parse.urlencode(params)
+    data = _ruian_get(url)
+
+    folded_tokens = [_ascii_fold(t) for t in tokens] if use_folded_filter else None
     out = []
     for feat in data.get("features", []):
         attrs = feat.get("attributes", {})
@@ -180,13 +200,97 @@ def ruian_search(q: str) -> list[dict]:
         adresa = attrs.get("adresa", "")
         if not adresa or "x" not in geom or "y" not in geom:
             continue
+        if folded_tokens is not None:
+            folded_adr = _ascii_fold(adresa)
+            if not all(t in folded_adr for t in folded_tokens):
+                continue
         out.append({
+            "kind": "address",
             "label": adresa,
             "sjtsk_cx": float(geom["x"]),
             "sjtsk_cy": float(geom["y"]),
             "obec": parse_obec(adresa),
         })
+        if len(out) >= 10:
+            break
     return out
+
+
+def _search_parcels(tokens: list[str]) -> list[dict]:
+    """Parcela layer (ParcelaDefinicniBod, MapServer/0) search. Fires
+    when at least one token matches '<int>' or '<int>/<int>' — the
+    canonical parcel-number format (kmenovecislo/poddelenicisla). Other
+    tokens are interpreted as obec/katastr filter, folded against the
+    layer's `katastralniuzemicisloparcely` field ('Libhošť 355/16')."""
+    parcel_tokens = [t for t in tokens if _PARCEL_TOKEN_RE.match(t)]
+    if not parcel_tokens:
+        return []
+
+    # ArcGIS layer 0 lets us filter on `cisloparcely` exact-match for the
+    # parcel-number tokens. AND-chain them (rare to give 2 numbers).
+    clauses = []
+    for t in parcel_tokens:
+        clauses.append(f"cisloparcely = '{_escape_like(t)}'")
+    params = {
+        "where": " AND ".join(clauses),
+        "outFields": "cisloparcely,katastralniuzemicisloparcely,vymeraparcely",
+        "outSR": "5514",
+        "returnGeometry": "true",
+        "resultRecordCount": "200",
+        "f": "json",
+    }
+    url = RUIAN_PARCELA_URL + "?" + urllib.parse.urlencode(params)
+    data = _ruian_get(url)
+
+    # Non-parcel tokens become a fold-filter on the katastr label.
+    other_tokens = [t for t in tokens if not _PARCEL_TOKEN_RE.match(t)]
+    folded_others = [_ascii_fold(t) for t in other_tokens]
+
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry", {})
+        label = attrs.get("katastralniuzemicisloparcely") or attrs.get("cisloparcely", "")
+        if not label or "x" not in geom or "y" not in geom:
+            continue
+        if folded_others:
+            folded_label = _ascii_fold(label)
+            if not all(t in folded_label for t in folded_others):
+                continue
+        # `katastralniuzemicisloparcely` = "<obec> <cisloparcely>", so the
+        # obec is everything before the trailing parcel number.
+        obec = label.rsplit(" ", 1)[0] if " " in label else label
+        out.append({
+            "kind": "parcel",
+            "label": f"Parcela {label} ({attrs.get('vymeraparcely', '?')} m²)",
+            "sjtsk_cx": float(geom["x"]),
+            "sjtsk_cy": float(geom["y"]),
+            "obec": obec,
+        })
+        if len(out) >= 10:
+            break
+    return out
+
+
+def ruian_search(q: str) -> list[dict]:
+    """Top-level RUIAN search — combines address + parcel hits. Tokens
+    split on whitespace + commas. Returns list of {kind, label, sjtsk_cx,
+    sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx.
+
+    Diacritic-insensitive when input has any numeric token (server fetches
+    a broad candidate set keyed off that token, Python filters folded).
+    Pure-text queries fall back to literal LIKE — RUIAN's diacritic chars
+    must match exactly. See _search_addresses for details."""
+    if not q.strip():
+        return []
+    tokens = [t for t in re.split(r"[\s,]+", q.strip()) if t]
+    if not tokens:
+        return []
+    # Parcels first (they're more specific) then addresses, deduped not
+    # needed since result types are distinct.
+    parcels = _search_parcels(tokens)
+    addresses = _search_addresses(tokens)
+    return parcels + addresses
 
 
 def _resolve_sm5_codes(cx: float, cy: float, half: float = 2500) -> list[str]:

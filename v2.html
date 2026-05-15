@@ -442,8 +442,38 @@ async function loadV2() {
     });
   }
 
+  // Extract the inner mesh's Y heightfield into a flat 2D grid so the
+  // parcel outline drape can sample per step instead of linear-interpolating
+  // between ring corners. SM5-derived mesh Y includes building roofs, so a
+  // boundary crossing a building climbs UP and back down — looks 3D-natural
+  // and stays visible from drone-eye angles. gen_detail emits vertices row-
+  // major (z rows, x cols) followed by skirt verts; we read the first n²
+  // POSITION.y entries straight into a Float32Array (4–16 MB depending on
+  // step). Triangle convention matches gen_detail._sample_grid_y so the
+  // outline lies on the same surface the mesh renders.
+  let _innerField = null;
+  const innerForField = allMeshes.find(m => m.userData?.meta?.slug === 'inner');
+  if (innerForField) {
+    const d = innerForField.userData.meta;
+    const n = Math.round(2 * d.half / d.step) + 1;
+    const pos = innerForField.geometry.getAttribute('position');
+    if (pos && pos.count >= n * n) {
+      const ys = new Float32Array(n * n);
+      for (let k = 0; k < n * n; k++) ys[k] = pos.array[k * 3 + 1];
+      _innerField = {
+        ys, n,
+        half: d.half, step: d.step,
+        // World position of mesh local-origin. Inner usually sits at
+        // detail.center_sjtsk == region.center_sjtsk, so sceneCx/Cz = 0.
+        sceneCx: innerForField.position.x,
+        sceneCz: innerForField.position.z,
+      };
+      console.info(`[v2] inner heightfield extracted: ${n}×${n} @ ${d.step} m`);
+    }
+  }
+
   // Manual-debug handle in the console.
-  window._v2 = { region, details, allMeshes, scene, camera, controls, renderer };
+  window._v2 = { region, details, allMeshes, scene, camera, controls, renderer, innerField: _innerField };
 
   // Re-target camera vertically to the inner mesh's centroid Y. region.ground_z
   // is the panorama-wide reference elevation, which equals village elevation
@@ -468,11 +498,11 @@ async function loadV2() {
   }
 
   // ── Parcel selection + button-triggered orbit-and-record sales video ──
-  const sel = setupParcelSelection(region);
+  const sel = setupParcelSelection(region, _innerField);
   setupVideoCapture(sel);
 }
 
-function setupParcelSelection(region) {
+function setupParcelSelection(region, innerField) {
   // Region center in SJTSK — for /api/parcels query and for local→scene conv.
   const [gcx, gcy] = region.center_sjtsk;
   // Mesh Y in scene is `absolute_elevation - region.ground_z`. The parcels
@@ -567,17 +597,55 @@ function setupParcelSelection(region) {
 
   // Drape one edge (between two consecutive ring vertices) by linear
   // interpolation in scene XZ + the ring-vertex Y values from the server.
-  // Earlier raycast-down approach intersected the full inner mesh (4M+
-  // tris) ~150× per parcel and froze the tab.
+  // Sample the inner mesh's Y heightfield at world (x, z) using the same
+  // triangle interpolation gen_detail._sample_grid_y uses on the Python
+  // side, so the outline lies exactly on the rendered surface. Returns
+  // null when the point falls outside the inner mesh footprint.
+  // Mesh has scale.z = -1, so world Z maps to local Z via negation.
+  function sampleInnerY(wx, wz) {
+    if (!innerField) return null;
+    const { ys, n, half, step, sceneCx, sceneCz } = innerField;
+    const lx = wx - sceneCx;
+    const lz = -(wz - sceneCz);
+    if (lx < -half || lx > half || lz < -half || lz > half) return null;
+    const fx = (lx + half) / step;
+    const fz = (lz + half) / step;
+    let ix = Math.floor(fx);
+    let iz = Math.floor(fz);
+    const tx = fx - ix;
+    const tz = fz - iz;
+    if (ix < 0) ix = 0; else if (ix > n - 2) ix = n - 2;
+    if (iz < 0) iz = 0; else if (iz > n - 2) iz = n - 2;
+    const y00 = ys[iz * n + ix];
+    const y10 = ys[(iz + 1) * n + ix];
+    const y01 = ys[iz * n + (ix + 1)];
+    const y11 = ys[(iz + 1) * n + (ix + 1)];
+    // gen_detail emits T1=[(0,0),(1,0)x,(0,1)z], T2=[(1,0),(0,1),(1,1)]
+    if (tx + tz <= 1.0) return (1 - tx - tz) * y00 + tz * y10 + tx * y01;
+    return (1 - tz) * y01 + (1 - tx) * y10 + (tx + tz - 1) * y11;
+  }
+
+  // Drape one ring edge across the rendered surface. Inside the inner
+  // mesh footprint we sample the actual heightfield (including building
+  // roofs from SM5 DSM) so the outline climbs over geometry like a
+  // realtor's post-production paint stroke. Outside (or before inner
+  // loads), linear-interpolate between the ring's own corner Y values.
+  // Earlier raycast-down approach hit the full inner mesh (~14M tris)
+  // ~150× per parcel and froze the tab.
   function drapeEdge(a, b) {
-    const SUB_M = 2.0;
+    const SUB_M = 1.0;            // sample every 1 m so building edges are crisp
+    const LIFT = 0.4;             // sit just above the surface, avoid z-fight
     const dx = b.x - a.x, dz = b.z - a.z, dy = b.y - a.y;
     const segLen = Math.hypot(dx, dz);
     const n = Math.max(1, Math.ceil(segLen / SUB_M));
     const out = [];
     for (let k = 0; k <= n; k++) {
       const t = k / n;
-      out.push(new THREE.Vector3(a.x + dx * t, a.y + dy * t + 0.4, a.z + dz * t));
+      const wx = a.x + dx * t;
+      const wz = a.z + dz * t;
+      const sampled = sampleInnerY(wx, wz);
+      const y = (sampled !== null ? sampled : a.y + dy * t) + LIFT;
+      out.push(new THREE.Vector3(wx, y, wz));
     }
     return out;
   }

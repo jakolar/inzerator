@@ -552,26 +552,18 @@ function setupParcelSelection(region) {
     // tube into a glowing neon perimeter through UnrealBloomPass's
     // threshold (~0.85). Tube radius dropped from 0.3 m to 0.12 m so
     // the bloom halo dominates over the geometry.
-    // Dual-pass parcel outline: bright neon when the boundary is on
-    // visible ground, faint ghost where buildings/trees occlude it.
-    //   tubeMatBright — depthTest:true, HDR color (3,3,3) feeds bloom →
-    //     glowing neon on visible terrain. Hidden behind 3D occluders.
-    //   tubeMatGhost — depthTest:false, dim semi-transparent → faint
-    //     trace shows parcel extent through buildings without the
-    //     full X-ray glow that drew the line *across* roofs at full
-    //     brightness in the single-pass version.
-    const tubeMatBright = new THREE.MeshBasicMaterial({
+    // Layer order: buildings on top, parcel glow underneath. HDR color
+    // (3,3,3) feeds bloom for the neon look; depthTest:true so any 3D
+    // geometry (building roof/wall, tree mesh) between the camera and
+    // the parcel boundary occludes the glow exactly like in MapLibre's
+    // fill-extrusion-over-fill stack. Earlier dual-pass + ghost variant
+    // drew a faint line ON TOP of building roofs, which looked like the
+    // glow was floating above the city instead of sitting on the ground.
+    const tubeMat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(3.0, 3.0, 3.0),
       toneMapped: false,
       transparent: false,
       depthTest: true,
-    });
-    const tubeMatGhost = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(1.0, 1.0, 1.0),
-      toneMapped: true,
-      transparent: true,
-      opacity: 0.18,
-      depthTest: false,
     });
     for (const ring of parcelRings) {
       for (let i = 0; i < ring.length; i++) {
@@ -584,14 +576,9 @@ function setupParcelSelection(region) {
           path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
         }
         const tubeGeo = new THREE.TubeGeometry(path, pts.length, 0.45, 6, false);
-        // Bright pass (renders first, depth-tested)
-        const bright = new THREE.Mesh(tubeGeo, tubeMatBright);
-        bright.renderOrder = 99;
-        outlineGroup.add(bright);
-        // Ghost pass (shares geometry; renders after at depthTest:false)
-        const ghost = new THREE.Mesh(tubeGeo, tubeMatGhost);
-        ghost.renderOrder = 100;
-        outlineGroup.add(ghost);
+        const tube = new THREE.Mesh(tubeGeo, tubeMat);
+        tube.renderOrder = 99;
+        outlineGroup.add(tube);
       }
     }
     countEl.textContent = String(selected.size);

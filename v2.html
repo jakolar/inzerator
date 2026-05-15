@@ -630,23 +630,47 @@ function setupParcelSelection(region, innerField) {
   // roofs from SM5 DSM) so the outline climbs over geometry like a
   // realtor's post-production paint stroke. Outside (or before inner
   // loads), linear-interpolate between the ring's own corner Y values.
-  // Earlier raycast-down approach hit the full inner mesh (~14M tris)
-  // ~150× per parcel and froze the tab.
+  //
+  // Wall-edge handling: where two adjacent samples have a Y difference
+  // greater than WALL_THRESH (building wall in DSM), insert an L-shaped
+  // corner at the segment midpoint — first horizontally at the low Y,
+  // then vertically up to the high Y — so the tube climbs the wall
+  // squarely instead of cutting a diagonal through it. The exact wall
+  // X-position is unknown without sub-mesh resolution sampling; midpoint
+  // is the cheapest approximation that visually reads as a wall corner.
   function drapeEdge(a, b) {
-    const SUB_M = 1.0;            // sample every 1 m so building edges are crisp
-    const LIFT = 0.4;             // sit just above the surface, avoid z-fight
+    const SUB_M = 1.0;
+    const LIFT = 0.4;
+    const WALL_THRESH = 1.5;
     const dx = b.x - a.x, dz = b.z - a.z, dy = b.y - a.y;
     const segLen = Math.hypot(dx, dz);
     const n = Math.max(1, Math.ceil(segLen / SUB_M));
-    const out = [];
+    const raw = [];
     for (let k = 0; k <= n; k++) {
       const t = k / n;
       const wx = a.x + dx * t;
       const wz = a.z + dz * t;
       const sampled = sampleInnerY(wx, wz);
       const y = (sampled !== null ? sampled : a.y + dy * t) + LIFT;
-      out.push(new THREE.Vector3(wx, y, wz));
+      raw.push([wx, y, wz]);
     }
+    const out = [];
+    for (let k = 0; k < raw.length - 1; k++) {
+      const [px, py, pz] = raw[k];
+      const [qx, qy, qz] = raw[k + 1];
+      out.push(new THREE.Vector3(px, py, pz));
+      if (Math.abs(qy - py) >= WALL_THRESH) {
+        const mx = (px + qx) / 2;
+        const mz = (pz + qz) / 2;
+        // Two-point L corner: horizontal to wall midpoint at low Y,
+        // vertical to wall midpoint at high Y. Works for both rising
+        // (entering a roof) and falling (leaving one).
+        out.push(new THREE.Vector3(mx, py, mz));
+        out.push(new THREE.Vector3(mx, qy, mz));
+      }
+    }
+    const [lx, ly, lz] = raw[raw.length - 1];
+    out.push(new THREE.Vector3(lx, ly, lz));
     return out;
   }
 

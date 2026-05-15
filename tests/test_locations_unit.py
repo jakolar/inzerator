@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 
 
 def test_module_imports():
-    assert locations.STEP_NAMES == ("panorama", "sm5", "outer", "closeup", "inner")
+    assert locations.STEP_NAMES == ("panorama", "sm5", "outer", "closeup", "inner", "compress")
     assert locations.TILES_DIR_PREFIX == "tiles_v2_"
 
 
@@ -339,6 +339,13 @@ def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
         return True
     monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
+    def fake_compress(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "compress")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_compress", fake_compress)
+
     class FakeProc:
         def __init__(self, cmd, **kw):
             self.cmd = cmd
@@ -382,6 +389,13 @@ def test_worker_skips_existing_glb(tmp_path, monkeypatch, clean_jobs):
         return True
     monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
+    def fake_compress(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "compress")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_compress", fake_compress)
+
     class FakeProc:
         def __init__(self, cmd, **kw):
             self.cmd = cmd
@@ -419,6 +433,13 @@ def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
         return True
     monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
+    def fake_compress(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "compress")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_compress", fake_compress)
+
     class FailingProc:
         def __init__(self, cmd, **kw):
             self.cmd = cmd
@@ -451,6 +472,13 @@ def test_worker_unlinks_partial_glb_on_failure(tmp_path, monkeypatch, clean_jobs
         sentinel.touch()
         return True
     monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
+
+    def fake_compress(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "compress")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_compress", fake_compress)
 
     class PartialThenFailProc:
         def __init__(self, cmd, **kw):

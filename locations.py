@@ -16,7 +16,7 @@ from urllib.error import URLError, HTTPError
 TILES_DIR_PREFIX = "tiles_v2_"
 JOB_LOG_DIR = Path("cache/jobs")
 STEP_TIMEOUT_SECS = 60 * 60   # 60 min: cold ČÚZK DMR5G cache can take 10–30 min
-STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner")
+STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner", "compress")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: list[str] = []
@@ -62,7 +62,7 @@ def parse_obec(adresa: str) -> str:
 
 
 def expected_glb(slug: str, step: str) -> Path:
-    """For 'sm5' returns the .sm5_ok sentinel marker (no actual GLB).
+    """For 'sm5' and 'compress' returns a sentinel marker (no actual GLB).
     Worker's resume-skip uses .exists() on this so the sentinel-vs-glb
     distinction is transparent to the loop."""
     base = Path(f"{TILES_DIR_PREFIX}{slug}")
@@ -70,6 +70,8 @@ def expected_glb(slug: str, step: str) -> Path:
         return base / "panorama.glb"
     if step == "sm5":
         return base / ".sm5_ok"
+    if step == "compress":
+        return base / ".compress_ok"
     return base / "details" / f"{step}.glb"
 
 
@@ -307,6 +309,84 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
     return True
 
 
+def _do_compress(job: dict, log_path: Path) -> bool:
+    """In-process 'compress' step: Draco-encode each detail GLB.
+    gen_detail.py writes uncompressed glb (~168 MB for inner @ 0.5 m);
+    Draco at quant_pos=16 brings that to ~30–40 MB with sub-cm position
+    error (~3 % of mesh step). Per-detail flow:
+      1. If <slug>/_orig_uncompressed/<step>.glb already exists, skip
+         (idempotent — previous run finished this child).
+      2. Otherwise move <slug>/details/<step>.glb to _orig_uncompressed/
+         and Draco-compress back into details/.
+    Writes .compress_ok sentinel when all three details are done."""
+    log_lines = []
+
+    def log(msg):
+        log_lines.append(msg)
+        try:
+            log_path.write_text("\n".join(log_lines) + "\n")
+        except OSError:
+            pass
+
+    # Lazy import — keeps test environments without DracoPy importable.
+    try:
+        import draco_compress_glb
+    except ImportError as e:
+        log(f"FAIL: draco_compress_glb import failed: {e}")
+        return False
+
+    region_dir = Path(f"{TILES_DIR_PREFIX}{job['slug']}")
+    details_dir = region_dir / "details"
+    orig_dir = region_dir / "_orig_uncompressed"
+    orig_dir.mkdir(parents=True, exist_ok=True)
+
+    details = ("outer", "closeup", "inner")
+    for slug in details:
+        compressed_path = details_dir / f"{slug}.glb"
+        orig_path = orig_dir / f"{slug}.glb"
+
+        if orig_path.exists():
+            log(f"[{slug}] already compressed (orig stored), skip")
+            continue
+        if not compressed_path.exists():
+            log(f"FAIL: {slug} — no source .glb at {compressed_path}")
+            return False
+
+        size_before = compressed_path.stat().st_size
+        log(f"[{slug}] {size_before // (1024*1024)} MB → compressing…")
+
+        # Atomic-ish: move source aside FIRST so we don't lose data if
+        # Draco encode crashes. If compression fails below, the original
+        # is still in _orig_uncompressed/ and the next retry will see
+        # `compressed_path.exists() == False`, treat as fail, and surface
+        # the issue rather than silently re-running.
+        try:
+            compressed_path.rename(orig_path)
+        except OSError as e:
+            log(f"FAIL: {slug} — rename source aside: {e}")
+            return False
+
+        try:
+            draco_compress_glb.compress(str(orig_path), str(compressed_path))
+            size_after = compressed_path.stat().st_size
+            log(f"[{slug}] → {size_after // (1024*1024)} MB "
+                f"({100 * size_after // size_before}% of original)")
+        except Exception as e:
+            log(f"FAIL: {slug} — Draco compress: {e}")
+            # Restore the uncompressed file so retry doesn't see a hole.
+            try:
+                orig_path.rename(compressed_path)
+            except OSError:
+                pass
+            return False
+
+    sentinel = expected_glb(job["slug"], "compress")
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.touch()
+    log("OK: all 3 details Draco-compressed; sentinel written")
+    return True
+
+
 def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
     return {
         "job_id": str(uuid.uuid4()),
@@ -439,9 +519,10 @@ _LOD_PRESET = {
 def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
     """Vyrobí subprocess command pro daný step. `--center-sjtsk=cx,cy`
     musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag).
-    Raises ValueError for 'sm5' — that step is in-process, not subprocess."""
-    if step == "sm5":
-        raise ValueError("sm5 is in-process, no subprocess command")
+    Raises ValueError for 'sm5' and 'compress' — those are in-process,
+    not subprocess steps."""
+    if step in ("sm5", "compress"):
+        raise ValueError(f"{step!r} is in-process, no subprocess command")
     base = ["python3"]
     center = f"--center-sjtsk={cx},{cy}"
     if step == "panorama":
@@ -488,13 +569,18 @@ def _run_step(job: dict, step: dict) -> bool:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{step['name']}.log"
 
-    # === In-process step: sm5 ===
-    if step["name"] == "sm5":
+    # === In-process steps: sm5, compress ===
+    _inproc_handlers = {
+        "sm5": _do_sm5_download,
+        "compress": _do_compress,
+    }
+    handler = _inproc_handlers.get(step["name"])
+    if handler is not None:
         try:
-            ok = _do_sm5_download(job, log_path)
+            ok = handler(job, log_path)
         except Exception as e:
             ok = False
-            step["error"] = f"sm5 internal error: {e}"
+            step["error"] = f"{step['name']} internal error: {e}"
             existing_text = log_path.read_text() if log_path.exists() else ""
             log_path.write_text(existing_text + f"\nException: {e}")
         step["finished_at"] = time.time()
@@ -511,7 +597,7 @@ def _run_step(job: dict, step: dict) -> bool:
             return True
         step["state"] = "fail"
         if not step.get("error"):
-            step["error"] = "sm5 download failed (see log)"
+            step["error"] = f"{step['name']} failed (see log)"
         if expected.exists():
             try:
                 expected.unlink()

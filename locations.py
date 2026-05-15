@@ -128,12 +128,24 @@ def _escape_like(q: str) -> str:
 
 def ruian_search(q: str) -> list[dict]:
     """Volá ČÚZK RUIAN AdresniMisto LIKE query. Vrací list {label, sjtsk_cx,
-    sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx."""
+    sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx.
+
+    Multi-token search: input se rozdělí na slova (whitespace + čárky) a
+    spojí AND-řetězcem LIKE klauzulí. Tj. 'Stebno 74 Kryry' najde
+    'Stebno 74, 44101 Kryry' i když uživatel vynechá PSČ. Case-insensitive
+    přes UPPER() na obou stranách."""
     if not q.strip():
         return []
-    escaped = _escape_like(q.strip())
+    tokens = [t for t in re.split(r"[\s,]+", q.strip()) if t]
+    if not tokens:
+        return []
+    clauses = [
+        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
+        for t in tokens
+    ]
+    where = " AND ".join(clauses)
     params = {
-        "where": f"UPPER(adresa) LIKE UPPER('%{escaped}%')",
+        "where": where,
         "outFields": "adresa,psc,cislodomovni,kod",
         "outSR": "5514",
         "returnGeometry": "true",

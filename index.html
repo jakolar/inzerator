@@ -120,10 +120,21 @@
     `;
     document.getElementById('search-btn').onclick = doSearch;
     document.getElementById('cancel-form-btn').onclick = () => renderForm(false);
-    document.getElementById('addr-input').addEventListener('keydown', e => {
+    const addrInput = document.getElementById('addr-input');
+    addrInput.addEventListener('keydown', e => {
       if (e.key === 'Enter') doSearch();
     });
+    // Typeahead: 300 ms po zastavení psaní fetch; nebloku­je tlačítko Hledat.
+    // Krátké dotazy (<2 znaky) tichý no-op, aby user neviděl spam-error.
+    addrInput.addEventListener('input', () => {
+      clearTimeout(SEARCH_DEBOUNCE);
+      const q = addrInput.value.trim();
+      if (q.length < 2) return;
+      SEARCH_DEBOUNCE = setTimeout(doSearch, 300);
+    });
   }
+
+  let SEARCH_DEBOUNCE = null;
 
   async function doSearch() {
     const q = document.getElementById('addr-input').value.trim();

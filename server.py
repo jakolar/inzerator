@@ -1,11 +1,26 @@
 """HTTP server with WMS proxy for ortofoto."""
 import http.server
+import socket
 import urllib.request
 import urllib.parse
 import os
 import threading
 import json
 from pathlib import Path
+
+# Force IPv4 for all stdlib urllib / http.client calls in this process.
+# Our network's IPv6 path to ČÚZK (ags.cuzk.cz, openzu.cuzk.gov.cz,
+# atom.cuzk.gov.cz) currently returns "Connection refused" while IPv4
+# works fine. Python's macOS getaddrinfo otherwise prefers AF_INET6 and
+# all urlopen calls die at the connect step. Filtering the resolver
+# results is the smallest, least-surprising shim.
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only_getaddrinfo(host, *args, **kw):
+    results = _orig_getaddrinfo(host, *args, **kw)
+    v4 = [r for r in results if r[0] == socket.AF_INET]
+    return v4 if v4 else results   # fall back if host is v6-only
+socket.getaddrinfo = _ipv4_only_getaddrinfo
+
 import locations
 
 # Cap concurrent outgoing requests to ČÚZK across all server threads —

@@ -46,8 +46,18 @@ import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 // mp4-muxer: in-memory MP4 muxer fed by WebCodecs `VideoEncoder` output.
 // Used for the deterministic frame-by-frame recording path so a slow
-// GPU doesn't produce a stuttery video.
-import { Muxer, ArrayBufferTarget } from 'https://esm.sh/mp4-muxer@5';
+// GPU doesn't produce a stuttery video. Lazy-imported in the record
+// handler (esm.sh occasionally refuses connections from our network and
+// a top-level import then takes the whole module + page down — only
+// the record path actually needs the muxer, so the dependency stays
+// off the critical view-the-tiles flow).
+let Muxer, ArrayBufferTarget;
+async function _loadMuxer() {
+  if (Muxer) return;
+  const mod = await import('https://esm.sh/mp4-muxer@5');
+  Muxer = mod.Muxer;
+  ArrayBufferTarget = mod.ArrayBufferTarget;
+}
 
 const params = new URLSearchParams(location.search);
 const REGION = params.get('region') || 'hnojice';
@@ -342,6 +352,42 @@ async function loadV2() {
           transparent: true,
           opacity: 0,
         });
+        // Clip-out region covered by the next-smaller detail. gen_detail.py
+        // can carve children-shaped holes at build time, but only if the
+        // smaller details already exist in the manifest when the larger one
+        // is generated — and our pipeline goes large→small (fade_to chain
+        // forces parent-first order), so outer/closeup ship SOLID. Without
+        // this discard the larger mesh's lower-resolution texture bleeds
+        // through fade-band seams and at any sub-pixel z-fight that
+        // polygonOffset doesn't fully suppress. Fragment-side discard on
+        // world XZ is exact, sidestepping that whole class of artefact.
+        const smaller = details[i + 1];
+        if (smaller) {
+          const sxc = smaller.center_sjtsk[0] - region.center_sjtsk[0];
+          const szc = -(smaller.center_sjtsk[1] - region.center_sjtsk[1]);
+          const clipBox = new THREE.Vector4(
+            sxc - smaller.half, szc - smaller.half,
+            sxc + smaller.half, szc + smaller.half,
+          );
+          mat.userData.uClipBox = clipBox;
+          mat.onBeforeCompile = (shader) => {
+            shader.uniforms.uClipBox = { value: clipBox };
+            shader.vertexShader = shader.vertexShader.replace(
+              '#include <common>',
+              '#include <common>\nvarying vec3 vWorldPos_clip;',
+            ).replace(
+              '#include <worldpos_vertex>',
+              '#include <worldpos_vertex>\nvWorldPos_clip = worldPosition.xyz;',
+            );
+            shader.fragmentShader = shader.fragmentShader.replace(
+              '#include <common>',
+              '#include <common>\nuniform vec4 uClipBox;\nvarying vec3 vWorldPos_clip;',
+            ).replace(
+              'void main() {',
+              'void main() {\n  if (vWorldPos_clip.x > uClipBox.x && vWorldPos_clip.x < uClipBox.z && vWorldPos_clip.z > uClipBox.y && vWorldPos_clip.z < uClipBox.w) discard;',
+            );
+          };
+        }
         const mesh = new THREE.Mesh(m.geometry, mat);
         const offX = detail.center_sjtsk[0] - region.center_sjtsk[0];
         const offZ = -(detail.center_sjtsk[1] - region.center_sjtsk[1]);
@@ -948,6 +994,16 @@ function setupVideoCapture(sel) {
     // The deterministic recording path needs WebCodecs.
     if (typeof VideoEncoder === 'undefined') {
       alert('Tvůj prohlížeč nepodporuje WebCodecs (potřeba Chrome 94+/Safari 16.4+/Firefox 130+). Nahrávání není dostupné.');
+      resetUi();
+      return;
+    }
+
+    // Lazy-load the muxer module (esm.sh may refuse the request on our
+    // network; surface that as a friendly alert instead of stalling).
+    try {
+      await _loadMuxer();
+    } catch (err) {
+      alert(`mp4-muxer se nepodařilo načíst (${err.message || err}). Zkontroluj síť a zkus znovu.`);
       resetUi();
       return;
     }

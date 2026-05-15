@@ -253,6 +253,28 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
 
     cache_root = Path("cache")
 
+    def _with_retries(label, fn, attempts=3):
+        """Retry transient network failures with exponential backoff —
+        ČÚZK openzu/atom often returns Connection refused for a single
+        request while neighbouring ones succeed. 3 attempts × backoff
+        (1 s, 3 s) covers the typical glitch without holding the whole
+        pipeline hostage for hours."""
+        import time as _t
+        last = None
+        for attempt in range(1, attempts + 1):
+            try:
+                fn()
+                return True
+            except Exception as e:
+                last = e
+                if attempt < attempts:
+                    backoff = attempt * 2 - 1   # 1, 3
+                    short = str(e)[:120]
+                    log(f"  {label} attempt {attempt}/{attempts} failed: {short}; retry in {backoff}s")
+                    _t.sleep(backoff)
+        log(f"FAIL: {label} after {attempts} attempts: {last}")
+        return False
+
     # 1) DMPOK-TIFF (SM5 DSM with buildings) — needed by gen_detail.py
     for i, code in enumerate(codes, 1):
         tif_path = cache_root / f"dmpok_tiff_{code}" / f"{code}.tif"
@@ -260,12 +282,10 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
             log(f"[SM5 {i}/{len(codes)}] {code} — cached, skip")
             continue
         log(f"[SM5 {i}/{len(codes)}] {code} — downloading…")
-        try:
-            download_tiff.download_tiff(code)
-            log(f"[SM5 {i}/{len(codes)}] {code} — done")
-        except Exception as e:
-            log(f"FAIL: {code} DMPOK-TIFF download error: {e}")
+        if not _with_retries(f"{code} DMPOK-TIFF",
+                             lambda c=code: download_tiff.download_tiff(c)):
             return False
+        log(f"[SM5 {i}/{len(codes)}] {code} — done")
 
     # 2) Raw ortofoto JPEG — needed by server _proxy_ortofoto_raw at runtime
     for i, code in enumerate(codes, 1):
@@ -274,12 +294,10 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
             log(f"[ORTO {i}/{len(codes)}] {code} — cached, skip")
             continue
         log(f"[ORTO {i}/{len(codes)}] {code} — downloading…")
-        try:
-            download_ortofoto.download(code, cache_root)
-            log(f"[ORTO {i}/{len(codes)}] {code} — done")
-        except Exception as e:
-            log(f"FAIL: {code} ortofoto download error: {e}")
+        if not _with_retries(f"{code} ortofoto",
+                             lambda c=code: download_ortofoto.download(c, cache_root)):
             return False
+        log(f"[ORTO {i}/{len(codes)}] {code} — done")
 
     # Write sentinel
     sentinel = expected_glb(job["slug"], "sm5")

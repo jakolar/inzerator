@@ -211,6 +211,15 @@ def test_enqueue_two_jobs_fifo(clean_jobs):
     assert locations.JOB_QUEUE == [a, b]
 
 
+def test_enqueue_duplicate_slug_returns_none(clean_jobs):
+    """Second enqueue with same slug while first is still queued → None."""
+    first = locations.enqueue_job("dup-test", "first", 0.0, 0.0)
+    second = locations.enqueue_job("dup-test", "second", 0.0, 0.0)
+    assert first is not None
+    assert second is None
+    assert len(locations.JOB_QUEUE) == 1
+
+
 def test_get_job_returns_none_for_unknown(clean_jobs):
     assert locations.get_job("nonexistent-uuid") is None
 

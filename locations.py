@@ -181,11 +181,24 @@ def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
     }
 
 
-def enqueue_job(slug: str, label: str, cx: float, cy: float) -> str:
-    """Přidá nový job do JOBS + JOB_QUEUE. Vrátí job_id.
-    Neověřuje slug-collision — to volá vyšší vrstva (HTTP handler)."""
-    job = _new_job(slug, label, cx, cy)
+def enqueue_job(slug: str, label: str, cx: float, cy: float) -> str | None:
+    """Add new job. Returns job_id, or None if a non-terminal job with the
+    same slug is already queued or running (caller maps to 409).
+
+    Check for existing active job is atomic under JOB_CV, closing TOCTOU
+    race where two concurrent POSTs could both pass disk status check
+    and enqueue duplicate jobs."""
     with JOB_CV:
+        # Check for existing active job with this slug
+        for jid in JOB_QUEUE:
+            existing = JOBS.get(jid)
+            if existing and existing["slug"] == slug:
+                return None
+        if CURRENT_JOB is not None:
+            existing = JOBS.get(CURRENT_JOB)
+            if existing and existing["slug"] == slug:
+                return None
+        job = _new_job(slug, label, cx, cy)
         JOBS[job["job_id"]] = job
         JOB_QUEUE.append(job["job_id"])
         JOB_CV.notify()   # vzbudí worker

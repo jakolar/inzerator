@@ -2345,7 +2345,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self._send_json(500, {"error": str(e)})
+            self._send_json(500, {"error": "internal server error"})
 
     def _handle_post_jobs(self):
         body = self._read_json_body()
@@ -2375,6 +2375,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             return
         # 'partial' or 'missing' = OK; worker will resume-skip completed steps
         job_id = locations.enqueue_job(slug, label, cx, cy)
+        if job_id is None:
+            self._send_json(409, {"error": f"a job for slug '{slug}' is already queued or running"})
+            return
         self._send_json(200, {"job_id": job_id, "slug": slug})
 
     def _handle_post_jobs_retry(self, job_id):

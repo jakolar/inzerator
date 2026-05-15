@@ -59,6 +59,7 @@ Polling: jeden globální tick každé 2 s na `/api/jobs?active=1` vrátí všec
 | GET | `/api/jobs?active=1` | List `{job_id, slug, queue_position, steps[]}` všech queued+running |
 | GET | `/api/jobs/<id>` | Detail jednoho jobu |
 | POST | `/api/jobs/<id>/retry` | Zařadí znovu (resume-skip hotové kroky) |
+| POST | `/api/jobs/<id>/cancel` | Pokud je queued: odstraní z fronty. Pokud běží: pošle SIGTERM subprocesu, počká, mark `cancelled` |
 
 ### 3. Job runner (background thread v server.py)
 
@@ -79,8 +80,8 @@ Job dict:
   "slug": "hnojice", "label": "Hnojice 47",
   "cx": -547700.0, "cy": -1107700.0,
   "steps": [
-    {"name": "panorama", "state": "pending|running|ok|fail|skipped",
-     "error": None | "<last 200 chars stderr>",
+    {"name": "panorama", "state": "pending|running|ok|fail|skipped|cancelled",
+     "error": None | "<head 300 + tail 300 chars stderr>",
      "started_at": None | float, "finished_at": None | float},
     {"name": "outer", ...},
     {"name": "closeup", ...},
@@ -95,22 +96,40 @@ Worker loop (jeden thread, startuje v `__main__` před `serve_forever()`):
 ```
 while True:
   with JOB_CV: while not JOB_QUEUE: JOB_CV.wait()
-  job_id = JOB_QUEUE.pop(0); CURRENT_JOB = job_id
+  job_id = JOB_QUEUE.pop(0)
+  job = JOBS[job_id]
+  if job.cancelled: continue   # cancel-while-queued, nepouštět
+  CURRENT_JOB = job_id; CURRENT_PROC = None
   for step in job.steps:
+    if job.cancelled:
+      step.state = "cancelled"; break
     expected_glb = path_for(step.name, job.slug)
     if expected_glb.exists():
       step.state = "skipped"; continue
     step.state = "running"; step.started_at = now()
-    proc = subprocess.run(cmd_for(step, job), capture_output=True, text=True, timeout=30*60)
-    write cache/jobs/<job_id>/<step.name>.log with stdout+stderr
-    if proc.returncode == 0 and expected_glb.exists():
+    CURRENT_PROC = subprocess.Popen(cmd_for(step, job), stdout=PIPE, stderr=PIPE, text=True)
+    try:
+      out, err = CURRENT_PROC.communicate(timeout=60*60)   # 60 min per step (cold cache)
+    except subprocess.TimeoutExpired:
+      CURRENT_PROC.kill(); out, err = CURRENT_PROC.communicate()
+      step.state = "fail"; step.error = "timeout 60m"; break
+    write cache/jobs/<job_id>/<step.name>.log with out + err
+    if job.cancelled:
+      step.state = "cancelled"; break
+    if CURRENT_PROC.returncode == 0 and expected_glb.exists():
       step.state = "ok"
     else:
-      step.state = "fail"; step.error = proc.stderr[-200:]
+      step.state = "fail"
+      step.error = err[:300] + "\n...\n" + err[-300:] if len(err) > 600 else err
       break  # zastavit, partial zůstane na disku
     step.finished_at = now()
-  CURRENT_JOB = None
+  CURRENT_JOB = None; CURRENT_PROC = None
 ```
+
+`POST /api/jobs/<id>/cancel` (handler):
+- Najde job. Pokud `job_id in JOB_QUEUE`: odebere z fronty, mark `job.cancelled = True`. Vrátí 200.
+- Pokud `CURRENT_JOB == job_id`: mark `job.cancelled = True` + `CURRENT_PROC.terminate()`, počká 10 s, pak `kill()`. Vrátí 200.
+- Jinak (job už `ok`/`fail`): 409.
 
 Subprocess příkazy (fixní Hnojice defaulty):
 
@@ -119,36 +138,59 @@ Subprocess příkazy (fixní Hnojice defaulty):
 | panorama | `python3 gen_panorama.py --region <slug> --center-sjtsk=<cx>,<cy>` |
 | outer | `python3 gen_detail.py --region <slug> --slug outer   --center-sjtsk=<cx>,<cy> --half 2500 --step 2.5 --fade 100 --fade-to panorama --zoom 17 --size 4096` |
 | closeup | `python3 gen_detail.py --region <slug> --slug closeup --center-sjtsk=<cx>,<cy> --half 1500 --step 1.5 --fade  50 --fade-to outer    --zoom 21 --size 8192` |
-| inner | `python3 gen_detail.py --region <slug> --slug inner   --center-sjtsk=<cx>,<cy> --half  500 --step 1.0 --fade  30 --fade-to closeup  --zoom 21 --size 8192` |
+| inner | `python3 gen_detail.py --region <slug> --slug inner   --center-sjtsk=<cx>,<cy> --half  500 --step 0.5 --fade  30 --fade-to closeup  --zoom 21 --size 8192` |
+
+Inner `--step 0.5` (jemnější než stávající Hnojice manifest = 1.0) — odpovídá `gen_multitile.py` `village_flat` profilu (`step_m: 0.5` pro innermost ring). 4× vertex count proti 1.0 m, ale generation time + disk akceptovatelné, vizuální zisk reálný (terénní hrany pod 1 m). Hnojice manifest tím pádem nebude přesně reprodukovatelný novou pipeline — pokud chceš starou Hnojici regenerovat s novými parametry, smaž `tiles_v2_hnojice/` a spusť přes UI.
 
 `path_for("panorama", slug)` = `tiles_v2_<slug>/panorama.glb`, ostatní `tiles_v2_<slug>/details/<step>.glb`.
 
 ## RUIAN search
 
-Endpoint `/api/ruian/search?q=<text>` v backendu volá **ČÚZK Geokoder REST**. Přesná adresa služby není ve `server.py` zatím použitá — implementace si při bootstrapu ověří dostupnost dvou kandidátů (od ČÚZK to bývá `https://ags.cuzk.cz/arcgis/rest/services/Geokoder/GeocodeServer/findAddressCandidates` nebo `https://ags.cuzk.gov.cz/arcgis2/rest/services/Geokoder/GeocodeServer/findAddressCandidates`) — kterýkoli vrátí 200 na sanity dotaz, ten se zafixuje. Parametry:
+Endpoint `/api/ruian/search?q=<text>` v backendu volá **ČÚZK RUIAN MapServer, vrstva 1 (AdresniMisto)**. URL: `https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/1/query`. (Spike ověřen 2026-05-15 — `Geokoder/GeocodeServer` na ČÚZK serverech neexistuje, žádná dedikovaná address-search služba není dostupná.)
+
+Query parametry (`POST` form-encoded, ne GET — bezpečnější escapování):
 
 ```
-SingleLine=<q>&outSR=5514&maxLocations=10&f=json
+where=UPPER(adresa) LIKE UPPER('%<escaped_q>%')
+outFields=adresa,psc,cislodomovni,kod
+outSR=5514
+returnGeometry=true
+resultRecordCount=10
+f=json
 ```
 
-`outSR=5514` zajistí, že odpověď nese souřadnice v S-JTSK rovnou (žádná lokální konverze WGS↔S-JTSK).
+`UPPER(adresa) LIKE UPPER('%…%')` obchází case-sensitivity. Sanitize: escape `'` → `''` a `%` → `\%` v `q`.
 
-**Fallback API**, pokud Geokoder nevrátí 200 ani z jedné varianty: použít **`RUIAN/MapServer/3/query`** (stejný endpoint, který `server.py:1333` už používá pro budovy) s `where`-filtrem na `cisladomovni` + `nazevobce` jako sekundární cesta. Detail mapování `q → where` se vyřeší v plánu implementace (regex split „<obec> <č.p.>").
+**Diacritics warning:** RUIAN ukládá adresy s diakritikou. Dotaz „Strážek" funguje, „Strazek" vrátí 0 hits. UI při 0 hits zobrazí „Zkus i s diakritikou (např. Strážek místo Strazek)."
 
-Backend mapuje JSON odpověď na:
+Příklad odpovědi (jeden feature):
 
 ```json
 {
-  "label": "Hnojice 47, 783 99 Hnojice u Šternberka",
-  "sjtsk_cx": -547700.0,
-  "sjtsk_cy": -1107700.0,
+  "attributes": {
+    "adresa": "č.p. 136, 78501 Hnojice",
+    "psc": 78501,
+    "cislodomovni": 136,
+    "kod": 12345678
+  },
+  "geometry": {"x": -547980.76, "y": -1107944.18}
+}
+```
+
+Backend mapuje na:
+
+```json
+{
+  "label": "č.p. 136, 78501 Hnojice",
+  "sjtsk_cx": -547980.76,
+  "sjtsk_cy": -1107944.18,
   "obec": "Hnojice"
 }
 ```
 
-`obec` se extrahuje z `address.City` (nebo posledního segmentu před PSČ) — slouží pro auto-slug `slugify(obec).lower()`.
+`obec` se extrahuje jako poslední segment po čárce a po PSČ: `adresa.rsplit(',', 1)[-1].strip().split(' ', 1)[1]` → „Hnojice". Slug = `unicodedata.normalize('NFD', obec).encode('ascii', 'ignore').decode().lower()` → `hnojice` / `strazek` (stdlib, žádné nové dependencies).
 
-**Fallback při výpadku ČÚZK:** `/api/ruian/search` vrátí 503 s body `{error: "ČÚZK unavailable"}`. UI ukáže warning + collapsible „Ruční S-JTSK input" (cx,cy textové pole), který obejde search a pošle rovnou `/api/jobs`.
+**Fallback při výpadku ČÚZK:** `/api/ruian/search` vrátí 503 s body `{error: "ČÚZK unavailable"}`. UI ukáže warning + collapsible „Ruční S-JTSK input" (cx,cy textové pole), který obejde search a pošle rovnou `/api/jobs` s ručně zadaným slugem.
 
 ## Data flow (happy path)
 
@@ -197,9 +239,12 @@ YAGNI: persistence queue do souboru přes restart se nedělá.
 | Slug existuje a je `ready` (všechny 4 `.glb`) | `POST /api/jobs` → 409; UI nabídne přepsání slugu (auto append `-2`). Force-overwrite v UI není (`rm -rf` ručně) |
 | Slug existuje a je `partial` (chybí ≥1 `.glb`) | `POST /api/jobs` → 200 + `job_id`; worker resume-skipuje hotové kroky |
 | Slug invalid (regex `^[a-z0-9-]+$`) | `POST /api/jobs` → 400 |
-| gen_panorama.py / gen_detail.py exit ≠ 0 | step `fail`, error = last 200 chars stderr; loop break |
-| Subprocess timeout (>30 min per step) | step `fail`, error = "timeout 30m" |
+| gen_panorama.py / gen_detail.py exit ≠ 0 | step `fail`, error = prvních 300 chars stderr + posledních 300 chars stderr (Pythonský traceback má důležitou informaci na obou koncích) |
+| Subprocess timeout (>60 min per step) | step `fail`, error = "timeout 60m" (60 min počítá s cold ČÚZK cache — viz níže) |
+| User cancel | Worker pošle subprocess.terminate() (SIGTERM), počká 10 s, pak kill (SIGKILL). Step → `cancelled`, loop break. Partial `.glb` zůstanou na disku stejně jako u `fail`. |
 | Backend crash mid-job | Při startu `JOBS = {}`; uživatel ve dashboardu vidí `partial` + Retry |
+
+**Cold cache poznámka:** `gen_panorama.py` stahuje DMR5G výškové dlaždice z ČÚZK do `cache/dmpok_tiff_*`. Pro Hnojice už hotové, pro novou lokaci to znamená 5–30 minut sítového stahování navíc před vlastním renderem (závisí na velikosti regionu a ČÚZK propustnosti). Z toho plyne timeout 60 min per step (ne 30 jako MVP odhad) a UX-očekávání v UI: u prvního stepu (panorama) zobrazit „⏳ panorama running… (první lokace v regionu může trvat 10–30 min — stahuje výškové dlaždice z ČÚZK)".
 
 ## Logy
 
@@ -207,16 +252,26 @@ Per-step log soubor: `cache/jobs/<job_id>/<step_name>.log` (stdout+stderr subpro
 
 ## Testování
 
-Manual smoke test:
+**Automatizované pytest testy** (`tests/test_locations_api.py`, ~50 řádků) na threading-citlivá místa, kde manuální test nezachytí race conditions:
+
+1. **`test_enqueue_creates_job`** — POST /api/jobs vrátí job_id, který je v `JOBS` a v `JOB_QUEUE`
+2. **`test_two_enqueues_serialize`** — dva POST hned po sobě → druhý dostane queue_position=1, worker je zpracuje sériově (mock subprocess.run vracející okamžitě)
+3. **`test_retry_resumes_skip`** — předpřipravený `tiles_v2_test/panorama.glb` na disku → POST /api/jobs → step panorama je `skipped`, ne `running`
+4. **`test_slug_collision_ready_409`** — všechny 4 `.glb` existují → POST /api/jobs vrátí 409
+5. **`test_slug_collision_partial_200`** — chybí closeup.glb → POST /api/jobs vrátí 200 + job_id
+6. **`test_cancel_running`** — mock subprocess.Popen → POST /api/jobs/<id>/cancel → step `cancelled`, worker neblokovaný
+
+Mock pattern: `subprocess.run` patchneme tak, aby vrátil exit=0 + dotkl se očekávaného `.glb` souboru (touch). Testy běží sekvenčně se sdíleným tempdir.
+
+**Manual smoke test** (nezbytný — pytest mockuje subprocess):
 1. Spustit server, otevřít `/index.html`
 2. Verify dashboard ukáže existující Hnojice jako `ready`
-3. Klik [+ Nová lokace], hledat „Šantovka", vybrat, Generovat
+3. Klik [+ Nová lokace], hledat „Šantovka" (s diakritikou!), vybrat, Generovat
 4. Sledovat polling: panorama → outer → closeup → inner
 5. All ✓ → klik Otevřít viewer → ověřit, že `v2.html?region=santovka` načte
 6. **Failure test:** uprostřed generování `kill -9` python subprocesu → ověřit, že step → fail, lokace ukáže `partial` + Retry tlačítko
 7. **Retry test:** klik Retry → worker projde, hotové kroky skipne, failed step přespustí
-
-Automatizovaný test (volitelný — viz YAGNI sekce): pytest na endpoint contracts.
+8. **Cancel test:** spustit nový job, hned klik Cancel → ověřit, že subprocess je zabit a step `cancelled`
 
 ## Out of scope (YAGNI)
 
@@ -228,9 +283,8 @@ Automatizovaný test (volitelný — viz YAGNI sekce): pytest na endpoint contra
 - Auth (Tailscale-only network)
 - Notifikace (web push, e-mail) po dokončení
 - Persistence queue přes restart (in-memory acceptable)
-- Automatizované pytest testy pro endpoint contracts (manual smoke stačí)
 - Mobile-specific tweaky (vanilla flexbox + Tailscale + iPad funguje)
-- Cancel button pro běžící job (kill subprocesu) — uživatel ho prostě nechá doběhnout nebo restartuje server
+- UI tlačítko pro destruktivní rebuild lokace v `ready` stavu (ruční `rm -rf` stačí)
 
 ## Soubory, které se změní / přidají
 

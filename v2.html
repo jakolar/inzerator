@@ -399,6 +399,28 @@ async function loadV2() {
   // Manual-debug handle in the console.
   window._v2 = { region, details, allMeshes, scene, camera, controls, renderer };
 
+  // Re-target camera vertically to the inner mesh's centroid Y. region.ground_z
+  // is the panorama-wide reference elevation, which equals village elevation
+  // ONLY when the panorama bbox center matches the village (Hnojice case).
+  // For Kryry the panorama is ~30 km wide and its center is ~50 m below the
+  // village hilltop, so detail meshes end up at scene Y ≈ 50, not 0. Default
+  // controls.target=(0,0,0) then looks underground and click→ray-plane hits
+  // air well below the actual terrain. Computing centroid AFTER meshes load
+  // fixes both the initial view and the parcel pick reference plane.
+  const innerMesh = allMeshes.find(m => m.userData?.meta?.slug === 'inner')
+                 || allMeshes.find(m => m.userData?.meta?.slug === 'closeup');
+  if (innerMesh) {
+    innerMesh.geometry.computeBoundingBox();
+    const bb = innerMesh.geometry.boundingBox;
+    const targetY = (bb.min.y + bb.max.y) / 2;
+    if (Math.abs(targetY) > 5) {   // only shift when noticeably off
+      controls.target.y = targetY;
+      camera.position.y += targetY;
+      controls.update();
+      console.info(`[v2] retargeted camera to village centroid Y=${targetY.toFixed(1)} m (panorama ground_z mismatch)`);
+    }
+  }
+
   // ── Parcel selection + button-triggered orbit-and-record sales video ──
   const sel = setupParcelSelection(region);
   setupVideoCapture(sel);
@@ -615,8 +637,11 @@ function setupParcelSelection(region) {
     mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
-    // Pass 1 — pick at village-floor altitude (scene Y=0).
-    if (!intersectAtY(0)) return;
+    // Pass 1 — pick at village-floor altitude. Use controls.target.y as the
+    // best estimate (post-load re-target above sets it to the inner mesh
+    // centroid Y, which is the village's actual elevation in scene units).
+    // Falling back to 0 only if no re-target happened (Hnojice case).
+    if (!intersectAtY(controls.target.y || 0)) return;
     let p = pickParcelAt(pickPoint.x, pickPoint.z);
     if (p) {
       // Pass 2 — refine to the parcel's own mean ground Y, then re-test

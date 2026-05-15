@@ -9,11 +9,14 @@
   body { overflow: hidden; background: #87ceeb; font-family: system-ui, sans-serif; }
   canvas { display: block; }
   #status {
-    position: absolute; top: 10px; left: 10px; z-index: 10;
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 20;
     background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 8px;
-    font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    font-size: 13px; line-height: 1.6; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
     transition: opacity 0.4s ease;
     color: #1a73e8;
+    font-family: system-ui, sans-serif;
+    white-space: nowrap;
   }
 </style>
 </head>
@@ -32,48 +35,96 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { Sky } from 'three/addons/objects/Sky.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { SSAARenderPass } from 'three/addons/postprocessing/SSAARenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+// mp4-muxer: in-memory MP4 muxer fed by WebCodecs `VideoEncoder` output.
+// Used for the deterministic frame-by-frame recording path so a slow
+// GPU doesn't produce a stuttery video.
+import { Muxer, ArrayBufferTarget } from 'https://esm.sh/mp4-muxer@5';
 
 const params = new URLSearchParams(location.search);
 const REGION = params.get('region') || 'hnojice';
-const DETAIL_SLUG = params.get('detail') || 'main';
+// Per-load cache-bust suffix for tile GLBs. Server sends Cache-Control:
+// max-age=86400 on .glb responses (server.py _serve_glb_gzipped), so a
+// static ?v=... lets the browser hold stale bytes across regenerations.
+// Date.now() forces a fresh fetch each page load while still letting
+// disk-cache of compressed payload work server-side.
+const BUST = `v=${Date.now()}`;
+// Atmosphere = sky HDR + horizon fog + panorama outer mesh (15 km terrain
+// backdrop). Off by default — pure visual fluff for the cinematic
+// recording path; the detail rings (outer/closeup/inner) cover the
+// working area on their own. Re-enable with ?atmosphere=1.
+const ATMOSPHERE = params.get('atmosphere') === '1';
 
 const scene = new THREE.Scene();
+// Flat sky-color background — visible whenever ATMOSPHERE is off (no HDR
+// cubemap takes over) and at the start of every page load before the
+// async HDR fetch lands. Without this the canvas clears to black behind
+// the detail rings, leaving the horizon as an ominous void.
+scene.background = new THREE.Color(0x9bb0c8);
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
 // Camera at (0, 200, 200) looks toward -Z. Combined with mesh.scale.z=-1 on
 // terrain meshes below, scene-Z corresponds to world-Y INVERTED (matching the
 // v1 convention). Result: forward of screen = world north, right of screen =
 // world east. Standard map orientation.
 camera.position.set(0, 200, 200);
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// Standard depth buffer (no `logarithmicDepthBuffer`) — the per-pixel
+// log() drifted subtly each frame on camera rotation, looking like the
+// scene was re-loading.
+// preserveDrawingBuffer: true — the WebCodecs recording path reads the
+// canvas via `new VideoFrame(canvas, …)` AFTER `composer.render()`
+// completes; without preservation the browser may have already cleared
+// the back-buffer for compositing, producing all-black frames in the
+// captured video.
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
+// Disable per-frame object sorting — we rely entirely on explicit
+// `renderOrder` per mesh. Sorting can otherwise reshuffle the LOD draw
+// order when camera depth changes, producing the per-frame "needles
+// flickering" artefact at near-vertical mesh faces.
+renderer.sortObjects = false;
+// Linear tone-mapping: neutral colour response, no warm tint that ACES
+// adds in the mid-tones.
+renderer.toneMapping = THREE.LinearToneMapping;
+renderer.toneMappingExposure = 1.0;
+// Higher anisotropy → sharper ortho when looking at the ground at an
+// oblique angle (which is most of the time in a drone fly-by). Capped by
+// the GPU; 16 is the common max on desktop.
+const _maxAniso = renderer.capabilities.getMaxAnisotropy();
 document.body.appendChild(renderer.domElement);
 
-// Sky: physically-based atmospheric scattering (same pattern as
-// hnojice_lod_multi.html). 450 km radius so it always sits beyond terrain.
-const sky = new Sky();
-sky.scale.setScalar(450000);
-scene.add(sky);
-const skyU = sky.material.uniforms;
-skyU.turbidity.value = 8;
-skyU.rayleigh.value = 2;
-skyU.mieCoefficient.value = 0.005;
-skyU.mieDirectionalG.value = 0.8;
-const SUN_ELEVATION_DEG = 35;
-const SUN_AZIMUTH_DEG = 180;
+// Partly-cloudy midday HDRI from Polyhaven (kloofendal_48d_partly_cloudy
+// _puresky, CC0, ~5.5 MB). Sun ~48° elevation. Loaded async; until it lands
+// the scene shows the sRGB blue clear colour set on body.
+// Horizon haze — FogExp2 saturates as (density·distance)². 1.5e-5 gives
+// ~20% at 30 km — atmospheric perspective without crushing detail.
+if (ATMOSPHERE) {
+  new RGBELoader().load(`sky_cloudy.hdr?${BUST}`, (tex) => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    scene.background = tex;
+    scene.environment = tex;
+  }, undefined, (err) => console.warn('sky load failed:', err));
+  scene.fog = new THREE.FogExp2(0x9bb0c8, 0.000015);
+}
+
+// MeshBasicMaterial on terrain ignores lights, so these are kept low-cost
+// for future material upgrades but don't affect render today. Direction
+// is a rough guess for the HDR's sun location.
 const sunVec = new THREE.Vector3().setFromSphericalCoords(
   1,
-  THREE.MathUtils.degToRad(90 - SUN_ELEVATION_DEG),
-  THREE.MathUtils.degToRad(SUN_AZIMUTH_DEG),
+  THREE.MathUtils.degToRad(90 - 48),  // sun elevation matches "48d" in HDR name
+  THREE.MathUtils.degToRad(180),
 );
-skyU.sunPosition.value.copy(sunVec);
-
-// Horizon haze — terrain fades into sky at distance.
-scene.fog = new THREE.FogExp2(0xb0c4d8, 0.00008);
-
-scene.add(new THREE.AmbientLight(0xffffff, 0.8));
-const dir = new THREE.DirectionalLight(0xffffff, 0.5);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dir = new THREE.DirectionalLight(0xfff2dc, 0.9);
 dir.position.copy(sunVec).multiplyScalar(500);
 scene.add(dir);
 
@@ -82,106 +133,879 @@ controls.target.set(0, 0, 0);
 controls.maxDistance = 60000;
 controls.update();
 
+// EffectComposer with an HDR-preserving HalfFloat buffer. Without HalfFloat
+// the sky's high-intensity sun pixels would clamp to 1.0 before bloom sees
+// them, killing the glow effect.
+const composer = new EffectComposer(
+  renderer,
+  new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType }),
+);
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+// SSAA pass — disabled at idle (RenderPass does the work for free); during
+// video recording we swap it on with sampleLevel=1 (2 sub-pixel offsets
+// averaged per frame). Combined with the renderer's built-in MSAA (4×),
+// effective AA per pixel ≈ 8×. Heavier sampleLevel=2 (4× sub-samples)
+// caused 60 fps drops on the orbit + bloom + DoF stack and the captured
+// video read as choppy.
+const ssaaPass = new SSAARenderPass(scene, camera);
+ssaaPass.sampleLevel = 1;
+ssaaPass.unbiased = true;
+ssaaPass.enabled = false;
+composer.addPass(ssaaPass);
+// Bloom — soft glow around bright pixels (sun, white roofs, water). Tuned
+// for subtlety (strength 0.35 / threshold 0.85): the sun blooms, normal
+// terrain doesn't. Bumping strength makes it more dreamy / less realistic.
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  0.35,
+  0.5,
+  0.85,
+);
+composer.addPass(bloomPass);
+// DoF (BokehPass) — disabled for now (uncomment block to re-enable).
+// const bokehPass = new BokehPass(scene, camera, {
+//   focus: 200, aperture: 5e-6, maxblur: 0.002,
+// });
+// composer.addPass(bokehPass);
+// OutputPass does the final tone-map + linear→sRGB conversion. Must be last.
+composer.addPass(new OutputPass());
+
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
 });
 
 function tick() {
   requestAnimationFrame(tick);
   controls.update();
-  renderer.render(scene, camera);
+  // Auto-focus DoF on whatever the user is orbiting around — disabled
+  // along with the BokehPass above.
+  // bokehPass.uniforms.focus.value = camera.position.distanceTo(controls.target);
+  composer.render();
 }
 tick();
 
 // ─── Load manifest + panorama + detail meshes ────────────────────────────
 const status = document.getElementById('status');
-const allMeshes = [];   // populated as meshes load; Task 5 uses this for raycast.
+const allMeshes = [];
+// Draco compression — GLBs are ~98% smaller on disk and on the wire
+// (panorama 14MB → 0.3MB, outer 165MB → 4MB). Decoder WASM is loaded once
+// from jsDelivr (bundled three.js build matches gltf-pipeline / DracoPy 2.x;
+// gstatic's older path can lag the format Draco-encoded GLBs emit).
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
+dracoLoader.setDecoderConfig({ type: 'wasm' });
 const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+// KTX2 (Basis Universal) GPU-compressed textures — ~50% smaller than JPEG
+// on the wire, ~4× smaller in VRAM. Transcoder is loaded once from CDN.
+const ktx2Loader = new KTX2Loader()
+  .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/basis/')
+  .detectSupport(renderer);
 const texLoader = new THREE.TextureLoader();
 
 async function loadV2() {
   const manifest = await fetch(`tiles_v2_${REGION}/manifest.json`, { cache: 'no-store' })
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
   const region = manifest.region;
-  const detail = manifest.details.find(d => d.slug === DETAIL_SLUG);
-  if (!detail) throw new Error(`detail '${DETAIL_SLUG}' not in manifest`);
+  // Render LODs from largest half (outer) to smallest (closeup) with
+  // increasing renderOrder. polygonOffset pushes each level slightly forward
+  // in depth so coplanar regions at the inter-LOD fade band don't z-fight.
+  const details = (manifest.details || []).slice().sort((a, b) => b.half - a.half);
 
-  // --- Panorama: scene origin, renderOrder 0 ---
-  status.textContent = 'Loading panorama mesh…';
-  await new Promise((resolve, reject) => {
-    gltfLoader.load(`tiles_v2_${REGION}/${region.panorama_glb}?v=v2-1`, (gltf) => {
-      let m = gltf.scene.children[0];
-      if (m && !m.isMesh && m.children[0]) m = m.children[0];
-      const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-      const mesh = new THREE.Mesh(m.geometry, mat);
-      mesh.renderOrder = 0;
-      // Flip Z so scene +Z renders as world -Y (south). With default camera
-      // looking toward -Z, the user looks at world NORTH and east is on the
-      // right — standard map orientation.
-      mesh.scale.z = -1;
-      mesh.userData = { kind: 'panorama', meta: region };
-      scene.add(mesh);
-      allMeshes.push(mesh);
-      // Ortho texture covering the panorama's wgs_bbox at zoom 12.
-      const bb = region.sjtsk_bbox;
-      const wb = region.wgs_bbox;
-      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=13`;
-      texLoader.load(url, (tex) => {
-        tex.colorSpace = THREE.SRGBColorSpace;
-        mat.map = tex;
-        mat.needsUpdate = true;
-      }, undefined, (e) => console.warn('panorama tex failed:', e));
-      resolve();
-    }, undefined, reject);
+  // Loading tracker — every layer has a mesh + a texture step. The status
+  // overlay stays visible (with per-step state) until every texture has
+  // either resolved or failed. Failures stay surfaced so we don't silently
+  // ship with a missing ring.
+  const layers = (ATMOSPHERE ? [{ key: 'panorama', label: 'Panorama' }] : [])
+    .concat(details.map(d => ({ key: d.slug, label: d.slug.charAt(0).toUpperCase() + d.slug.slice(1) })));
+  const stateBy = {};
+  // mesh state machine: pending → downloading (%) → decoding → ok | fail
+  // tex state machine:  pending → downloading (%) → ok | fail
+  for (const L of layers) stateBy[L.key] = {
+    mesh: 'pending', mesh_pct: 0,
+    tex: 'pending', tex_pct: 0,
+  };
+
+  const STATE_ICON = {
+    pending: '⏳', downloading: '⇣', decoding: '⚙', ok: '✓', fail: '✗',
+  };
+  function fmtSlot(state, pct) {
+    if (state === 'downloading') return `⇣ ${Math.round(pct * 100)}%`;
+    return STATE_ICON[state] || state;
+  }
+  function renderStatus() {
+    const lines = layers.map(L => {
+      const s = stateBy[L.key];
+      return `${fmtSlot(s.mesh, s.mesh_pct)} ${L.label} mesh &nbsp;&nbsp; ${fmtSlot(s.tex, s.tex_pct)} ${L.label} tex`;
+    });
+    const isFinal = v => v === 'ok' || v === 'fail';
+    const allDone = layers.every(L => isFinal(stateBy[L.key].mesh) && isFinal(stateBy[L.key].tex));
+    const anyFail = layers.some(L => stateBy[L.key].mesh === 'fail' || stateBy[L.key].tex === 'fail');
+    status.innerHTML = lines.join('<br>');
+    status.style.color = anyFail ? '#c30' : '#1a73e8';
+    if (allDone && !anyFail) {
+      status.style.opacity = '0';
+      setTimeout(() => { status.style.display = 'none'; }, 500);
+    }
+  }
+  function setState(key, kind, value) {
+    stateBy[key][kind] = value;
+    renderStatus();
+  }
+  function setProgress(key, kind, loaded, total) {
+    // GLTFLoader's onProgress fires with loaded/total in compressed bytes
+    // (Content-Encoding: br means total = compressed size, not GLB size).
+    // Treat it as 0..1 progress; if total=0 we still show "downloading".
+    const pct = total > 0 ? Math.min(1, loaded / total) : 0;
+    stateBy[key][`${kind}_pct`] = pct;
+    if (stateBy[key][kind] !== 'downloading') {
+      stateBy[key][kind] = 'downloading';
+    }
+    renderStatus();
+  }
+  renderStatus();
+
+  // --- Panorama: scene origin, renderOrder 0 (only if ?atmosphere=1) ---
+  if (ATMOSPHERE) {
+    await new Promise((resolve, reject) => {
+      gltfLoader.load(`tiles_v2_${REGION}/${region.panorama_glb}?${BUST}`, (gltf) => {
+        let m = gltf.scene.children[0];
+        if (m && !m.isMesh && m.children[0]) m = m.children[0];
+        const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+        const mesh = new THREE.Mesh(m.geometry, mat);
+        mesh.renderOrder = 0;
+        // Flip Z so scene +Z renders as world -Y (south). With default camera
+        // looking toward -Z, the user looks at world NORTH and east is on the
+        // right — standard map orientation.
+        mesh.scale.z = -1;
+        // Disable frustum culling — Three.js's bounding-sphere computation
+        // can briefly mis-cull these huge meshes when the camera rotates
+        // fast, producing a "mesh pops back in" flash on the return frame.
+        mesh.frustumCulled = false;
+        mesh.userData = { kind: 'panorama', meta: region };
+        scene.add(mesh);
+        allMeshes.push(mesh);
+        setState('panorama', 'mesh', 'ok');
+        const bb = region.sjtsk_bbox;
+        const wb = region.wgs_bbox;
+        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=14&format=ktx2`;
+        ktx2Loader.load(url, (tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = _maxAniso;
+          mat.map = tex;
+          mat.needsUpdate = true;
+          setState('panorama', 'tex', 'ok');
+        }, (e) => {
+          if (e && e.lengthComputable) setProgress('panorama', 'tex', e.loaded, e.total);
+        }, (e) => {
+          console.warn('panorama tex failed:', e);
+          setState('panorama', 'tex', 'fail');
+        });
+        resolve();
+      }, (e) => {
+        if (e && e.lengthComputable) {
+          setProgress('panorama', 'mesh', e.loaded, e.total);
+          if (e.total > 0 && e.loaded >= e.total) setState('panorama', 'mesh', 'decoding');
+        }
+      }, (e) => { setState('panorama', 'mesh', 'fail'); reject(e); });
+    });
+  }
+
+  // --- Detail stack: outer → closeup → inner, increasing renderOrder ---
+  for (let i = 0; i < details.length; i++) {
+    const detail = details[i];
+    await new Promise((resolve, reject) => {
+      gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?${BUST}`, (gltf) => {
+        let m = gltf.scene.children[0];
+        if (m && !m.isMesh && m.children[0]) m = m.children[0];
+        const mat = new THREE.MeshBasicMaterial({
+          side: THREE.DoubleSide,
+          // Cross-LOD wins via `polygonOffset` per renderOrder step.
+          // CRUCIAL: factor=0. `polygonOffsetFactor` multiplies the
+          // triangle's depth slope, so on near-vertical surfaces (the
+          // skirt walls at LOD seams, building faces in SM5) the
+          // effective bias balloons by orders of magnitude — the skirt
+          // then renders IN FRONT of the buildings, leaking the LOD
+          // ring through the village from the opposite side.
+          // `units`-only bias is constant per triangle regardless of
+          // orientation; -32 units per LOD level is enough to bury
+          // T-junction sub-pixel cracks without distorting depth on
+          // vertical geometry.
+          polygonOffset: true,
+          polygonOffsetFactor: 0,
+          polygonOffsetUnits: -(i + 1) * 32,
+          // Hide the mesh while its texture is in flight.
+          transparent: true,
+          opacity: 0,
+        });
+        const mesh = new THREE.Mesh(m.geometry, mat);
+        const offX = detail.center_sjtsk[0] - region.center_sjtsk[0];
+        const offZ = -(detail.center_sjtsk[1] - region.center_sjtsk[1]);
+        mesh.position.set(offX, 0, offZ);
+        mesh.scale.z = -1;
+        mesh.renderOrder = 1 + i;
+        mesh.frustumCulled = false;   // never disappear on fast camera moves
+        mesh.userData = { kind: 'detail', meta: detail };
+        scene.add(mesh);
+        allMeshes.push(mesh);
+        setState(detail.slug, 'mesh', 'ok');
+        const bb = detail.sjtsk_bbox;
+        const wb = detail.wgs_bbox;
+        const zoom = detail.zoom || 19;
+        const size = detail.size || 4096;
+        // Per-detail texture format:
+        //   'inner'   → PNG (lossless; the village core under heaviest zoom
+        //               sees zero JPEG/Basis artefacts — large file but the
+        //               only texture loaded at this LOD)
+        //   'closeup' → KTX2 UASTC (near-original, GPU-native, mid-range)
+        //   others    → KTX2 ETC1S (small, slight loss invisible at distance)
+        let url, loader;
+        if (detail.slug === 'inner') {
+          url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=png`;
+          loader = texLoader;
+        } else {
+          const ktxMode = detail.slug === 'closeup' ? 'uastc' : 'etc1s';
+          url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}`;
+          loader = ktx2Loader;
+        }
+        loader.load(url, (tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = _maxAniso;
+          mat.map = tex;
+          mat.transparent = false;
+          mat.opacity = 1;
+          mat.needsUpdate = true;
+          setState(detail.slug, 'tex', 'ok');
+        }, (e) => {
+          if (e && e.lengthComputable) setProgress(detail.slug, 'tex', e.loaded, e.total);
+        }, (e) => {
+          console.warn(`detail '${detail.slug}' tex failed:`, e);
+          setState(detail.slug, 'tex', 'fail');
+        });
+        resolve();
+      }, (e) => {
+        if (e && e.lengthComputable) {
+          setProgress(detail.slug, 'mesh', e.loaded, e.total);
+          if (e.total > 0 && e.loaded >= e.total) setState(detail.slug, 'mesh', 'decoding');
+        }
+      }, (e) => { setState(detail.slug, 'mesh', 'fail'); reject(e); });
+    });
+  }
+
+  // Manual-debug handle in the console.
+  window._v2 = { region, details, allMeshes, scene, camera, controls, renderer };
+
+  // ── Parcel selection + button-triggered orbit-and-record sales video ──
+  const sel = setupParcelSelection(region);
+  setupVideoCapture(sel);
+}
+
+function setupParcelSelection(region) {
+  // Region center in SJTSK — for /api/parcels query and for local→scene conv.
+  const [gcx, gcy] = region.center_sjtsk;
+  // Mesh Y in scene is `absolute_elevation - region.ground_z`. The parcels
+  // API gives absolute elevation in ring_local[2]; convert to scene Y by
+  // subtracting ground_z (otherwise outlines float 200 m above ground).
+  const groundZ = region.ground_z || 0;
+  const parcelsByLabel = new Map();    // label → parcel record
+  const selected = new Set();          // labels of currently selected parcels
+  const outlineGroup = new THREE.Group();
+  outlineGroup.renderOrder = 99;
+  scene.add(outlineGroup);
+  let parcels = null;     // fetched on first toggle
+  let mode = false;
+
+  // ── Floating menu ──
+  const menu = document.createElement('div');
+  Object.assign(menu.style, {
+    position: 'absolute', top: '14px', left: '14px', zIndex: '10',
+    background: 'rgba(255,255,255,0.95)', padding: '10px 12px',
+    borderRadius: '8px', fontFamily: 'system-ui, sans-serif',
+    fontSize: '13px', boxShadow: '0 2px 10px rgba(0,0,0,0.2)',
+    display: 'flex', flexDirection: 'column', gap: '6px', minWidth: '200px',
+  });
+  menu.innerHTML = `
+    <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+      <input id="sel-mode" type="checkbox">
+      <span>Výběr parcel</span>
+    </label>
+    <button id="sel-clear" style="font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#f6f6f6;cursor:pointer;">
+      Smazat výběr (<span id="sel-count">0</span>)
+    </button>
+    <div id="sel-hint" style="font-size:11px;color:#666;">Zapni výběr a klikej na parcely.</div>
+  `;
+  document.body.appendChild(menu);
+  const modeChk = menu.querySelector('#sel-mode');
+  const clearBtn = menu.querySelector('#sel-clear');
+  const countEl = menu.querySelector('#sel-count');
+  const hintEl = menu.querySelector('#sel-hint');
+
+  modeChk.addEventListener('change', async () => {
+    mode = modeChk.checked;
+    if (mode && !parcels) {
+      hintEl.textContent = 'Načítám parcely…';
+      try {
+        const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=1500`);
+        parcels = await r.json();
+        for (const p of parcels) parcelsByLabel.set(p.label, p);
+        hintEl.textContent = `${parcels.length} parcel načteno. Klikej.`;
+      } catch (e) {
+        hintEl.textContent = `Chyba: ${e.message}`;
+        parcels = [];
+      }
+    } else if (mode) {
+      hintEl.textContent = `${parcels.length} parcel — klikej.`;
+    } else {
+      hintEl.textContent = 'Výběr vypnut.';
+    }
   });
 
-  // --- Detail: scene offset = world delta to region anchor, renderOrder 1 ---
-  status.textContent = 'Loading detail mesh…';
-  await new Promise((resolve, reject) => {
-    gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?v=v2-1`, (gltf) => {
-      let m = gltf.scene.children[0];
-      if (m && !m.isMesh && m.children[0]) m = m.children[0];
-      const mat = new THREE.MeshBasicMaterial({
-        side: THREE.DoubleSide,
-        polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1,
+  clearBtn.addEventListener('click', () => {
+    selected.clear();
+    redrawOutlines();
+  });
+
+  // ── Point-in-polygon (2D ring, scene XZ vs parcel ring) ──
+  function pointInRing(px, pz, ring) {
+    // ring entries from server are [scene_x, scene_z, scene_y].
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], zi = ring[i][1];
+      const xj = ring[j][0], zj = ring[j][1];
+      const intersect = ((zi > pz) !== (zj > pz)) &&
+        (px < (xj - xi) * (pz - zi) / (zj - zi + 1e-9) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function pickParcelAt(sceneX, sceneZ) {
+    if (!parcels) return null;
+    // Find the smallest parcel containing the point (handles nested/parent
+    // parcels — pick the most specific one).
+    let pick = null, pickArea = Infinity;
+    for (const p of parcels) {
+      if (!p.ring_local || p.ring_local.length < 3) continue;
+      if (pointInRing(sceneX, sceneZ, p.ring_local) && p.area_m2 < pickArea) {
+        pick = p; pickArea = p.area_m2;
+      }
+    }
+    return pick;
+  }
+
+  // Drape one edge (between two consecutive ring vertices) by linear
+  // interpolation in scene XZ + the ring-vertex Y values from the server.
+  // Earlier raycast-down approach intersected the full inner mesh (4M+
+  // tris) ~150× per parcel and froze the tab.
+  function drapeEdge(a, b) {
+    const SUB_M = 2.0;
+    const dx = b.x - a.x, dz = b.z - a.z, dy = b.y - a.y;
+    const segLen = Math.hypot(dx, dz);
+    const n = Math.max(1, Math.ceil(segLen / SUB_M));
+    const out = [];
+    for (let k = 0; k <= n; k++) {
+      const t = k / n;
+      out.push(new THREE.Vector3(a.x + dx * t, a.y + dy * t + 0.4, a.z + dz * t));
+    }
+    return out;
+  }
+
+  // Canonical key for an undirected ring edge — XZ-only, quantised to 1 cm
+  // so RÚIAN's shared edges between adjacent parcels match exactly. (Y is
+  // omitted because two parcels touching the same boundary can disagree
+  // by mm in sample_y's interpolation, but their XZ are identical.)
+  function edgeKey(a, b) {
+    const q = (v) => `${Math.round(v.x * 100)}:${Math.round(v.z * 100)}`;
+    const ka = q(a), kb = q(b);
+    return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+  }
+
+  function redrawOutlines() {
+    while (outlineGroup.children.length) {
+      const m = outlineGroup.children.pop();
+      m.geometry.dispose();
+      m.material.dispose();
+    }
+    // Pass 1: count occurrences of each (unordered) edge across all
+    // selected parcels. Edges shared by two adjacent parcels appear
+    // twice → drop them so the union perimeter draws cleanly.
+    const edgeCount = new Map();
+    const parcelRings = [];
+    for (const label of selected) {
+      const p = parcelsByLabel.get(label);
+      if (!p) continue;
+      const ring = p.ring_local.map(v => new THREE.Vector3(v[0], v[2] - groundZ, v[1]));
+      parcelRings.push(ring);
+      for (let i = 0; i < ring.length; i++) {
+        const k = edgeKey(ring[i], ring[(i + 1) % ring.length]);
+        edgeCount.set(k, (edgeCount.get(k) || 0) + 1);
+      }
+    }
+    // Pass 2: emit a tube only for edges that occur exactly once
+    // (= they're on the outer hull of the selection). Material is a
+    // thin HDR-white line — `toneMapped: false` lets the linear color
+    // value (3, 3, 3) reach the bloom pass unclamped, which turns the
+    // tube into a glowing neon perimeter through UnrealBloomPass's
+    // threshold (~0.85). Tube radius dropped from 0.3 m to 0.12 m so
+    // the bloom halo dominates over the geometry.
+    const tubeMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(3.0, 3.0, 3.0),
+      toneMapped: false,
+      transparent: false,
+      depthTest: false,
+    });
+    for (const ring of parcelRings) {
+      for (let i = 0; i < ring.length; i++) {
+        const a = ring[i];
+        const b = ring[(i + 1) % ring.length];
+        if (edgeCount.get(edgeKey(a, b)) !== 1) continue;
+        const pts = drapeEdge(a, b);
+        const path = new THREE.CurvePath();
+        for (let j = 0; j < pts.length - 1; j++) {
+          path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
+        }
+        const tubeGeo = new THREE.TubeGeometry(path, pts.length, 0.45, 6, false);
+        const tube = new THREE.Mesh(tubeGeo, tubeMat);
+        tube.renderOrder = 99;
+        outlineGroup.add(tube);
+      }
+    }
+    countEl.textContent = String(selected.size);
+  }
+
+  // ── Left-click in selection mode → toggle parcel ──
+  // Picking uses ray-plane intersection (O(1)) instead of raycasting through
+  // the 14M-tri LOD stack — earlier raycast froze the tab for tens of
+  // seconds. Two-pass refinement converges on the parcel's actual ground
+  // elevation in scene coords:
+  //   1) intersect a plane at the typical village ground Y (≈0 in scene
+  //      coords, since `region.ground_z` is set so the village floor
+  //      lands near scene Y=0)
+  //   2) look up which parcel contains the first hit's XZ; if found,
+  //      re-intersect at THAT parcel's actual mean ground Y so the
+  //      lateral offset from oblique camera angles is correct
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const pickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const pickPoint = new THREE.Vector3();
+  function intersectAtY(planeY) {
+    pickPlane.constant = -planeY;
+    return raycaster.ray.intersectPlane(pickPlane, pickPoint);
+  }
+  function meanSceneY(ring) {
+    // ring entry = [scene_x, scene_z, absolute_elevation]
+    let sum = 0;
+    for (const v of ring) sum += v[2] - groundZ;
+    return sum / ring.length;
+  }
+  renderer.domElement.addEventListener('click', (e) => {
+    if (!mode || !parcels) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    // Pass 1 — pick at village-floor altitude (scene Y=0).
+    if (!intersectAtY(0)) return;
+    let p = pickParcelAt(pickPoint.x, pickPoint.z);
+    if (p) {
+      // Pass 2 — refine to the parcel's own mean ground Y, then re-test
+      // (a tall building click might otherwise pick a neighbour parcel).
+      const refinedY = meanSceneY(p.ring_local);
+      if (intersectAtY(refinedY)) {
+        const p2 = pickParcelAt(pickPoint.x, pickPoint.z);
+        if (p2) p = p2;
+      }
+    }
+    if (!p) {
+      hintEl.textContent = 'Tam není parcela.';
+      return;
+    }
+    if (selected.has(p.label)) selected.delete(p.label);
+    else selected.add(p.label);
+    redrawOutlines();
+    hintEl.textContent = `Vybráno: ${selected.size} (poslední: ${p.label}, ${p.area_m2} m²)`;
+  });
+
+  // Provide union centroid for the video orbit subsystem. Returns a point
+  // in SCENE coordinates (Y already shifted by `-groundZ`), ready to feed
+  // into `camera.lookAt(...)` and orbit math.
+  function unionCentroid() {
+    if (!selected.size) return null;
+    // Area-weighted centroid of all selected parcels (mean of ring vertices,
+    // weighted by parcel area).
+    let sx = 0, sz = 0, sy = 0, w = 0;
+    for (const label of selected) {
+      const p = parcelsByLabel.get(label);
+      if (!p) continue;
+      let cx = 0, cz = 0, cy = 0;
+      // ring_local entry = [scene_x, scene_z, absolute_elevation]; convert
+      // the elevation to scene Y here so the centroid matches the on-screen
+      // outline (≈ ground level, not ~250 m up).
+      for (const v of p.ring_local) { cx += v[0]; cz += v[1]; cy += v[2] - groundZ; }
+      cx /= p.ring_local.length; cz /= p.ring_local.length; cy /= p.ring_local.length;
+      sx += cx * p.area_m2; sz += cz * p.area_m2; sy += cy * p.area_m2;
+      w += p.area_m2;
+    }
+    if (w === 0) return null;
+    return new THREE.Vector3(sx / w, sy / w, sz / w);
+  }
+
+  return { unionCentroid, getSelected: () => selected };
+}
+
+// 9 cinematic camera-path presets ported from viewer-realtor-overlay.js
+// (hnojice_multi.html). Each one returns a CatmullRomCurve3 pair (camera
+// position + lookAt target) parameterised over t∈[0,1].
+// `subject = { cx, cz, gy }` — XZ centroid and ground Y of the target
+// (selected parcels' union centroid in scene coords, or current
+// controls.target if no selection).
+const VIDEO_PRESETS = {
+  topdown:      { label: '📐 Top-down zoom',     duration: 15 },
+  highorbit360: { label: '🛰️ High orbit 360°',  duration: 30 },
+  halforbit:    { label: '🔄 Half-orbit',        duration: 15 },
+  revealpullup: { label: '📡 Reveal pull-up',    duration: 25 },
+  divepush:     { label: '🎯 Diagonal push-in',  duration: 20 },
+  locator:      { label: '🌍 Locator zoom',      duration: 20 },
+  contextarc:   { label: '🌀 Context arc',       duration: 25 },
+  lateralflyby: { label: '✈️ Lateral fly-by',    duration: 15 },
+  sunsetorbit:  { label: '🌅 Sunset orbit',      duration: 15 },
+};
+
+// Output formats — drives the recorded video's resolution and aspect.
+// During recording we set the renderer's drawing buffer + camera aspect
+// to these; preview canvas remains the same CSS size so the user sees a
+// stretched/squashed live preview but the captured stream is at the
+// target dimensions exactly.
+const VIDEO_FORMATS = {
+  'yt-1080':  { w: 1920, h: 1080, label: 'YouTube / web 1080p (16:9)' },
+  'yt-4k':    { w: 3840, h: 2160, label: 'YouTube 4K (16:9) — heavy' },
+  'fb-720':   { w: 1280, h: 720,  label: 'Facebook feed 720p (16:9)' },
+  'reels':    { w: 1080, h: 1920, label: 'IG/FB Reels / TikTok (9:16)' },
+  'square':   { w: 1080, h: 1080, label: 'Instagram square (1:1)' },
+  'portrait': { w: 1080, h: 1350, label: 'Instagram portrait (4:5)' },
+};
+
+function buildCameraPath(preset, subject) {
+  const { cx, cz, gy } = subject;
+  const tgtAt = (y = gy) => new THREE.Vector3(cx, y, cz);
+  const closed = (preset === 'highorbit360');
+  let posPts;
+
+  if (preset === 'topdown') {
+    posPts = [
+      new THREE.Vector3(cx, gy + 150, cz),
+      new THREE.Vector3(cx, gy + 115, cz),
+      new THREE.Vector3(cx, gy +  80, cz),
+    ];
+  } else if (preset === 'highorbit360') {
+    const R = 250, H = 200, N = 16;
+    posPts = [];
+    for (let i = 0; i < N; i++) {
+      const theta = (2 * Math.PI * i) / N;
+      posPts.push(new THREE.Vector3(cx + R * Math.cos(theta), gy + H, cz + R * Math.sin(theta)));
+    }
+  } else if (preset === 'halforbit' || preset === 'sunsetorbit') {
+    const R = 220, H = 180, N = 8;
+    const startAng = Math.PI;
+    const endAng = startAng - Math.PI / 2;
+    posPts = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const theta = startAng + (endAng - startAng) * t;
+      posPts.push(new THREE.Vector3(cx + R * Math.cos(theta), gy + H, cz + R * Math.sin(theta)));
+    }
+  } else if (preset === 'revealpullup') {
+    posPts = [
+      new THREE.Vector3(cx - 400, gy +  30, cz - 400),
+      new THREE.Vector3(cx - 250, gy +  90, cz - 250),
+      new THREE.Vector3(cx - 100, gy + 160, cz - 100),
+      new THREE.Vector3(cx,       gy + 220, cz),
+    ];
+  } else if (preset === 'divepush') {
+    posPts = [
+      new THREE.Vector3(cx - 250, gy + 300, cz - 250),
+      new THREE.Vector3(cx - 100, gy + 180, cz - 100),
+      new THREE.Vector3(cx +  80, gy + 100, cz +  20),
+      new THREE.Vector3(cx +  80, gy +  80, cz +  20),
+    ];
+  } else if (preset === 'locator') {
+    posPts = [
+      new THREE.Vector3(cx, gy + 500, cz),
+      new THREE.Vector3(cx, gy + 350, cz),
+      new THREE.Vector3(cx, gy + 220, cz),
+      new THREE.Vector3(cx, gy + 150, cz),
+    ];
+  } else if (preset === 'contextarc') {
+    const R = 220, H = 180, N = 8;
+    const startAng = Math.PI;
+    const endAng = startAng - Math.PI / 2;
+    // Floor radius at 15% of R so the final point isn't exactly above the
+    // target. With r=0 the camera lands straight overhead and `lookAt`
+    // produces a degenerate matrix (forward ∥ up → right-vector cross
+    // product collapses to zero, projection emits NaN, SSAA accumulates
+    // the NaN, MediaRecorder silently drops the corrupted frames and the
+    // file never finalises). r≥33 m keeps lookAt well-conditioned.
+    posPts = [];
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const theta = startAng + (endAng - startAng) * t;
+      const linearFalloff = t < 0.75 ? 1.0 : (1.0 - (t - 0.75) / 0.25);
+      const falloff = 0.15 + 0.85 * linearFalloff;
+      const r = R * falloff;
+      const h = H + (1 - linearFalloff) * 40;
+      posPts.push(new THREE.Vector3(cx + r * Math.cos(theta), gy + h, cz + r * Math.sin(theta)));
+    }
+  } else if (preset === 'lateralflyby') {
+    const ZOFF = 25;
+    posPts = [
+      new THREE.Vector3(cx - 70, gy + 50, cz + ZOFF),
+      new THREE.Vector3(cx - 25, gy + 50, cz + ZOFF),
+      new THREE.Vector3(cx + 25, gy + 50, cz + ZOFF),
+      new THREE.Vector3(cx + 70, gy + 50, cz + ZOFF),
+    ];
+  } else {
+    // Fallback — short vertical zoom.
+    posPts = [
+      new THREE.Vector3(cx, gy + 150, cz),
+      new THREE.Vector3(cx, gy +  80, cz),
+    ];
+  }
+
+  const tgtPts = posPts.map(() => tgtAt());
+  return {
+    posCurve: new THREE.CatmullRomCurve3(posPts, closed, 'catmullrom', 0.5),
+    targetCurve: new THREE.CatmullRomCurve3(tgtPts, closed),
+  };
+}
+
+// Bitrate presets — HEVC/VP9 achieve roughly H.264 quality at ~50% the
+// bitrate, so even "medium" looks clean at 1080p. Set on the
+// MediaRecorder per recording.
+const VIDEO_QUALITY = {
+  high:   { label: 'Vysoká (~95 MB / 25s)',     bps: 30_000_000 },
+  medium: { label: 'Standardní (~45 MB / 25s)', bps: 14_000_000 },
+  low:    { label: 'Web / Stories (~22 MB / 25s)', bps: 7_000_000 },
+};
+
+function setupVideoCapture(sel) {
+  // 30 fps is the cinematic standard for real-estate sales videos and
+  // doubles each frame's GPU budget (33 ms vs 16.67 ms at 60 fps) — leaves
+  // plenty of headroom for SSAA + bloom + DoF at 1080p+ so the output is
+  // smooth instead of judder-y.
+  const VIDEO_FPS = 30;
+  let recording = false;
+  let chosenPreset = 'highorbit360';
+  let chosenFormat = 'yt-1080';
+  let chosenQuality = 'medium';
+
+  // Lower-left preset selector + record button.
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position: 'absolute', bottom: '14px', left: '14px', zIndex: '10',
+    background: 'rgba(255,255,255,0.97)', padding: '10px 12px',
+    borderRadius: '8px', border: '1px solid #ccc',
+    fontFamily: 'system-ui, sans-serif', fontSize: '13px',
+    boxShadow: '0 2px 10px rgba(0,0,0,0.2)',
+    display: 'flex', flexDirection: 'column', gap: '6px', minWidth: '240px',
+  });
+  const presetOpts = Object.entries(VIDEO_PRESETS)
+    .map(([k, v]) => `<option value="${k}"${k === chosenPreset ? ' selected' : ''}>${v.label} (${v.duration}s)</option>`)
+    .join('');
+  const formatOpts = Object.entries(VIDEO_FORMATS)
+    .map(([k, v]) => `<option value="${k}"${k === chosenFormat ? ' selected' : ''}>${v.label}</option>`)
+    .join('');
+  const qualityOpts = Object.entries(VIDEO_QUALITY)
+    .map(([k, v]) => `<option value="${k}"${k === chosenQuality ? ' selected' : ''}>${v.label}</option>`)
+    .join('');
+  panel.innerHTML = `
+    <select id="vp-preset" style="font-size:13px;padding:4px;border:1px solid #ccc;border-radius:4px;">${presetOpts}</select>
+    <select id="vp-format" style="font-size:13px;padding:4px;border:1px solid #ccc;border-radius:4px;">${formatOpts}</select>
+    <select id="vp-quality" style="font-size:13px;padding:4px;border:1px solid #ccc;border-radius:4px;">${qualityOpts}</select>
+    <button id="vp-start" style="font-size:13px;padding:8px 12px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-weight:600;">🎬 Vytvořit video</button>
+  `;
+  document.body.appendChild(panel);
+  const presetSel = panel.querySelector('#vp-preset');
+  const formatSel = panel.querySelector('#vp-format');
+  const qualitySel = panel.querySelector('#vp-quality');
+  const recBtn = panel.querySelector('#vp-start');
+  presetSel.addEventListener('change', () => { chosenPreset = presetSel.value; });
+  formatSel.addEventListener('change', () => { chosenFormat = formatSel.value; });
+  qualitySel.addEventListener('change', () => { chosenQuality = qualitySel.value; });
+
+  // Recording badge.
+  const badge = document.createElement('div');
+  Object.assign(badge.style, {
+    position: 'absolute', top: '14px', right: '14px', zIndex: '10',
+    background: 'rgba(208,30,40,0.95)', color: '#fff', padding: '8px 14px',
+    borderRadius: '6px', fontFamily: 'system-ui, sans-serif', fontSize: '13px',
+    fontWeight: '600', display: 'none', boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
+  });
+  badge.textContent = '● REC';
+  document.body.appendChild(badge);
+
+  recBtn.addEventListener('click', () => {
+    if (recording) return;
+    // Subject = selected-parcels centroid (scene coords) or current orbit
+    // target. Both are in the same coordinate space.
+    const sc = (sel && sel.unionCentroid && sel.unionCentroid()) || controls.target.clone();
+    startRecording({ cx: sc.x, cz: sc.z, gy: sc.y }).catch(err => {
+      console.error('Recording failed:', err);
+      alert(`Nahrávání selhalo: ${err.message || err}`);
+    });
+  });
+
+  // H.264 codec string by resolution (profile/level must cover the
+  // bitrate × resolution × fps the encoder is asked to produce).
+  function avcCodecString(w, h) {
+    if (w <= 1280 && h <= 720) return 'avc1.42E01F';   // baseline 3.1
+    if (w <= 1920 && h <= 1080) return 'avc1.640028';  // high 4.0
+    return 'avc1.640033';                              // high 5.1 (4K)
+  }
+
+  async function startRecording(subject) {
+    recording = true;
+    badge.style.display = 'block';
+    controls.enabled = false;
+
+    // === Recording-time format setup (restored in resetUi) ===
+    // Drawing-buffer is sized to the user-picked output format (1080p,
+    // 4K, Reels 9:16, …). Camera aspect updated so framing matches the
+    // recorded file. SSAA swapped in for crisp edges — no real-time
+    // constraint here because we drive each frame deterministically.
+    const fmt = VIDEO_FORMATS[chosenFormat] || VIDEO_FORMATS['yt-1080'];
+    const origPR = renderer.getPixelRatio();
+    const origAspect = camera.aspect;
+    renderer.setPixelRatio(1);
+    renderer.setSize(fmt.w, fmt.h, false);
+    composer.setSize(fmt.w, fmt.h);
+    camera.aspect = fmt.w / fmt.h;
+    camera.updateProjectionMatrix();
+    renderPass.enabled = false;
+    ssaaPass.enabled = true;
+
+    const resetUi = () => {
+      badge.style.display = 'none';
+      controls.enabled = true;
+      recording = false;
+      renderer.setPixelRatio(origPR);
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      camera.aspect = origAspect;
+      camera.updateProjectionMatrix();
+      renderPass.enabled = true;
+      ssaaPass.enabled = false;
+    };
+
+    const preset = chosenPreset;
+    const durationS = (VIDEO_PRESETS[preset] || VIDEO_PRESETS.highorbit360).duration;
+    const fps = VIDEO_FPS;
+    const totalFrames = Math.round(durationS * fps);
+    const bps = (VIDEO_QUALITY[chosenQuality] || VIDEO_QUALITY.medium).bps;
+    const { posCurve, targetCurve } = buildCameraPath(preset, subject);
+
+    // The deterministic recording path needs WebCodecs.
+    if (typeof VideoEncoder === 'undefined') {
+      alert('Tvůj prohlížeč nepodporuje WebCodecs (potřeba Chrome 94+/Safari 16.4+/Firefox 130+). Nahrávání není dostupné.');
+      resetUi();
+      return;
+    }
+
+    // --- WebCodecs muxer + encoder setup ---
+    const muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      video: { codec: 'avc', width: fmt.w, height: fmt.h, frameRate: fps },
+      fastStart: 'in-memory',
+    });
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => console.error('VideoEncoder error:', e),
+    });
+    try {
+      encoder.configure({
+        codec: avcCodecString(fmt.w, fmt.h),
+        width: fmt.w,
+        height: fmt.h,
+        bitrate: bps,
+        framerate: fps,
       });
-      const mesh = new THREE.Mesh(m.geometry, mat);
-      // Detail position: scene +Z is rendered as world -Y by mesh.scale.z=-1
-      // below. So scene_z offset = -(detail_cy - region_cy) so the detail
-      // sits on the panorama at its world-correct location.
-      const offX = detail.center_sjtsk[0] - region.center_sjtsk[0];
-      const offZ = -(detail.center_sjtsk[1] - region.center_sjtsk[1]);
-      mesh.position.set(offX, 0, offZ);
-      mesh.scale.z = -1;
-      mesh.renderOrder = 1;
-      mesh.userData = { kind: 'detail', meta: detail };
-      scene.add(mesh);
-      allMeshes.push(mesh);
-      const bb = detail.sjtsk_bbox;
-      const wb = detail.wgs_bbox;
-      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=19`;
-      texLoader.load(url, (tex) => {
-        tex.colorSpace = THREE.SRGBColorSpace;
-        mat.map = tex;
-        mat.needsUpdate = true;
-      }, undefined, (e) => console.warn('detail tex failed:', e));
-      resolve();
-    }, undefined, reject);
-  });
+    } catch (err) {
+      console.error('VideoEncoder.configure failed:', err);
+      alert(`Konfigurace encoderu selhala: ${err.message || err}`);
+      resetUi();
+      return;
+    }
+    console.info(`[rec] WebCodecs ${fmt.w}x${fmt.h} @${fps}fps  bitrate=${(bps/1e6).toFixed(1)} Mbps  ${totalFrames} frames`);
 
-  status.style.opacity = '0';
-  setTimeout(() => { status.style.display = 'none'; }, 500);
-  // Expose for Task 5 + manual debugging.
-  window._v2 = { region, detail, allMeshes, scene, camera, controls, renderer };
+    // --- Frame loop: render at deterministic t, encode, repeat ---
+    const tmpPos = new THREE.Vector3();
+    const tmpTgt = new THREE.Vector3();
+    const KEYFRAME_INTERVAL = fps * 2;   // I-frame every 2 s — good seek + reasonable size
+    const startWall = performance.now();
+
+    for (let i = 0; i < totalFrames; i++) {
+      // t in [0, 1) — same wall-clock-independent timeline as before.
+      const t = i / totalFrames;
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      posCurve.getPoint(e, tmpPos);
+      targetCurve.getPoint(e, tmpTgt);
+      camera.position.copy(tmpPos);
+      camera.lookAt(tmpTgt);
+      controls.target.copy(tmpTgt);
+      composer.render();
+      // Hand the GPU one event-loop tick to finish + the next rAF to
+      // swap; without this the VideoFrame can sample a partially-rendered
+      // backbuffer and emit black/torn frames mid-orbit.
+      await new Promise(r => requestAnimationFrame(r));
+
+      const frame = new VideoFrame(renderer.domElement, {
+        timestamp: Math.round(i * 1_000_000 / fps),   // microseconds
+        duration: Math.round(1_000_000 / fps),
+      });
+      encoder.encode(frame, { keyFrame: i % KEYFRAME_INTERVAL === 0 });
+      frame.close();
+
+      // Backpressure: if encoder queue is huge, let it drain so the
+      // browser doesn't OOM on long recordings.
+      if (encoder.encodeQueueSize > 4) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      // Status line ticks every ~1 s of wall clock so the user knows
+      // it's working even if the GPU runs the render slower than real
+      // time.
+      if (i % fps === 0) {
+        badge.textContent = `● REC ${i}/${totalFrames}  (${(performance.now() - startWall) / 1000 | 0}s)`;
+      }
+    }
+
+    await encoder.flush();
+    encoder.close();
+    muxer.finalize();
+    const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${REGION}_${preset}_${fmt.w}x${fmt.h}_${Date.now()}.mp4`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    badge.textContent = '● REC';
+    resetUi();
+  }
 }
 
 loadV2().catch(e => {
-  console.error(e);
-  status.textContent = `ERROR: ${e.message}`;
+  console.error('loadV2 failed:', e);
+  let msg = 'unknown';
+  if (e instanceof Error) msg = e.message || e.toString();
+  else if (e && typeof e === 'object' && 'type' in e)
+    msg = `${e.type} on ${(e.target && e.target.src) || '?'}`;
+  else if (typeof e === 'string') msg = e;
+  else msg = String(e);
+  status.textContent = `ERROR: ${msg}`;
   status.style.color = 'red';
 });
 </script>

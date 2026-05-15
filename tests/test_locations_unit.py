@@ -263,3 +263,121 @@ def test_cancel_already_done_returns_false(clean_jobs):
     for s in locations.JOBS[job_id]["steps"]:
         s["state"] = "ok"
     assert locations.cancel_job(job_id) is False
+
+
+import os
+
+
+def test_cmd_for_panorama():
+    cmd = locations.cmd_for("panorama", "test", -547700.0, -1107700.0)
+    assert cmd[0] == "python3"
+    assert "gen_panorama.py" in cmd[1]
+    assert "--region" in cmd
+    assert "test" in cmd
+    # --center-sjtsk používá `=` syntax kvůli negativním číslům + argparse
+    assert any(arg.startswith("--center-sjtsk=") for arg in cmd)
+
+
+def test_cmd_for_inner_has_step_0_5():
+    """Inner detail = --step 0.5 (jemnější než stávající Hnojice manifest)."""
+    cmd = locations.cmd_for("inner", "test", -547700.0, -1107700.0)
+    cmd_str = " ".join(cmd)
+    assert "--slug inner" in cmd_str
+    assert "--step 0.5" in cmd_str
+    assert "--half 500" in cmd_str
+    assert "--fade-to closeup" in cmd_str
+
+
+def test_cmd_for_outer_closeup_steps():
+    outer = " ".join(locations.cmd_for("outer", "x", 0.0, 0.0))
+    closeup = " ".join(locations.cmd_for("closeup", "x", 0.0, 0.0))
+    assert "--half 2500" in outer and "--step 2.5" in outer and "--fade-to panorama" in outer
+    assert "--half 1500" in closeup and "--step 1.5" in closeup and "--fade-to outer" in closeup
+
+
+def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
+    """Mock subprocess.Popen, aby vytvořil expected .glb. Worker projde
+    všechny 4 stepy → state ok pro každý."""
+    monkeypatch.chdir(tmp_path)
+
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = 0
+        def communicate(self, timeout=None):
+            # Najdi --region a --slug v cmd, vytvoř expected .glb
+            args = self.cmd
+            region = args[args.index("--region") + 1]
+            slug_step = "panorama"
+            if "--slug" in args:
+                slug_step = args[args.index("--slug") + 1]
+            out_path = locations.expected_glb(region, slug_step)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.touch()
+            return "fake stdout", ""
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): pass
+
+    monkeypatch.setattr(locations.subprocess, "Popen", FakeProc)
+
+    job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
+    # Spustit worker jednou (single-iteration helper)
+    locations._run_one_job_for_test()
+    job = locations.JOBS[job_id]
+    assert all(s["state"] == "ok" for s in job["steps"]), \
+        f"states: {[(s['name'], s['state']) for s in job['steps']]}"
+
+
+def test_worker_skips_existing_glb(tmp_path, monkeypatch, clean_jobs):
+    """Pokud panorama.glb už existuje, step → skipped, ne running."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "tiles_v2_test").mkdir()
+    (tmp_path / "tiles_v2_test" / "panorama.glb").touch()
+
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = 0
+        def communicate(self, timeout=None):
+            args = self.cmd
+            region = args[args.index("--region") + 1]
+            slug_step = args[args.index("--slug") + 1] if "--slug" in args else "panorama"
+            out_path = locations.expected_glb(region, slug_step)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.touch()
+            return "", ""
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): pass
+
+    monkeypatch.setattr(locations.subprocess, "Popen", FakeProc)
+    job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
+    locations._run_one_job_for_test()
+    job = locations.JOBS[job_id]
+    assert job["steps"][0]["state"] == "skipped"
+    assert all(s["state"] == "ok" for s in job["steps"][1:])
+
+
+def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
+    """Pokud subprocess vrátí non-zero, step → fail, loop break,
+    zbývající stepy zůstanou pending."""
+    monkeypatch.chdir(tmp_path)
+
+    class FailingProc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = 1
+        def communicate(self, timeout=None):
+            return "", "Traceback (most recent call last):\n  File 'foo'\nValueError: bad"
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): pass
+
+    monkeypatch.setattr(locations.subprocess, "Popen", FailingProc)
+    job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
+    locations._run_one_job_for_test()
+    job = locations.JOBS[job_id]
+    assert job["steps"][0]["state"] == "fail"
+    assert "ValueError" in job["steps"][0]["error"]
+    assert all(s["state"] == "pending" for s in job["steps"][1:])

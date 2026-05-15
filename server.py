@@ -6,6 +6,7 @@ import os
 import threading
 import json
 from pathlib import Path
+import locations
 
 # Cap concurrent outgoing requests to ČÚZK across all server threads —
 # avoids Connection Refused when 9 HD tiles each spawn 6 workers (54 in flight).
@@ -552,6 +553,17 @@ def _fetch_parcels_area(gcx, gcy, radius):
                     round(-(sy - gcy), 2),
                     ty,
                 ])
+            # Fill DSM-miss vertices (sample_y returned 0) with the mean of
+            # the valid ring vertices. CZ absolute elevation is always ≥ 115
+            # m, so ty=0 is a coverage hole, not real ground. Without this
+            # fix the client subtracts groundZ (~250 m) and the outline
+            # tunnels deep underground at the village edge.
+            valid_ys = [v[2] for v in ring_local if v[2] > 0]
+            if valid_ys and len(valid_ys) < len(ring_local):
+                fill = round(sum(valid_ys) / len(valid_ys), 2)
+                for v in ring_local:
+                    if v[2] == 0:
+                        v[2] = fill
             kmen = attrs.get("kmenovecislo")
             podd = attrs.get("poddelenicisla")
             label = f"{kmen}/{podd}" if podd else (str(kmen) if kmen else "—")
@@ -602,6 +614,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         from PIL import Image
         from io import BytesIO
         from pathlib import Path
+        import hashlib
 
         wbbox_str = query.get("WBBOX", [""])[0]
         bbox_str = query.get("BBOX", [""])[0]
@@ -609,7 +622,42 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Missing BBOX or WBBOX")
             return
 
+        # On-disk cache for rendered ortho — short-circuits the multi-sheet
+        # composite + warp + resize cycle on repeat requests (outer 3km warp
+        # is 42s on cold cache, ~1s warm). Cache key covers every parameter
+        # that affects pixel output; raw SM5 files themselves don't change.
+        # Manual cleanup: `rm -rf cache/orto_render/` to invalidate.
+        out_format = query.get("format", ["jpeg"])[0].lower()
+        if out_format not in ("jpeg", "jpg", "png", "ktx2"):
+            out_format = "jpeg"
+        cache_key_src = "|".join(
+            f"{k}={query.get(k, [''])[0]}"
+            for k in ("BBOX", "WBBOX", "size", "upscale", "format", "look",
+                      "ktx2", "quality")
+        )
+        cache_key = hashlib.sha256(cache_key_src.encode()).hexdigest()[:16]
+        cache_dir = Path("cache/orto_render")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{cache_key}.{out_format}"
+        _mime_for = {
+            "png": "image/png", "ktx2": "image/ktx2",
+        }
+        if cache_path.exists():
+            data = cache_path.read_bytes()
+            mime = _mime_for.get(out_format, "image/jpeg")
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Ortofoto-Cache", "hit")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         # Determine the S-JTSK rectangle to crop from the source file.
+        # Prefer BBOX as the authoritative SJTSK bbox (sheet finding uses it).
+        # WBBOX is used only to define the WGS reproject output extent.
         west = south = east = north = None
         if wbbox_str:
             try:
@@ -617,6 +665,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             except ValueError:
                 self.send_error(400, "WBBOX must be west,south,east,north (WGS84)")
                 return
+        if bbox_str:
+            try:
+                sjtsk_xmin, sjtsk_ymin, sjtsk_xmax, sjtsk_ymax = (
+                    float(x) for x in bbox_str.split(","))
+            except ValueError:
+                self.send_error(400, "BBOX must be xmin,ymin,xmax,ymax in S-JTSK")
+                return
+        else:
+            # Fallback: derive SJTSK AABB from WBBOX corners (S-JTSK is rotated
+            # ~7.7° from WGS, so this AABB overshoots the actual extent — only
+            # used if caller didn't send a precise BBOX).
             from pyproj import Transformer
             to_sjtsk = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)
             wgs_corners = [
@@ -627,69 +686,78 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             sy_list = [c[1] for c in wgs_corners]
             sjtsk_xmin, sjtsk_xmax = min(sx_list), max(sx_list)
             sjtsk_ymin, sjtsk_ymax = min(sy_list), max(sy_list)
-        else:
-            try:
-                sjtsk_xmin, sjtsk_ymin, sjtsk_xmax, sjtsk_ymax = (
-                    float(x) for x in bbox_str.split(","))
-            except ValueError:
-                self.send_error(400, "BBOX must be xmin,ymin,xmax,ymax in S-JTSK")
-                return
-        cx = (sjtsk_xmin + sjtsk_xmax) / 2.0
-        cy = (sjtsk_ymin + sjtsk_ymax) / 2.0
 
         Image.MAX_IMAGE_PIXELS = None
-        raw_path = None
-        jgw_vals = None
-        for d in sorted(Path("cache").glob("ortofoto_*")):
-            for jpg in d.glob("*.jpg"):
-                jgw_path = jpg.with_suffix(".jgw")
-                if not jgw_path.exists():
-                    continue
-                try:
-                    with open(jgw_path) as f:
-                        vals = [float(line.strip()) for line in f if line.strip()]
-                    if len(vals) != 6:
-                        continue
-                    px_x, _, _, px_y, x0, y0 = vals
-                    with Image.open(jpg) as probe:
-                        w, h = probe.size
-                except Exception:
-                    continue
-                # JGW origin is the *centre* of the upper-left pixel; extents
-                # straddle ±0.5 px around that. Treat origin as upper-left
-                # corner for inclusive bbox check (good enough at 12.5 cm).
-                left, right = x0, x0 + w * px_x
-                top, bottom = y0, y0 + h * px_y     # px_y < 0
-                if min(left, right) <= cx <= max(left, right) \
-                        and min(top, bottom) <= cy <= max(top, bottom):
-                    raw_path = jpg
-                    jgw_vals = (px_x, px_y, x0, y0, w, h)
-                    break
-            if raw_path is not None:
-                break
-
-        if raw_path is None:
+        sheets = self._find_raw_ortofotos_covering(
+            sjtsk_xmin, sjtsk_ymin, sjtsk_xmax, sjtsk_ymax,
+        )
+        if not sheets:
             self.send_error(404,
-                "No raw ortofoto cached for this BBOX. "
+                "No raw ortofoto cached covering this BBOX. "
                 "Download via download_ortofoto.py --code <MAPNOM>.")
             return
 
-        px_x, px_y, x0, y0, w, h = jgw_vals
-        # World coords → pixel coords. px_y is negative (north-up).
-        def world_to_px(sx, sy):
-            return (sx - x0) / px_x, (sy - y0) / px_y
-        ax, ay = world_to_px(sjtsk_xmin, sjtsk_ymax)
-        bx, by = world_to_px(sjtsk_xmax, sjtsk_ymin)
-        pl = max(0, int(min(ax, bx)))
-        pr = min(w, int(max(ax, bx)) + 1)
-        pt = max(0, int(min(ay, by)))
-        pb = min(h, int(max(ay, by)) + 1)
-        if pr <= pl or pb <= pt:
-            self.send_error(400, "BBOX outside raw ortofoto extent")
+        # Composite all intersecting SM5 sheets onto an SJTSK-aligned canvas
+        # at the sheets' native pixel resolution (12.5 cm). All SM5 sheets
+        # share the same pixel scale so we use the first sheet's px size as
+        # the reference. crop_x0 / crop_y0 are the world coords of the
+        # composite's top-left corner.
+        ref_px_x, ref_px_y = sheets[0][1][0], sheets[0][1][1]
+        abs_px_x = abs(ref_px_x)
+        abs_px_y = abs(ref_px_y)
+        crop_x0 = sjtsk_xmin
+        crop_y0 = sjtsk_ymax           # top edge (px_y < 0 means rows scan down)
+        out_w = max(1, int(round((sjtsk_xmax - sjtsk_xmin) / abs_px_x)))
+        out_h = max(1, int(round((sjtsk_ymax - sjtsk_ymin) / abs_px_y)))
+        composite = Image.new("RGB", (out_w, out_h), (0, 0, 0))
+        used = []   # (filename, src_px_w, src_px_h) — for response header
+
+        for jpg, vals in sheets:
+            s_px_x, s_px_y, s_x0, s_y0, s_w, s_h = vals
+            s_left = s_x0
+            s_right = s_x0 + s_w * s_px_x
+            s_top = s_y0
+            s_bottom = s_y0 + s_h * s_px_y
+            s_lo_x, s_hi_x = min(s_left, s_right), max(s_left, s_right)
+            s_lo_y, s_hi_y = min(s_top, s_bottom), max(s_top, s_bottom)
+            # Overlap in SJTSK
+            ox_lo = max(s_lo_x, sjtsk_xmin)
+            ox_hi = min(s_hi_x, sjtsk_xmax)
+            oy_lo = max(s_lo_y, sjtsk_ymin)
+            oy_hi = min(s_hi_y, sjtsk_ymax)
+            if ox_hi <= ox_lo or oy_hi <= oy_lo:
+                continue
+            # Source pixel range inside this sheet
+            sa_x = (ox_lo - s_x0) / s_px_x
+            sb_x = (ox_hi - s_x0) / s_px_x
+            sa_y = (oy_hi - s_y0) / s_px_y    # top of overlap (max y, low row)
+            sb_y = (oy_lo - s_y0) / s_px_y    # bottom of overlap (min y, high row)
+            spl = max(0, int(round(min(sa_x, sb_x))))
+            spr = min(s_w, int(round(max(sa_x, sb_x))))
+            spt = max(0, int(round(min(sa_y, sb_y))))
+            spb = min(s_h, int(round(max(sa_y, sb_y))))
+            if spr <= spl or spb <= spt:
+                continue
+            with Image.open(jpg) as src_img:
+                src_crop = src_img.crop((spl, spt, spr, spb)).copy()
+            # Destination pixel position in composite (anchor top-left of crop)
+            dpl = int(round((ox_lo - crop_x0) / abs_px_x))
+            dpt = int(round((crop_y0 - oy_hi) / abs_px_y))
+            composite.paste(src_crop, (dpl, dpt))
+            used.append((jpg.name, src_crop.width, src_crop.height))
+
+        if not used:
+            self.send_error(400, "BBOX outside cached raw ortofoto coverage")
             return
 
-        with Image.open(raw_path) as src_img:
-            cropped = src_img.crop((pl, pt, pr, pb)).copy()
+        cropped = composite
+        # Drive the WBBOX reproject and the rest of the pipeline off the
+        # composite's reference. (Below code expects these names.)
+        px_x = ref_px_x
+        px_y = ref_px_y
+        pl, pt = 0, 0
+        pr, pb = composite.width, composite.height
+        raw_path = type("MultiSheet", (), {"name": "+".join(u[0] for u in used)})()
 
         # If WBBOX requested → reproject the SJTSK crop to a WGS84 axis-
         # aligned image whose extent matches WBBOX exactly. Required for
@@ -700,8 +768,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             import rasterio.transform
             import rasterio.warp
 
-            crop_x0 = x0 + pl * px_x
-            crop_y0 = y0 + pt * px_y           # px_y is negative; this is top edge
+            # crop_x0 / crop_y0 already set on the composite (top-left =
+            # sjtsk_xmin, sjtsk_ymax); just feed them into the warp transform.
             src_arr = np.array(cropped)        # H × W × 3
             if src_arr.ndim == 2:
                 src_arr = np.stack([src_arr]*3, axis=-1)
@@ -712,7 +780,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             )
             # Output size — square to match what the area viewer asks for.
             try:
-                size_param = max(64, min(int(query.get("size", ["768"])[0]), 4096))
+                size_param = max(64, min(int(query.get("size", ["768"])[0]), 8192))
             except ValueError:
                 size_param = 768
             out_w = out_h = size_param
@@ -732,7 +800,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         upscale = query.get("upscale", ["0"])[0] == "1"
         if size_str:
             try:
-                target = max(64, min(int(size_str), 4096))
+                target = max(64, min(int(size_str), 8192))
                 ratio = cropped.width / max(cropped.height, 1)
                 if ratio >= 1:
                     new_w, new_h = target, max(1, int(target / ratio))
@@ -746,16 +814,57 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 pass
 
         out_format = query.get("format", ["jpeg"])[0].lower()
-        if out_format not in ("jpeg", "jpg", "png"):
+        if out_format not in ("jpeg", "jpg", "png", "ktx2"):
             out_format = "jpeg"
         buf = BytesIO()
         if out_format == "png":
             cropped.save(buf, "PNG", optimize=True)
             mime = "image/png"
+            data = buf.getvalue()
+        elif out_format == "ktx2":
+            # basisu doesn't take stdin → write JPEG, run encoder, read KTX2.
+            # Mode/quality from query: ?ktx2=etc1s|uastc, ?quality=1..255 (ETC1S
+            # only; lower = better quality, default 128). UASTC mode ignores -q
+            # and produces ~5× larger files at near-original quality.
+            cropped.save(buf, "JPEG", quality=95, optimize=True, subsampling=0)
+            import subprocess, tempfile, uuid
+            ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
+            try:
+                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+            except ValueError:
+                q_val = 128
+            tmpdir = Path(tempfile.gettempdir())
+            stem = f"orto_{uuid.uuid4().hex}"
+            tmp_jpg = tmpdir / f"{stem}.jpg"
+            tmp_ktx2 = tmpdir / f"{stem}.ktx2"
+            cmd = ["basisu", "-ktx2", "-mipmap", "-y_flip"]
+            if ktx2_mode == "uastc":
+                cmd += ["-uastc", "-uastc_rdo_l", "2.0"]
+            else:
+                cmd += ["-q", str(q_val)]
+            cmd += [str(tmp_jpg), "-output_file", str(tmp_ktx2)]
+            try:
+                tmp_jpg.write_bytes(buf.getvalue())
+                subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+                data = tmp_ktx2.read_bytes()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.send_error(500, f"basisu KTX2 encode failed: {e}")
+                return
+            finally:
+                tmp_jpg.unlink(missing_ok=True)
+                tmp_ktx2.unlink(missing_ok=True)
+            mime = "image/ktx2"
         else:
             cropped.save(buf, "JPEG", quality=95, optimize=True, subsampling=0)
             mime = "image/jpeg"
-        data = buf.getvalue()
+            data = buf.getvalue()
+
+        # Persist to the on-disk render cache (write to a temp file first so a
+        # mid-write crash doesn't leave a half-baked cache entry that future
+        # requests would happily serve).
+        cache_tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        cache_tmp.write_bytes(data)
+        cache_tmp.replace(cache_path)
 
         self.send_response(200)
         self.send_header("Content-Type", mime)
@@ -765,17 +874,25 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("X-Ortofoto-Native-PxSize-cm",
                          f"{abs(px_x) * 100:.1f}")
         self.send_header("X-Ortofoto-Crop-Px", f"{pr - pl}x{pb - pt}")
+        self.send_header("X-Ortofoto-Cache", "miss")
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         self.wfile.write(data)
 
 
-    def _find_raw_ortofoto_for_bbox(self, xmin, ymin, xmax, ymax):
-        """Return the path of a cached raw SM5 ortofoto that fully contains
-        the given S-JTSK bbox, or None."""
+    def _find_raw_ortofotos_covering(self, xmin, ymin, xmax, ymax):
+        """Return a list of (jpg_path, jgw_vals) for cached raw SM5 orthos
+        that COLLECTIVELY cover the given S-JTSK bbox. Empty list if not
+        fully covered (so the caller falls through to the tile pipeline).
+
+        Coverage check: every corner of the requested bbox must lie inside
+        at least one candidate sheet (SM5 sheets tile cleanly with no gaps
+        so corner-coverage implies area-coverage for axis-aligned bboxes).
+        """
         from PIL import Image
         from pathlib import Path
         Image.MAX_IMAGE_PIXELS = None
+        candidates = []  # (jpg, vals, (lo_x, lo_y, hi_x, hi_y))
         for d in sorted(Path("cache").glob("ortofoto_*")):
             for jpg in d.glob("*.jpg"):
                 jgw_path = jpg.with_suffix(".jgw")
@@ -791,13 +908,25 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         w, h = probe.size
                 except Exception:
                     continue
+                vals_full = (px_x, px_y, x0, y0, w, h)
                 left, right = x0, x0 + w * px_x
                 top, bottom = y0, y0 + h * px_y
                 lo_x, hi_x = min(left, right), max(left, right)
                 lo_y, hi_y = min(top, bottom), max(top, bottom)
-                if lo_x <= xmin and xmax <= hi_x and lo_y <= ymin and ymax <= hi_y:
-                    return jpg
-        return None
+                # Skip sheets that don't intersect the bbox at all
+                if hi_x <= xmin or lo_x >= xmax or hi_y <= ymin or lo_y >= ymax:
+                    continue
+                candidates.append((jpg, vals_full, (lo_x, lo_y, hi_x, hi_y)))
+
+        if not candidates:
+            return []
+
+        corners = [(xmin, ymin), (xmax, ymin), (xmin, ymax), (xmax, ymax)]
+        for cx, cy in corners:
+            if not any(lo_x <= cx <= hi_x and lo_y <= cy <= hi_y
+                       for _, _, (lo_x, lo_y, hi_x, hi_y) in candidates):
+                return []
+        return [(c[0], c[1]) for c in candidates]
 
     def _proxy_ortofoto(self):
         """Compose ČÚZK ortofoto from tiles matching S-JTSK bbox."""
@@ -837,10 +966,13 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         ]
                         xs = [p[0] for p in c]; ys = [p[1] for p in c]
                         sj_check = [min(xs), min(ys), max(xs), max(ys)]
-            if sj_check and self._find_raw_ortofoto_for_bbox(*sj_check):
+            if sj_check and self._find_raw_ortofotos_covering(*sj_check):
+                print(f"[ortofoto] auto-route → raw for bbox {sj_check}")
                 return self._proxy_ortofoto_raw(query)
-        except (ValueError, Exception):
-            pass
+        except Exception as e:
+            import traceback
+            print(f"[ortofoto] auto-route FAILED, falling through: {e}")
+            traceback.print_exc()
 
         # Use exact WGS84 bbox if provided (matches UV computation exactly)
         wbbox_str = query.get("WBBOX", [""])[0]
@@ -1018,7 +1150,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
         cropped = composite.crop((max(0, px_left), max(0, px_top), min(composite.width, px_right), min(composite.height, px_bot)))
         size_param = int(query.get("size", ["512"])[0])
-        size_param = min(max(size_param, 256), 2048)
+        size_param = min(max(size_param, 256), 8192)
         cropped = cropped.resize((size_param, size_param), Image.LANCZOS)
 
         # Apply game look
@@ -1030,17 +1162,48 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         # JPEG re-compression on top of ČÚZK's source JPEG tiles). Default
         # remains JPEG for bandwidth.
         out_format = query.get("format", ["jpeg"])[0].lower()
-        if out_format not in ("jpeg", "jpg", "png"):
+        if out_format not in ("jpeg", "jpg", "png", "ktx2"):
             out_format = "jpeg"
         buf = BytesIO()
         if out_format == "png":
             cropped.save(buf, "PNG", optimize=True)
             mime = "image/png"
+            data = buf.getvalue()
+        elif out_format == "ktx2":
+            jpeg_quality = {256: 60, 512: 70, 640: 75, 768: 90, 1024: 92, 2048: 94}.get(size_param, 85)
+            cropped.save(buf, "JPEG", quality=jpeg_quality, optimize=True, subsampling=0)
+            import subprocess, tempfile, uuid
+            ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
+            try:
+                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+            except ValueError:
+                q_val = 128
+            tmpdir = Path(tempfile.gettempdir())
+            stem = f"orto_{uuid.uuid4().hex}"
+            tmp_jpg = tmpdir / f"{stem}.jpg"
+            tmp_ktx2 = tmpdir / f"{stem}.ktx2"
+            cmd = ["basisu", "-ktx2", "-mipmap", "-y_flip"]
+            if ktx2_mode == "uastc":
+                cmd += ["-uastc", "-uastc_rdo_l", "2.0"]
+            else:
+                cmd += ["-q", str(q_val)]
+            cmd += [str(tmp_jpg), "-output_file", str(tmp_ktx2)]
+            try:
+                tmp_jpg.write_bytes(buf.getvalue())
+                subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+                data = tmp_ktx2.read_bytes()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.send_error(500, f"basisu KTX2 encode failed: {e}")
+                return
+            finally:
+                tmp_jpg.unlink(missing_ok=True)
+                tmp_ktx2.unlink(missing_ok=True)
+            mime = "image/ktx2"
         else:
             jpeg_quality = {256: 60, 512: 70, 640: 75, 768: 90, 1024: 92, 2048: 94}.get(size_param, 85)
             cropped.save(buf, "JPEG", quality=jpeg_quality, optimize=True, subsampling=0)
             mime = "image/jpeg"
-        data = buf.getvalue()
+            data = buf.getvalue()
 
         self.send_response(200)
         self.send_header("Content-Type", mime)
@@ -1130,6 +1293,36 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         return img
 
     def do_GET(self):
+        # Parse path + query once for Lokace UI /api/* endpoints
+        _parsed = urllib.parse.urlparse(self.path)
+        _path = _parsed.path
+        _query = urllib.parse.parse_qs(_parsed.query)
+
+        # API endpoints (Lokace UI)
+        if _path == "/api/locations":
+            self._send_json(200, locations.list_locations())
+            return
+        if _path == "/api/ruian/search":
+            q = _query.get("q", [""])[0]
+            try:
+                results = locations.ruian_search(q)
+            except locations.RuianUnavailable as e:
+                self._send_json(503, {"error": f"ČÚZK unavailable: {e}"})
+                return
+            self._send_json(200, results)
+            return
+        if _path == "/api/jobs":
+            self._send_json(200, locations.list_active_jobs())
+            return
+        if _path.startswith("/api/jobs/"):
+            job_id = _path[len("/api/jobs/"):]
+            job = locations.get_job(job_id)
+            if job is None:
+                self._send_json(404, {"error": "job not found"})
+                return
+            self._send_json(200, job)
+            return
+
         if self.path.startswith("/proxy/ortofoto?"):
             self._proxy_ortofoto()
         elif self.path.startswith("/proxy/cadastre?"):
@@ -1971,19 +2164,58 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def _serve_glb_gzipped(self):
-        """Serve GLB files with gzip compression."""
+        """Serve GLB files with brotli (preferred) or gzip on the wire.
+        Brotli typically beats gzip by 15-20% for already-Draco GLBs. We
+        cache the compressed bytes on disk so we don't re-compress per req.
+        """
         import gzip as gz
-        file_path = os.path.join(DIRECTORY, self.path.lstrip("/"))
+        import posixpath
+        accept = self.headers.get("Accept-Encoding", "") or ""
+        prefer_br = "br" in accept
+        # Normalise the URL path and refuse anything that escapes DIRECTORY.
+        # Without this, `/../../etc/file.glb` would be joined naively and
+        # read+cache an arbitrary file outside the serving root.
+        raw = self.path.split("?", 1)[0]
+        norm = posixpath.normpath(raw).lstrip("/")
+        file_path = os.path.realpath(os.path.join(DIRECTORY, norm))
+        if not (file_path == DIRECTORY or file_path.startswith(DIRECTORY + os.sep)):
+            self.send_error(403)
+            return
         if not os.path.exists(file_path):
             self.send_error(404)
             return
-        with open(file_path, "rb") as f:
-            data = f.read()
-        compressed = gz.compress(data, compresslevel=6)
+
+        # Disk-cache the compressed payload keyed on file mtime + encoding.
+        st = os.stat(file_path)
+        enc = "br" if prefer_br else "gzip"
+        cache_path = f"{file_path}.{enc}.{int(st.st_mtime)}"
+        if os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                compressed = f.read()
+        else:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            if prefer_br:
+                try:
+                    import brotli
+                    compressed = brotli.compress(data, quality=6)
+                except Exception:
+                    enc = "gzip"
+                    compressed = gz.compress(data, compresslevel=6)
+            else:
+                compressed = gz.compress(data, compresslevel=6)
+            try:
+                tmp = cache_path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(compressed)
+                os.replace(tmp, cache_path)
+            except OSError:
+                pass  # best-effort caching
+
         self.send_response(200)
         self.send_header("Content-Type", "model/gltf-binary")
         self.send_header("Content-Length", str(len(compressed)))
-        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Encoding", enc)
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         self.wfile.write(compressed)
@@ -2072,10 +2304,116 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error(502, f"Cadastre WMS error: {e}")
 
+    # ------------------------------------------------------------------
+    # Helpers shared by GET and POST handlers
+    # ------------------------------------------------------------------
+
+    def _send_json(self, status: int, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        return json.loads(raw)
+
+    # ------------------------------------------------------------------
+    # POST /api/* (Lokace UI)
+    # ------------------------------------------------------------------
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/jobs":
+                self._handle_post_jobs()
+            elif path.startswith("/api/jobs/") and path.endswith("/retry"):
+                self._handle_post_jobs_retry(path[len("/api/jobs/"):-len("/retry")])
+            elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                self._handle_post_jobs_cancel(path[len("/api/jobs/"):-len("/cancel")])
+            else:
+                self.send_error(404, "POST endpoint not found")
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid JSON body"})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._send_json(500, {"error": str(e)})
+
+    def _handle_post_jobs(self):
+        body = self._read_json_body()
+        slug = body.get("slug", "").strip()
+        label = body.get("label", slug).strip() or slug
+        cx = body.get("cx")
+        cy = body.get("cy")
+        if not slug or cx is None or cy is None:
+            self._send_json(400, {"error": "required fields: slug, cx, cy"})
+            return
+        if not locations.is_valid_slug(slug):
+            self._send_json(400, {"error": "slug must match ^[a-z0-9-]+$"})
+            return
+        try:
+            cx = float(cx); cy = float(cy)
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "cx, cy must be numbers"})
+            return
+        status = locations.location_status(slug)
+        if status == "ready":
+            self._send_json(409, {
+                "error": "slug already exists and is ready",
+                "slug": slug,
+                "suggestion": locations.next_free_slug(slug,
+                    set(loc["slug"] for loc in locations.list_locations())),
+            })
+            return
+        # 'partial' or 'missing' = OK; worker will resume-skip completed steps
+        job_id = locations.enqueue_job(slug, label, cx, cy)
+        self._send_json(200, {"job_id": job_id, "slug": slug})
+
+    def _handle_post_jobs_retry(self, job_id):
+        ok = locations.retry_job(job_id)
+        self._send_json(200 if ok else 404,
+            {"job_id": job_id, "retried": ok} if ok else {"error": "job not found"})
+
+    def _handle_post_jobs_cancel(self, job_id):
+        ok = locations.cancel_job(job_id)
+        self._send_json(200 if ok else 404,
+            {"job_id": job_id, "cancelled": ok} if ok else {"error": "job not found or already done"})
+
+
+def _ensure_self_signed_cert(cert_path: Path, key_path: Path):
+    """Generate a self-signed cert (10y validity) so the dev server can
+    speak HTTPS. WebCodecs / OffscreenCanvas / clipboard / mediarecorder
+    over a LAN hostname all need a secure context; plain HTTP only
+    qualifies for localhost. Cert is per-machine, never committed."""
+    if cert_path.exists() and key_path.exists():
+        return
+    import subprocess
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Generating self-signed cert at {cert_path} (one-time, valid 10y)…")
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key_path), "-out", str(cert_path),
+        "-days", "3650", "-subj", "/CN=inzerator-dev",
+        "-addext", "subjectAltName=DNS:localhost,DNS:jans-mac-mini.local,DNS:jans-mac-mini,IP:127.0.0.1,IP:0.0.0.0",
+    ], check=True, capture_output=True)
+
 
 if __name__ == "__main__":
     # ThreadingHTTPServer so the 9 parallel tile requests from the client
     # don't queue behind each other (each HD composite does many ČÚZK fetches).
+    # Plain HTTP — for WebCodecs (which needs a secure-context origin) wrap
+    # the server with Tailscale Serve or a similar reverse proxy that
+    # terminates TLS upstream:
+    #     tailscale serve --bg --https=443 http://localhost:8080
+    locations.start_worker()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), ProxyHandler)
-    print(f"Server: http://0.0.0.0:{PORT}/ (threaded)")
+    print(f"Server: http://0.0.0.0:{PORT}/ (threaded, job worker started)")
     server.serve_forever()

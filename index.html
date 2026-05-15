@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inženýrátor — Lokace</title>
+  <style>
+    body { font-family: -apple-system, "Helvetica Neue", sans-serif;
+           background: #f5f5f7; color: #1d1d1f; max-width: 800px;
+           margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 22px; margin: 0 0 16px 0; }
+    .location-row { display: flex; align-items: center; gap: 12px;
+                    padding: 12px 14px; background: white;
+                    border-radius: 8px; margin-bottom: 8px;
+                    box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .location-row .label { flex: 1; font-weight: 500; }
+    .location-row .status { font-size: 13px; color: #666; }
+    .status-ready { color: #2a8a2a; }
+    .status-partial { color: #c08000; }
+    .status-generating { color: #1a73e8; }
+    .btn { padding: 6px 12px; border: 0; border-radius: 6px;
+           background: #1a73e8; color: white; cursor: pointer;
+           font-size: 13px; }
+    .btn-secondary { background: #e0e0e0; color: #333; }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+    .empty { padding: 24px; text-align: center; color: #999; }
+    .error { color: #c30; padding: 12px; background: #fff0f0;
+             border-radius: 6px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Lokace</h1>
+  <div id="locations"><div class="empty">Načítám…</div></div>
+  <div style="margin-top: 24px;">
+    <button class="btn" id="new-location-btn">+ Nová lokace</button>
+  </div>
+  <div id="form-container"></div>
+
+  <script>
+  // === Renders ===
+  async function renderLocations() {
+    const r = await fetch('/api/locations').then(r => r.json()).catch(e => null);
+    const el = document.getElementById('locations');
+    if (!r) {
+      el.innerHTML = '<div class="error">Backend nedostupný</div>';
+      return;
+    }
+    if (r.length === 0) {
+      el.innerHTML = '<div class="empty">Žádné lokace. Klikni „+ Nová lokace".</div>';
+      return;
+    }
+    el.innerHTML = r.map(loc => `
+      <div class="location-row" data-slug="${loc.slug}">
+        <span class="label">${escapeHtml(loc.label)}</span>
+        <span class="status status-${loc.status}">${statusLabel(loc)}</span>
+        ${loc.status === 'ready'
+          ? `<a class="btn" href="/v2.html?region=${loc.slug}">Otevřít</a>`
+          : ''}
+      </div>
+    `).join('');
+  }
+
+  function statusLabel(loc) {
+    if (loc.status === 'ready') return '✓ ready';
+    if (loc.status === 'partial') return '⚠ partial';
+    return loc.status;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // Initial load
+  renderLocations();
+  </script>
+</body>
+</html>

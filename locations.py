@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import unicodedata
 import urllib.parse
+import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -157,3 +159,50 @@ def ruian_search(q: str) -> list[dict]:
             "obec": parse_obec(adresa),
         })
     return out
+
+
+def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
+    return {
+        "job_id": str(uuid.uuid4()),
+        "slug": slug,
+        "label": label,
+        "cx": cx,
+        "cy": cy,
+        "cancelled": False,
+        "created_at": time.time(),
+        "steps": [
+            {"name": name, "state": "pending", "error": None,
+             "started_at": None, "finished_at": None}
+            for name in STEP_NAMES
+        ],
+    }
+
+
+def enqueue_job(slug: str, label: str, cx: float, cy: float) -> str:
+    """Přidá nový job do JOBS + JOB_QUEUE. Vrátí job_id.
+    Neověřuje slug-collision — to volá vyšší vrstva (HTTP handler)."""
+    job = _new_job(slug, label, cx, cy)
+    with JOB_CV:
+        JOBS[job["job_id"]] = job
+        JOB_QUEUE.append(job["job_id"])
+        JOB_CV.notify()   # vzbudí worker
+    return job["job_id"]
+
+
+def get_job(job_id: str) -> dict | None:
+    return JOBS.get(job_id)
+
+
+def list_active_jobs() -> list[dict]:
+    """Vrátí všechny joby, které jsou v queue nebo právě běží
+    (CURRENT_JOB). Každá položka má queue_position (0 = right now / next)."""
+    with JOB_LOCK:
+        out = []
+        # Currently running first (queue_position = -1 nebo 0 podle konvence)
+        if CURRENT_JOB and CURRENT_JOB in JOBS:
+            job = JOBS[CURRENT_JOB]
+            out.append({**job, "queue_position": -1})
+        for i, jid in enumerate(JOB_QUEUE):
+            if jid in JOBS:
+                out.append({**JOBS[jid], "queue_position": i})
+        return out

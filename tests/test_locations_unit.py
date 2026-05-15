@@ -176,3 +176,51 @@ def test_ruian_search_network_error_raises():
     with patch("locations.urlopen", side_effect=URLError("connection refused")):
         with pytest.raises(locations.RuianUnavailable):
             locations.ruian_search("Hnojice")
+
+
+@pytest.fixture
+def clean_jobs():
+    """Reset job state mezi testy."""
+    with locations.JOB_LOCK:
+        locations.JOBS.clear()
+        locations.JOB_QUEUE.clear()
+        locations.CURRENT_JOB = None
+    yield
+    with locations.JOB_LOCK:
+        locations.JOBS.clear()
+        locations.JOB_QUEUE.clear()
+        locations.CURRENT_JOB = None
+
+
+def test_enqueue_creates_job_with_4_steps(clean_jobs):
+    job_id = locations.enqueue_job("test1", "Test Village", -500000.0, -1100000.0)
+    assert job_id in locations.JOBS
+    job = locations.JOBS[job_id]
+    assert job["slug"] == "test1"
+    assert job["label"] == "Test Village"
+    assert job["cx"] == -500000.0
+    assert job["cy"] == -1100000.0
+    assert [s["name"] for s in job["steps"]] == list(locations.STEP_NAMES)
+    assert all(s["state"] == "pending" for s in job["steps"])
+    assert locations.JOB_QUEUE == [job_id]
+
+
+def test_enqueue_two_jobs_fifo(clean_jobs):
+    a = locations.enqueue_job("a", "A", -500000.0, -1100000.0)
+    b = locations.enqueue_job("b", "B", -500000.0, -1100000.0)
+    assert locations.JOB_QUEUE == [a, b]
+
+
+def test_get_job_returns_none_for_unknown(clean_jobs):
+    assert locations.get_job("nonexistent-uuid") is None
+
+
+def test_list_active_jobs_queued(clean_jobs):
+    a = locations.enqueue_job("a", "A", -500000.0, -1100000.0)
+    b = locations.enqueue_job("b", "B", -500000.0, -1100000.0)
+    active = locations.list_active_jobs()
+    assert len(active) == 2
+    assert active[0]["job_id"] == a
+    assert active[0]["queue_position"] == 0
+    assert active[1]["job_id"] == b
+    assert active[1]["queue_position"] == 1

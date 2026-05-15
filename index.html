@@ -71,8 +71,129 @@
       c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  let SELECTED_HIT = null;
+
+  function renderForm(show) {
+    const el = document.getElementById('form-container');
+    if (!show) { el.innerHTML = ''; return; }
+    el.innerHTML = `
+      <div style="background:white; padding:16px; border-radius:8px; margin-top:16px;
+                  box-shadow:0 1px 2px rgba(0,0,0,0.06);">
+        <h3 style="margin-top:0;">Nová lokace</h3>
+        <div>
+          <input id="addr-input" type="text" placeholder="Hnojice 47 (s diakritikou!)"
+                 style="width:60%; padding:6px;">
+          <button class="btn" id="search-btn">Hledat</button>
+        </div>
+        <div id="search-results" style="margin-top:12px;"></div>
+        <div id="selected-fields" style="margin-top:12px; display:none;">
+          <p><b>Vybráno:</b> <span id="selected-label"></span></p>
+          <label>Slug: <input id="slug-input" type="text"></label><br><br>
+          <label>Label: <input id="label-input" type="text" style="width:60%"></label><br><br>
+          <p style="font-size:12px; color:#666;">S-JTSK: <span id="sjtsk-display"></span></p>
+          <button class="btn" id="generate-btn">Generovat</button>
+          <button class="btn btn-secondary" id="cancel-form-btn">Zrušit</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('search-btn').onclick = doSearch;
+    document.getElementById('cancel-form-btn').onclick = () => renderForm(false);
+    document.getElementById('addr-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') doSearch();
+    });
+  }
+
+  async function doSearch() {
+    const q = document.getElementById('addr-input').value.trim();
+    const resultsEl = document.getElementById('search-results');
+    if (!q) {
+      resultsEl.innerHTML = '<div class="error">Zadej alespoň 2 znaky</div>';
+      return;
+    }
+    resultsEl.innerHTML = '<i>Hledám…</i>';
+    try {
+      const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}`);
+      if (r.status === 503) {
+        resultsEl.innerHTML = '<div class="error">ČÚZK nedostupné. Zkus později nebo zadej S-JTSK ručně.</div>';
+        return;
+      }
+      const data = await r.json();
+      if (data.length === 0) {
+        resultsEl.innerHTML = '<div class="error">Nic nenalezeno. Zkus i s diakritikou (Strážek, ne Strazek).</div>';
+        return;
+      }
+      resultsEl.innerHTML = data.map((hit, i) => `
+        <div style="padding:8px; cursor:pointer; border-bottom:1px solid #eee;"
+             data-i="${i}" class="hit-row">
+          ${escapeHtml(hit.label)}
+        </div>
+      `).join('');
+      // Klik na hit → prefill form
+      resultsEl.querySelectorAll('.hit-row').forEach((el, i) => {
+        el.onclick = () => selectHit(data[i]);
+      });
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="error">Chyba: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  async function selectHit(hit) {
+    SELECTED_HIT = hit;
+    // Auto-slug: slugify(obec), kolize-check přes /api/locations
+    const locs = await fetch('/api/locations').then(r => r.json());
+    const existing = new Set(locs.map(l => l.slug));
+    const base = slugifyJS(hit.obec);
+    let slug = base;
+    let n = 2;
+    while (existing.has(slug)) { slug = `${base}-${n}`; n++; }
+
+    document.getElementById('selected-label').textContent = hit.label;
+    document.getElementById('slug-input').value = slug;
+    document.getElementById('label-input').value = hit.label;
+    document.getElementById('sjtsk-display').textContent =
+      `${hit.sjtsk_cx.toFixed(2)}, ${hit.sjtsk_cy.toFixed(2)}`;
+    document.getElementById('selected-fields').style.display = 'block';
+    document.getElementById('generate-btn').onclick = doGenerate;
+  }
+
+  function slugifyJS(text) {
+    return text
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  async function doGenerate() {
+    if (!SELECTED_HIT) return;
+    const body = {
+      slug: document.getElementById('slug-input').value.trim(),
+      label: document.getElementById('label-input').value.trim(),
+      cx: SELECTED_HIT.sjtsk_cx,
+      cy: SELECTED_HIT.sjtsk_cy,
+    };
+    const r = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.status !== 200) {
+      alert(`Chyba ${r.status}: ${data.error || 'unknown'}` +
+            (data.suggestion ? `\nZkus slug: ${data.suggestion}` : ''));
+      return;
+    }
+    renderForm(false);
+    SELECTED_HIT = null;
+    await renderLocations();
+    // V Task 11: spustit polling
+  }
+
   // Initial load
   renderLocations();
+
+  // Wire up button at the end
+  document.getElementById('new-location-btn').onclick = () => renderForm(true);
   </script>
 </body>
 </html>

@@ -186,11 +186,98 @@
     renderForm(false);
     SELECTED_HIT = null;
     await renderLocations();
-    // V Task 11: spustit polling
+    startPolling();
+  }
+
+  // === Polling + Step Status ===
+  let POLL_TIMER = null;
+  let ACTIVE_JOBS = [];
+
+  async function pollOnce() {
+    try {
+      const r = await fetch('/api/jobs?active=1');
+      ACTIVE_JOBS = await r.json();
+    } catch (e) {
+      ACTIVE_JOBS = [];
+    }
+    renderActiveJobs();
+    if (ACTIVE_JOBS.length > 0) {
+      POLL_TIMER = setTimeout(pollOnce, 2000);
+    } else {
+      POLL_TIMER = null;
+      await renderLocations();
+    }
+  }
+
+  function startPolling() {
+    if (POLL_TIMER === null) pollOnce();
+  }
+
+  function renderActiveJobs() {
+    const container = document.getElementById('locations');
+    const existing = Array.from(container.querySelectorAll('.location-row'));
+    const existingBySlug = new Map(existing.map(el => [el.dataset.slug, el]));
+
+    for (const job of ACTIVE_JOBS) {
+      const row = renderJobRow(job);
+      const old = existingBySlug.get(job.slug);
+      if (old) old.replaceWith(row);
+      else container.appendChild(row);
+    }
+  }
+
+  function renderJobRow(job) {
+    const div = document.createElement('div');
+    div.className = 'location-row';
+    div.dataset.slug = job.slug;
+    div.dataset.jobId = job.job_id;
+    const stepIcons = job.steps.map(s => {
+      const icon = {
+        pending: '⏳', running: '⏳', ok: '✓', fail: '✗',
+        skipped: '↷', cancelled: '⊘',
+      }[s.state] || '?';
+      const color = (s.state === 'fail' || s.state === 'cancelled') ? '#c30'
+                  : (s.state === 'running') ? '#1a73e8' : '#666';
+      return `<span style="color:${color}">${icon} ${s.name}</span>`;
+    }).join(' · ');
+    const failedStep = job.steps.find(s => s.state === 'fail');
+    const isDone = job.steps.every(s =>
+      ['ok','fail','cancelled','skipped'].includes(s.state));
+    const hasFail = !!failedStep;
+
+    div.innerHTML = `
+      <span class="label">${escapeHtml(job.label || job.slug)}</span>
+      <span class="status status-generating" style="font-size:12px">${stepIcons}</span>
+      ${hasFail ? `<button class="btn" data-action="retry">Retry</button>` : ''}
+      ${!isDone ? `<button class="btn btn-secondary" data-action="cancel">Cancel</button>` : ''}
+    `;
+    if (failedStep) {
+      div.title = `${failedStep.name}: ${failedStep.error || 'unknown error'}`;
+    }
+    div.querySelector('[data-action="retry"]')?.addEventListener('click',
+      () => doRetry(job.job_id));
+    div.querySelector('[data-action="cancel"]')?.addEventListener('click',
+      () => doCancel(job.job_id));
+    return div;
+  }
+
+  async function doRetry(job_id) {
+    await fetch(`/api/jobs/${job_id}/retry`, {method: 'POST'});
+    startPolling();
+  }
+
+  async function doCancel(job_id) {
+    if (!confirm('Zrušit generování?')) return;
+    await fetch(`/api/jobs/${job_id}/cancel`, {method: 'POST'});
+    startPolling();
   }
 
   // Initial load
-  renderLocations();
+  (async () => {
+    await renderLocations();
+    const active = await fetch('/api/jobs?active=1').then(r => r.json()).catch(() => []);
+    if (active.length > 0) startPolling();
+  })();
 
   // Wire up button at the end
   document.getElementById('new-location-btn').onclick = () => renderForm(true);

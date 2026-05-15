@@ -57,8 +57,10 @@ inzerator/
 ## Running
 
 ```bash
-# Install Python deps (rasterio, shapely, pyproj, pillow, pygltflib, open3d)
-pip install rasterio shapely pyproj pillow pygltflib open3d numpy scipy
+# Install Python deps. `requests` is used by the Lokace UI auto-download
+# pipeline (DMPOK-TIFF + ortofoto); `DracoPy` is used by draco_compress_glb.
+# Pin versions in production — see global supply-chain note in CLAUDE.md.
+pip install rasterio shapely pyproj pillow pygltflib open3d numpy scipy requests DracoPy
 
 # Start the server (default port 8080, binds 0.0.0.0)
 python3 server.py

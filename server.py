@@ -1327,7 +1327,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._send_json(200, results)
             return
         if _path == "/api/jobs":
-            self._send_json(200, locations.list_active_jobs())
+            # ?active=1 (default) → running + queued only. Anything else
+            # → all known jobs, including terminated ones (in-memory only,
+            # not persisted, so this is "since worker process started").
+            active_only = _query.get("active", ["1"])[0] == "1"
+            if active_only:
+                self._send_json(200, locations.list_active_jobs())
+            else:
+                self._send_json(200, list(locations.JOBS.values()))
             return
         if _path.startswith("/api/jobs/"):
             job_id = _path[len("/api/jobs/"):]

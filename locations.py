@@ -409,12 +409,15 @@ def cancel_job(job_id: str) -> bool:
         if CURRENT_JOB == job_id and CURRENT_PROC is not None:
             try:
                 CURRENT_PROC.terminate()
-                # 10 s grace, pak kill
+                # 10 s grace, pak kill. Daemon thread so it doesn't keep
+                # the process alive past server shutdown.
                 _proc = CURRENT_PROC
-                threading.Timer(
+                _t = threading.Timer(
                     10.0,
                     lambda: _proc.kill() if _proc.poll() is None else None
-                ).start()
+                )
+                _t.daemon = True
+                _t.start()
             except (ProcessLookupError, AttributeError):
                 pass
         return True
@@ -473,7 +476,10 @@ def _run_step(job: dict, step: dict) -> bool:
     global CURRENT_PROC
     expected = expected_glb(job["slug"], step["name"])
     if expected.exists():
+        now = time.time()
         step["state"] = "skipped"
+        step["started_at"] = now
+        step["finished_at"] = now
         return True
 
     step["state"] = "running"
@@ -600,13 +606,24 @@ def _run_one_job_for_test() -> None:
 
 
 def worker_loop() -> None:
-    """Background thread: čeká na frontu, spotřebuje joby."""
+    """Background thread: čeká na frontu, spotřebuje joby.
+
+    Wrapped in try/except so an unhandled exception in a step (disk full
+    writing a log, PermissionError on an existing dir, future bugs in
+    _run_step …) doesn't kill the thread — that would leave the queue
+    silently un-serviced with no error visible to the UI. The job that
+    raised is lost (already popped from queue, not requeued) but future
+    work keeps running."""
+    import traceback as _tb
     while True:
-        with JOB_CV:
-            while not JOB_QUEUE:
-                JOB_CV.wait()
-            job_id = JOB_QUEUE.pop(0)
-        _run_one_job(job_id)
+        try:
+            with JOB_CV:
+                while not JOB_QUEUE:
+                    JOB_CV.wait()
+                job_id = JOB_QUEUE.pop(0)
+            _run_one_job(job_id)
+        except Exception:
+            _tb.print_exc()
 
 
 def start_worker() -> threading.Thread:

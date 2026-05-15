@@ -77,14 +77,18 @@ def expected_glb(slug: str, step: str) -> Path:
 
 def location_status(slug: str) -> str:
     """'missing' = adresář nebo panorama.glb chybí.
-    'partial' = panorama.glb existuje ale chybí alespoň jeden detail.
-    'ready'   = všechny 4 .glb existují."""
+    'partial' = panorama.glb existuje ale chybí alespoň jeden detail
+                NEBO .compress_ok sentinel chybí (detaily ještě nejsou
+                Draco-encoded, viewer by tahal 5× větší soubory).
+    'ready'   = všechny 4 .glb existují + .compress_ok sentinel."""
     pano = expected_glb(slug, "panorama")
     if not pano.exists():
         return "missing" if not pano.parent.exists() else "partial"
     for step in ("outer", "closeup", "inner"):
         if not expected_glb(slug, step).exists():
             return "partial"
+    if not expected_glb(slug, "compress").exists():
+        return "partial"
     return "ready"
 
 

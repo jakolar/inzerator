@@ -92,7 +92,19 @@ def test_location_status_ready(tmp_path, monkeypatch):
     (base / "panorama.glb").touch()
     for s in ("outer", "closeup", "inner"):
         (base / "details" / f"{s}.glb").touch()
+    (base / ".compress_ok").touch()
     assert locations.location_status("foo") == "ready"
+
+
+def test_location_status_partial_when_compress_missing(tmp_path, monkeypatch):
+    """All 4 glb present but no .compress_ok → still partial."""
+    monkeypatch.chdir(tmp_path)
+    base = tmp_path / "tiles_v2_foo"
+    (base / "details").mkdir(parents=True)
+    (base / "panorama.glb").touch()
+    for s in ("outer", "closeup", "inner"):
+        (base / "details" / f"{s}.glb").touch()
+    assert locations.location_status("foo") == "partial"
 
 
 def test_list_locations_scan(tmp_path, monkeypatch):
@@ -104,6 +116,7 @@ def test_list_locations_scan(tmp_path, monkeypatch):
     (tmp_path / "tiles_v2_alpha" / "details" / "outer.glb").touch()
     (tmp_path / "tiles_v2_alpha" / "details" / "closeup.glb").touch()
     (tmp_path / "tiles_v2_alpha" / "details" / "inner.glb").touch()
+    (tmp_path / "tiles_v2_alpha" / ".compress_ok").touch()
     # Manifest s label pro alpha
     import json as _json
     (tmp_path / "tiles_v2_alpha" / "manifest.json").write_text(

@@ -16,7 +16,7 @@ from urllib.error import URLError, HTTPError
 TILES_DIR_PREFIX = "tiles_v2_"
 JOB_LOG_DIR = Path("cache/jobs")
 STEP_TIMEOUT_SECS = 60 * 60   # 60 min: cold ČÚZK DMR5G cache can take 10–30 min
-STEP_NAMES = ("panorama", "outer", "closeup", "inner")
+STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: list[str] = []
@@ -62,9 +62,15 @@ def parse_obec(adresa: str) -> str:
 
 
 def expected_glb(slug: str, step: str) -> Path:
+    """For 'sm5' returns the .sm5_ok sentinel marker (no actual GLB).
+    Worker's resume-skip uses .exists() on this so the sentinel-vs-glb
+    distinction is transparent to the loop."""
+    base = Path(f"{TILES_DIR_PREFIX}{slug}")
     if step == "panorama":
-        return Path(f"{TILES_DIR_PREFIX}{slug}") / "panorama.glb"
-    return Path(f"{TILES_DIR_PREFIX}{slug}") / "details" / f"{step}.glb"
+        return base / "panorama.glb"
+    if step == "sm5":
+        return base / ".sm5_ok"
+    return base / "details" / f"{step}.glb"
 
 
 def location_status(slug: str) -> str:
@@ -115,6 +121,7 @@ def list_locations() -> list[dict]:
 
 
 RUIAN_ADRESNI_MISTO_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/1/query"
+SM5_KLADY_URL = "https://ags.cuzk.cz/arcgis/rest/services/KladyMapovychListu/MapServer/25/query"
 
 
 class RuianUnavailable(Exception):
@@ -174,6 +181,92 @@ def ruian_search(q: str) -> list[dict]:
             "obec": parse_obec(adresa),
         })
     return out
+
+
+def _resolve_sm5_codes(cx: float, cy: float, half: float = 2500) -> list[str]:
+    """Query ČÚZK KladyMapovychListu for SM5 sheet MAPNOM codes covering
+    the envelope (cx ± half, cy ± half) in S-JTSK. Returns list of codes
+    like ['JESE44', 'JESE45', ...]. Raises RuianUnavailable on network
+    failure (reuses the same exception — same ČÚZK ArcGIS infrastructure)."""
+    geometry = json.dumps({
+        "xmin": cx - half, "ymin": cy - half,
+        "xmax": cx + half, "ymax": cy + half,
+        "spatialReference": {"wkid": 5514},
+    })
+    params = {
+        "geometry": geometry,
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "5514",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "MAPNOM",
+        "outSR": "5514",
+        "f": "json",
+    }
+    url = SM5_KLADY_URL + "?" + urllib.parse.urlencode(params)
+    req = Request(url, headers={"User-Agent": "inzerator/1.0"})
+    try:
+        with urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+    except (URLError, HTTPError, TimeoutError, OSError) as e:
+        raise RuianUnavailable(f"sheet lookup failed: {e}") from e
+    codes = []
+    for feat in data.get("features", []):
+        code = feat.get("attributes", {}).get("MAPNOM")
+        if code:
+            codes.append(code)
+    return codes
+
+
+def _do_sm5_download(job: dict, log_path: Path) -> bool:
+    """In-process SM5 step: resolve sheet codes for outer-ring bbox
+    (half=2500), download missing ones via download_tiff.download_tiff,
+    touch sentinel. Returns True on success, False on any failure (writes
+    error to log_path)."""
+    log_lines = []
+
+    def log(msg):
+        log_lines.append(msg)
+        # Best-effort incremental write so user can tail the log
+        try:
+            log_path.write_text("\n".join(log_lines) + "\n")
+        except OSError:
+            pass
+
+    try:
+        log(f"Resolving SM5 sheets for envelope (cx={job['cx']}, cy={job['cy']}, half=2500)…")
+        codes = _resolve_sm5_codes(job["cx"], job["cy"], half=2500)
+        log(f"ČÚZK returned {len(codes)} sheet(s): {', '.join(codes)}")
+    except RuianUnavailable as e:
+        log(f"FAIL: {e}")
+        return False
+
+    if not codes:
+        log("FAIL: no SM5 sheets cover this envelope — location is outside ČR coverage?")
+        return False
+
+    # Import lazily so locations.py doesn't fail to import if `requests`
+    # is missing in a test environment (download_tiff requires it).
+    import download_tiff
+
+    for i, code in enumerate(codes, 1):
+        tif_path = Path(f"cache/dmpok_tiff_{code}") / f"{code}.tif"
+        if tif_path.exists():
+            log(f"[{i}/{len(codes)}] {code} — cached, skip")
+            continue
+        log(f"[{i}/{len(codes)}] {code} — downloading…")
+        try:
+            download_tiff.download_tiff(code)
+            log(f"[{i}/{len(codes)}] {code} — done")
+        except Exception as e:
+            log(f"FAIL: {code} download error: {e}")
+            return False
+
+    # Write sentinel
+    sentinel = expected_glb(job["slug"], "sm5")
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.touch()
+    log("OK: all SM5 sheets ready; sentinel written")
+    return True
 
 
 def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
@@ -304,7 +397,10 @@ _LOD_PRESET = {
 
 def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
     """Vyrobí subprocess command pro daný step. `--center-sjtsk=cx,cy`
-    musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag)."""
+    musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag).
+    Raises ValueError for 'sm5' — that step is in-process, not subprocess."""
+    if step == "sm5":
+        raise ValueError("sm5 is in-process, no subprocess command")
     base = ["python3"]
     center = f"--center-sjtsk={cx},{cy}"
     if step == "panorama":
@@ -333,10 +429,9 @@ def _format_error(stderr: str) -> str:
 
 
 def _run_step(job: dict, step: dict) -> bool:
-    """Spustí jeden step jako subprocess. Vrátí True pokud ok/skipped,
-    False pokud fail/cancelled (= worker má break).
-    Pokud step skončí ve stavu fail/cancelled, smaže částečný .glb soubor
-    aby retry neviděl corrupted file jako skipped."""
+    """Run one step. Returns True on success (state ok/skipped), False on
+    fail/cancelled (worker should break).
+    On fail/cancelled, drops partial output file so retry doesn't skip it."""
     global CURRENT_PROC
     expected = expected_glb(job["slug"], step["name"])
     if expected.exists():
@@ -345,10 +440,43 @@ def _run_step(job: dict, step: dict) -> bool:
 
     step["state"] = "running"
     step["started_at"] = time.time()
-    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"])
     log_dir = JOB_LOG_DIR / job["job_id"]
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{step['name']}.log"
+
+    # === In-process step: sm5 ===
+    if step["name"] == "sm5":
+        try:
+            ok = _do_sm5_download(job, log_path)
+        except Exception as e:
+            ok = False
+            step["error"] = f"sm5 internal error: {e}"
+            existing_text = log_path.read_text() if log_path.exists() else ""
+            log_path.write_text(existing_text + f"\nException: {e}")
+        step["finished_at"] = time.time()
+        if job["cancelled"]:
+            step["state"] = "cancelled"
+            if expected.exists():
+                try:
+                    expected.unlink()
+                except OSError:
+                    pass
+            return False
+        if ok:
+            step["state"] = "ok"
+            return True
+        step["state"] = "fail"
+        if not step.get("error"):
+            step["error"] = "sm5 download failed (see log)"
+        if expected.exists():
+            try:
+                expected.unlink()
+            except OSError:
+                pass
+        return False
+
+    # === Subprocess step: panorama, outer, closeup, inner ===
+    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"])
 
     try:
         try:
@@ -390,7 +518,7 @@ def _run_step(job: dict, step: dict) -> bool:
         step["error"] = _format_error(err or f"exit {CURRENT_PROC.returncode}, .glb missing")
         return False
     finally:
-        # Drop partial .glb so retry doesn't see corrupted/half-written file as skipped
+        # Drop partial output so retry doesn't see corrupted/half-written file as skipped
         if step["state"] in ("fail", "cancelled") and expected.exists():
             try:
                 expected.unlink()

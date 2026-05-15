@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 
 
 def test_module_imports():
-    assert locations.STEP_NAMES == ("panorama", "outer", "closeup", "inner")
+    assert locations.STEP_NAMES == ("panorama", "sm5", "outer", "closeup", "inner")
     assert locations.TILES_DIR_PREFIX == "tiles_v2_"
 
 
@@ -64,6 +64,7 @@ def test_parse_obec(adresa, obec):
 def test_expected_glb_paths():
     from pathlib import Path
     assert locations.expected_glb("hnojice", "panorama") == Path("tiles_v2_hnojice/panorama.glb")
+    assert locations.expected_glb("hnojice", "sm5") == Path("tiles_v2_hnojice/.sm5_ok")
     assert locations.expected_glb("hnojice", "outer") == Path("tiles_v2_hnojice/details/outer.glb")
     assert locations.expected_glb("hnojice", "closeup") == Path("tiles_v2_hnojice/details/closeup.glb")
     assert locations.expected_glb("hnojice", "inner") == Path("tiles_v2_hnojice/details/inner.glb")
@@ -178,6 +179,27 @@ def test_ruian_search_network_error_raises():
             locations.ruian_search("Hnojice")
 
 
+def test_resolve_sm5_codes_envelope_query():
+    """Mock ČÚZK envelope query → return 2 MAPNOM codes."""
+    payload = json.dumps({"features": [
+        {"attributes": {"MAPNOM": "JESE44"}},
+        {"attributes": {"MAPNOM": "JESE45"}},
+    ]}).encode()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=MagicMock(read=lambda: payload))
+    cm.__exit__ = MagicMock(return_value=False)
+    with patch("locations.urlopen", return_value=cm):
+        codes = locations._resolve_sm5_codes(-813194.0, -1029466.0, half=2500)
+    assert codes == ["JESE44", "JESE45"]
+
+
+def test_resolve_sm5_codes_network_error():
+    from urllib.error import URLError
+    with patch("locations.urlopen", side_effect=URLError("nope")):
+        with pytest.raises(locations.RuianUnavailable):
+            locations._resolve_sm5_codes(0.0, 0.0)
+
+
 @pytest.fixture
 def clean_jobs():
     """Reset job state mezi testy."""
@@ -192,7 +214,7 @@ def clean_jobs():
         locations.CURRENT_JOB = None
 
 
-def test_enqueue_creates_job_with_4_steps(clean_jobs):
+def test_enqueue_creates_job_with_5_steps(clean_jobs):
     job_id = locations.enqueue_job("test1", "Test Village", -500000.0, -1100000.0)
     assert job_id in locations.JOBS
     job = locations.JOBS[job_id]
@@ -242,15 +264,16 @@ def test_retry_resets_failed_steps(clean_jobs):
     locations.JOB_QUEUE.clear()
     job = locations.JOBS[job_id]
     job["steps"][0]["state"] = "ok"      # panorama
-    job["steps"][1]["state"] = "ok"      # outer
-    job["steps"][2]["state"] = "fail"    # closeup
-    job["steps"][2]["error"] = "test error"
-    job["steps"][3]["state"] = "pending" # inner stayed
+    job["steps"][1]["state"] = "ok"      # sm5 (NEW)
+    job["steps"][2]["state"] = "ok"      # outer
+    job["steps"][3]["state"] = "fail"    # closeup
+    job["steps"][3]["error"] = "test error"
+    job["steps"][4]["state"] = "pending" # inner stayed
     assert locations.retry_job(job_id) is True
     assert locations.JOB_QUEUE == [job_id]
     # Failed se reset; ok zůstane (worker je preskočí přes existenci .glb)
-    assert job["steps"][2]["state"] == "pending"
-    assert job["steps"][2]["error"] is None
+    assert job["steps"][3]["state"] == "pending"
+    assert job["steps"][3]["error"] is None
     assert job["steps"][0]["state"] == "ok"   # ok zůstane
 
 
@@ -306,8 +329,15 @@ def test_cmd_for_outer_closeup_steps():
 
 def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
     """Mock subprocess.Popen, aby vytvořil expected .glb. Worker projde
-    všechny 4 stepy → state ok pro každý."""
+    všech 5 stepů → state ok pro každý."""
     monkeypatch.chdir(tmp_path)
+
+    def fake_sm5(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "sm5")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
     class FakeProc:
         def __init__(self, cmd, **kw):
@@ -339,10 +369,18 @@ def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
 
 
 def test_worker_skips_existing_glb(tmp_path, monkeypatch, clean_jobs):
-    """Pokud panorama.glb už existuje, step → skipped, ne running."""
+    """Pokud panorama.glb + .sm5_ok už existují, oba stepy → skipped."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "tiles_v2_test").mkdir()
     (tmp_path / "tiles_v2_test" / "panorama.glb").touch()
+    (tmp_path / "tiles_v2_test" / ".sm5_ok").touch()
+
+    def fake_sm5(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "sm5")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
     class FakeProc:
         def __init__(self, cmd, **kw):
@@ -364,14 +402,22 @@ def test_worker_skips_existing_glb(tmp_path, monkeypatch, clean_jobs):
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
-    assert job["steps"][0]["state"] == "skipped"
-    assert all(s["state"] == "ok" for s in job["steps"][1:])
+    assert job["steps"][0]["state"] == "skipped"   # panorama
+    assert job["steps"][1]["state"] == "skipped"   # sm5
+    assert all(s["state"] == "ok" for s in job["steps"][2:])
 
 
 def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
     """Pokud subprocess vrátí non-zero, step → fail, loop break,
     zbývající stepy zůstanou pending."""
     monkeypatch.chdir(tmp_path)
+
+    def fake_sm5(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "sm5")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
     class FailingProc:
         def __init__(self, cmd, **kw):
@@ -387,6 +433,8 @@ def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
+    # panorama (step[0]) fails first — sm5 mock never invoked since panorama
+    # is the first step and FailingProc fires on it
     assert job["steps"][0]["state"] == "fail"
     assert "ValueError" in job["steps"][0]["error"]
     assert all(s["state"] == "pending" for s in job["steps"][1:])
@@ -396,6 +444,13 @@ def test_worker_unlinks_partial_glb_on_failure(tmp_path, monkeypatch, clean_jobs
     """Subprocess fails AFTER writing partial .glb → file must be deleted so
     retry doesn't see it as skipped."""
     monkeypatch.chdir(tmp_path)
+
+    def fake_sm5(job, log_path):
+        sentinel = locations.expected_glb(job["slug"], "sm5")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        return True
+    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
     class PartialThenFailProc:
         def __init__(self, cmd, **kw):

@@ -381,3 +381,33 @@ def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
     assert job["steps"][0]["state"] == "fail"
     assert "ValueError" in job["steps"][0]["error"]
     assert all(s["state"] == "pending" for s in job["steps"][1:])
+
+
+def test_worker_unlinks_partial_glb_on_failure(tmp_path, monkeypatch, clean_jobs):
+    """Subprocess fails AFTER writing partial .glb → file must be deleted so
+    retry doesn't see it as skipped."""
+    monkeypatch.chdir(tmp_path)
+
+    class PartialThenFailProc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = 1
+        def communicate(self, timeout=None):
+            args = self.cmd
+            region = args[args.index("--region") + 1]
+            slug_step = args[args.index("--slug") + 1] if "--slug" in args else "panorama"
+            out_path = locations.expected_glb(region, slug_step)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.touch()  # partial write before crash
+            return "", "ValueError: simulated crash"
+        def terminate(self): pass
+        def kill(self): pass
+        def wait(self, timeout=None): pass
+
+    monkeypatch.setattr(locations.subprocess, "Popen", PartialThenFailProc)
+    job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
+    locations._run_one_job_for_test()
+    job = locations.JOBS[job_id]
+    assert job["steps"][0]["state"] == "fail"
+    assert not locations.expected_glb("test", "panorama").exists(), \
+        "partial .glb must be deleted on failure so retry redoes the step"

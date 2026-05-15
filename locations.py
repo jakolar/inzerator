@@ -264,8 +264,6 @@ def cancel_job(job_id: str) -> bool:
         return True
 
 
-_CANCEL_REQUESTED = False
-
 # ---------------------------------------------------------------------------
 # LOD presets + subprocess command builder
 # ---------------------------------------------------------------------------
@@ -311,7 +309,9 @@ def _format_error(stderr: str) -> str:
 
 def _run_step(job: dict, step: dict) -> bool:
     """Spustí jeden step jako subprocess. Vrátí True pokud ok/skipped,
-    False pokud fail/cancelled (= worker má break)."""
+    False pokud fail/cancelled (= worker má break).
+    Pokud step skončí ve stavu fail/cancelled, smaže částečný .glb soubor
+    aby retry neviděl corrupted file jako skipped."""
     global CURRENT_PROC
     expected = expected_glb(job["slug"], step["name"])
     if expected.exists():
@@ -326,57 +326,64 @@ def _run_step(job: dict, step: dict) -> bool:
     log_path = log_dir / f"{step['name']}.log"
 
     try:
-        with JOB_LOCK:
-            # Protect CURRENT_PROC write so cancel_job (HTTP thread) sees it
-            # immediately after Popen — closes race between spawn and terminate.
-            CURRENT_PROC = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-    except OSError as e:
-        step["state"] = "fail"
-        step["error"] = f"spawn failed: {e}"
-        return False
+        try:
+            with JOB_LOCK:
+                # Protect CURRENT_PROC write so cancel_job (HTTP thread) sees it
+                # immediately after Popen — closes race between spawn and terminate.
+                CURRENT_PROC = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+        except OSError as e:
+            step["state"] = "fail"
+            step["error"] = f"spawn failed: {e}"
+            return False
 
-    try:
-        out, err = CURRENT_PROC.communicate(timeout=STEP_TIMEOUT_SECS)
-    except subprocess.TimeoutExpired:
-        CURRENT_PROC.kill()
-        out, err = CURRENT_PROC.communicate()
+        try:
+            out, err = CURRENT_PROC.communicate(timeout=STEP_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            CURRENT_PROC.kill()
+            out, err = CURRENT_PROC.communicate()
+            log_path.write_text((out or "") + "\n--- STDERR ---\n" + (err or ""))
+            step["state"] = "fail"
+            step["error"] = f"timeout {STEP_TIMEOUT_SECS // 60}m"
+            step["finished_at"] = time.time()
+            return False
+
         log_path.write_text((out or "") + "\n--- STDERR ---\n" + (err or ""))
-        step["state"] = "fail"
-        step["error"] = f"timeout {STEP_TIMEOUT_SECS // 60}m"
         step["finished_at"] = time.time()
-        return False
 
-    log_path.write_text((out or "") + "\n--- STDERR ---\n" + (err or ""))
-    step["finished_at"] = time.time()
-
-    if job["cancelled"]:
-        step["state"] = "cancelled"
+        if job["cancelled"]:
+            step["state"] = "cancelled"
+            return False
+        if CURRENT_PROC.returncode == 0 and expected.exists():
+            step["state"] = "ok"
+            return True
+        step["state"] = "fail"
+        step["error"] = _format_error(err or f"exit {CURRENT_PROC.returncode}, .glb missing")
         return False
-    if CURRENT_PROC.returncode == 0 and expected.exists():
-        step["state"] = "ok"
-        return True
-    step["state"] = "fail"
-    step["error"] = _format_error(err or f"exit {CURRENT_PROC.returncode}, .glb missing")
-    return False
+    finally:
+        # Drop partial .glb so retry doesn't see corrupted/half-written file as skipped
+        if step["state"] in ("fail", "cancelled") and expected.exists():
+            try:
+                expected.unlink()
+            except OSError:
+                pass
 
 
 def _run_one_job(job_id: str) -> None:
     """Zpracuje jeden job ze začátku do konce / do fail/cancel.
     Volá worker_loop i test helper."""
-    global CURRENT_JOB, CURRENT_PROC, _CANCEL_REQUESTED
+    global CURRENT_JOB, CURRENT_PROC
     job = JOBS.get(job_id)
     if job is None or job["cancelled"]:
         return
     with JOB_LOCK:
-        # Set CURRENT_JOB and reset cancel flag atomically under lock,
-        # so cancel_job cannot observe an inconsistent state between the two.
+        # Set CURRENT_JOB atomically under lock, so cancel_job cannot observe
+        # an inconsistent state.
         CURRENT_JOB = job_id
-        _CANCEL_REQUESTED = False
     CURRENT_PROC = None
     try:
         for step in job["steps"]:

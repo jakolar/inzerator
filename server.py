@@ -1326,6 +1326,18 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return
             self._send_json(200, results)
             return
+        if _path == "/api/sjtsk2wgs":
+            # Used by the index.html manual-S-JTSK fallback so the verify
+            # map can still place a marker without bundling proj4 client-side.
+            try:
+                cx = float(_query.get("cx", ["nan"])[0])
+                cy = float(_query.get("cy", ["nan"])[0])
+            except ValueError:
+                self._send_json(400, {"error": "cx, cy must be numbers"})
+                return
+            lat, lon = locations._sjtsk_to_wgs(cx, cy)
+            self._send_json(200, {"lat": lat, "lon": lon})
+            return
         if _path == "/api/jobs":
             # ?active=1 (default) → running + queued only. Anything else
             # → all known jobs, including terminated ones (in-memory only,

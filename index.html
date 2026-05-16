@@ -4,6 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inženýrátor — Lokace</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <style>
     body { font-family: -apple-system, "Helvetica Neue", sans-serif;
            background: #f5f5f7; color: #1d1d1f; max-width: 800px;
@@ -164,32 +168,82 @@
           </details>
         `;
         setTimeout(() => {
-          document.getElementById('manual-ok-btn')?.addEventListener('click', () => {
+          document.getElementById('manual-ok-btn')?.addEventListener('click', async () => {
             const cx = parseFloat(document.getElementById('manual-cx').value);
             const cy = parseFloat(document.getElementById('manual-cy').value);
             if (isNaN(cx) || isNaN(cy)) { alert('Zadej platná čísla'); return; }
-            selectHit({label: `Manual ${cx}, ${cy}`, sjtsk_cx: cx, sjtsk_cy: cy, obec: 'lokace'});
+            // Server-side SJTSK→WGS so the verify map has marker coords
+            // without bundling proj4 in the page.
+            const ll = await fetch(`/api/sjtsk2wgs?cx=${cx}&cy=${cy}`).then(r => r.json());
+            if (typeof ll.lat !== 'number') { alert('Konverze selhala'); return; }
+            selectHit({label: `Manual ${cx}, ${cy}`, sjtsk_cx: cx, sjtsk_cy: cy,
+                       wgs_lat: ll.lat, wgs_lon: ll.lon, obec: 'lokace'});
           });
         }, 0);
         return;
       }
-      resultsEl.innerHTML = data.map((hit, i) => `
-        <div style="padding:8px; cursor:pointer; border-bottom:1px solid #eee;"
-             data-i="${i}" class="hit-row">
-          ${escapeHtml(hit.label)}
-        </div>
-      `).join('');
-      // Klik na hit → prefill form
-      resultsEl.querySelectorAll('.hit-row').forEach((el, i) => {
-        el.onclick = () => selectHit(data[i]);
-      });
+      LAST_HITS = data;
+      renderHitList(data);
     } catch (e) {
       resultsEl.innerHTML = `<div class="error">Chyba: ${escapeHtml(e.message)}</div>`;
     }
   }
 
-  async function selectHit(hit) {
+  let LAST_HITS = [];
+  let VERIFY_MAP = null;   // active Leaflet instance (destroyed on Zpět)
+
+  function renderHitList(data) {
+    const resultsEl = document.getElementById('search-results');
+    resultsEl.innerHTML = data.map((hit, i) => `
+      <div style="padding:8px; cursor:pointer; border-bottom:1px solid #eee;"
+           data-i="${i}" class="hit-row">
+        ${escapeHtml(hit.label)}
+      </div>
+    `).join('');
+    resultsEl.querySelectorAll('.hit-row').forEach((el, i) => {
+      el.onclick = () => selectHit(data[i]);
+    });
+  }
+
+  // Verify mezikrok: než user potvrdí, ukáže se mini OSM mapa s markerem
+  // na zvolené lokaci. Adresy jako "Hnojice 47" se v ČR vyskytují na víc
+  // místech — vizuální ověření přes mapu uchrání před vygenerováním
+  // špatné vesnice (a 30 min ztraceného času na ČÚZK pipeline).
+  function selectHit(hit) {
     SELECTED_HIT = hit;
+    const resultsEl = document.getElementById('search-results');
+    resultsEl.innerHTML = `
+      <div style="font-size:12px; color:#666; margin-bottom:8px;">
+        Ověř, že je to opravdu ta lokace, kterou chceš generovat:
+      </div>
+      <div style="margin-bottom:6px;"><b>${escapeHtml(hit.label)}</b></div>
+      <div id="verify-map" style="width:100%; height:280px; border-radius:6px;
+           border:1px solid #ddd; margin-bottom:8px;"></div>
+      <button class="btn" id="confirm-hit-btn">Potvrdit ✓</button>
+      <button class="btn btn-secondary" id="back-to-results-btn">Zpět</button>
+    `;
+    // Tear down previous map (Leaflet hates re-init on the same div)
+    if (VERIFY_MAP) { try { VERIFY_MAP.remove(); } catch (_) {} VERIFY_MAP = null; }
+    // Address hits zoom to street level; parcel hits a bit wider so the
+    // user sees neighboring parcels for context.
+    const z = hit.kind === 'parcel' ? 17 : 18;
+    VERIFY_MAP = L.map('verify-map').setView([hit.wgs_lat, hit.wgs_lon], z);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap',
+      maxZoom: 19,
+    }).addTo(VERIFY_MAP);
+    L.marker([hit.wgs_lat, hit.wgs_lon]).addTo(VERIFY_MAP)
+      .bindPopup(escapeHtml(hit.label)).openPopup();
+    document.getElementById('confirm-hit-btn').onclick = () => confirmHit(hit);
+    document.getElementById('back-to-results-btn').onclick = () => {
+      if (VERIFY_MAP) { try { VERIFY_MAP.remove(); } catch (_) {} VERIFY_MAP = null; }
+      renderHitList(LAST_HITS);
+    };
+  }
+
+  async function confirmHit(hit) {
+    if (VERIFY_MAP) { try { VERIFY_MAP.remove(); } catch (_) {} VERIFY_MAP = null; }
+    document.getElementById('search-results').innerHTML = '';
     // Auto-slug: slugify(obec), kolize-check přes /api/locations
     const locs = await fetch('/api/locations').then(r => r.json());
     const existing = new Set(locs.map(l => l.slug));

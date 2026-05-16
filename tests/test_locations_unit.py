@@ -154,13 +154,15 @@ def test_ruian_search_maps_features():
     # "Hnojice" has no numeric token → no parcel path, no fold filter.
     # Both fake features pass through.
     assert len(result) == 2
-    assert result[0] == {
-        "kind": "address",
-        "label": "č.p. 136, 78501 Hnojice",
-        "sjtsk_cx": -547980.76,
-        "sjtsk_cy": -1107944.18,
-        "obec": "Hnojice",
-    }
+    r0 = result[0]
+    assert r0["kind"] == "address"
+    assert r0["label"] == "č.p. 136, 78501 Hnojice"
+    assert r0["sjtsk_cx"] == -547980.76
+    assert r0["sjtsk_cy"] == -1107944.18
+    assert r0["obec"] == "Hnojice"
+    # wgs_lat/lon come from pyproj — Hnojice center ~ (49.72, 17.22)
+    assert 49.6 < r0["wgs_lat"] < 49.8
+    assert 17.1 < r0["wgs_lon"] < 17.3
     assert result[1]["obec"] == "Strážek"
 
 

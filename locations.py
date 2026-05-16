@@ -141,6 +141,20 @@ def _ascii_fold(s: str) -> str:
     return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii").lower()
 
 
+_SJTSK_TO_WGS = None
+
+def _sjtsk_to_wgs(cx: float, cy: float) -> tuple[float, float]:
+    """Convert EPSG:5514 (S-JTSK / Krovak East-North) → (lat, lon) WGS84.
+    Lazy-init the Transformer (importing pyproj is ~30 ms, skip in tests
+    that don't need it)."""
+    global _SJTSK_TO_WGS
+    if _SJTSK_TO_WGS is None:
+        from pyproj import Transformer
+        _SJTSK_TO_WGS = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
+    lon, lat = _SJTSK_TO_WGS.transform(cx, cy)
+    return lat, lon
+
+
 class RuianUnavailable(Exception):
     """ČÚZK RUIAN AdresniMisto service nedostupný (network / 5xx)."""
 
@@ -204,11 +218,13 @@ def _search_addresses(tokens: list[str]) -> list[dict]:
             folded_adr = _ascii_fold(adresa)
             if not all(t in folded_adr for t in folded_tokens):
                 continue
+        cx = float(geom["x"]); cy = float(geom["y"])
+        lat, lon = _sjtsk_to_wgs(cx, cy)
         out.append({
             "kind": "address",
             "label": adresa,
-            "sjtsk_cx": float(geom["x"]),
-            "sjtsk_cy": float(geom["y"]),
+            "sjtsk_cx": cx, "sjtsk_cy": cy,
+            "wgs_lat": lat, "wgs_lon": lon,
             "obec": parse_obec(adresa),
         })
         if len(out) >= 10:
@@ -260,11 +276,13 @@ def _search_parcels(tokens: list[str]) -> list[dict]:
         # `katastralniuzemicisloparcely` = "<obec> <cisloparcely>", so the
         # obec is everything before the trailing parcel number.
         obec = label.rsplit(" ", 1)[0] if " " in label else label
+        cx = float(geom["x"]); cy = float(geom["y"])
+        lat, lon = _sjtsk_to_wgs(cx, cy)
         out.append({
             "kind": "parcel",
             "label": f"Parcela {label} ({attrs.get('vymeraparcely', '?')} m²)",
-            "sjtsk_cx": float(geom["x"]),
-            "sjtsk_cy": float(geom["y"]),
+            "sjtsk_cx": cx, "sjtsk_cy": cy,
+            "wgs_lat": lat, "wgs_lon": lon,
             "obec": obec,
         })
         if len(out) >= 10:

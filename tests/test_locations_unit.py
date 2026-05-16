@@ -4,6 +4,14 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
+@pytest.fixture(autouse=True)
+def _reset_ku_cache():
+    """Module-level KÚ cache leaks between tests; reset around every test."""
+    locations._KU_CACHE = None
+    yield
+    locations._KU_CACHE = None
+
+
 def test_module_imports():
     assert locations.STEP_NAMES == ("panorama", "sm5", "outer", "closeup", "inner", "compress")
     assert locations.TILES_DIR_PREFIX == "tiles_v2_"
@@ -235,6 +243,89 @@ def test_ruian_search_network_error_raises():
     with patch("locations.urlopen", side_effect=URLError("connection refused")):
         with pytest.raises(locations.RuianUnavailable):
             locations.ruian_search("Hnojice")
+
+
+def test_resolve_ku_codes_diacritic_fold():
+    """KÚ cache lookup is diacritic-tolerant: user types 'Stribrnice', cache
+    holds 'Stříbrnice' with diacritics, fold match returns kod 756091."""
+    locations._KU_CACHE = [
+        (756091, "Stříbrnice", "stribrnice"),
+        (719790, "Petrov nad Desnou", "petrov nad desnou"),
+        (777001, "Stříbrnice u Uherského Hradiště", "stribrnice u uherskeho hradiste"),
+    ]
+    assert sorted(locations._resolve_ku_codes(["Stribrnice"])) == [756091, 777001]
+    assert locations._resolve_ku_codes(["Stribrnice", "Uherskeho"]) == [777001]
+    assert locations._resolve_ku_codes(["Nonexistent"]) == []
+    assert locations._resolve_ku_codes([]) == []
+
+
+def test_fetch_all_ku_paginates():
+    """_fetch_all_ku must paginate when ČÚZK returns full pages of size 2000."""
+    page1 = [{"attributes": {"kod": i, "nazev": f"KU{i}"}} for i in range(2000)]
+    page2 = [{"attributes": {"kod": i, "nazev": f"KU{i}"}} for i in range(2000, 2500)]
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req.get_full_url()
+        calls.append(url)
+        if "resultOffset=2000" in url:
+            return _mock_ruian_response(page2)
+        return _mock_ruian_response(page1)
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        entries = locations._fetch_all_ku()
+
+    assert len(entries) == 2500
+    assert entries[0] == (0, "KU0")
+    assert entries[-1] == (2499, "KU2499")
+    assert len(calls) == 2
+
+
+def test_search_parcels_uses_ku_filter_in_server_query():
+    """User types '350/2 Stribrnice' — server-side query must include
+    katastralniuzemi IN (756091) so ČÚZK's 200-row cap returns the
+    Stříbrnice parcel directly (was: lost in the cross-ČR haystack)."""
+    locations._KU_CACHE = [(756091, "Stříbrnice", "stribrnice")]
+    captured_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req.get_full_url()
+        captured_urls.append(url)
+        return _mock_ruian_response([
+            {"attributes": {"cisloparcely": "350/2",
+                            "katastralniuzemicisloparcely": "Stříbrnice 350/2",
+                            "vymeraparcely": 1910.0},
+             "geometry": {"x": -550000.0, "y": -1100000.0}},
+        ])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        result = locations.ruian_search("350/2 Stribrnice")
+
+    parcels = [h for h in result if h["kind"] == "parcel"]
+    assert len(parcels) == 1
+    assert "Stříbrnice 350/2" in parcels[0]["label"]
+    parcel_urls = [u for u in captured_urls if "MapServer/0" in u]
+    assert len(parcel_urls) == 1
+    # urlencode of 'katastralniuzemi IN (756091)' → escaped form
+    assert "katastralniuzemi+IN+%28756091%29" in parcel_urls[0]
+
+
+def test_search_parcels_empty_when_obec_unknown():
+    """User types '350/2 Zizala' — no KÚ matches, return [] without
+    hitting the parcel layer (better UX than ČR-wide fan-out)."""
+    locations._KU_CACHE = [(756091, "Stříbrnice", "stribrnice")]
+    captured_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        captured_urls.append(req.get_full_url())
+        return _mock_ruian_response([])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        result = locations.ruian_search("350/2 Zizala")
+
+    assert [h for h in result if h["kind"] == "parcel"] == []
+    # No parcel-layer call was made (only addresses path).
+    assert not any("MapServer/0" in u for u in captured_urls)
 
 
 def test_resolve_sm5_codes_envelope_query():

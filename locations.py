@@ -128,7 +128,12 @@ def list_locations() -> list[dict]:
 
 RUIAN_ADRESNI_MISTO_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/1/query"
 RUIAN_PARCELA_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/0/query"
+RUIAN_KU_URL = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/7/query"
 SM5_KLADY_URL = "https://ags.cuzk.cz/arcgis/rest/services/KladyMapovychListu/MapServer/25/query"
+
+# (kod, nazev, folded_nazev). Lazy-loaded on first KÚ lookup; ~13k entries.
+_KU_CACHE: list | None = None
+_KU_CACHE_LOCK = threading.Lock()
 
 _NUMERIC_TOKEN_RE = re.compile(r"\d")
 _PARCEL_TOKEN_RE = re.compile(r"^\d+(/\d+)?$")
@@ -232,21 +237,93 @@ def _search_addresses(tokens: list[str]) -> list[dict]:
     return out
 
 
+def _fetch_all_ku() -> list[tuple[int, str]]:
+    """Stáhne celý seznam (kod, nazev) z KÚ layeru (~13k záznamů, 2026:13074).
+    Paginated po 2000; raises RuianUnavailable on network error. Pro testy
+    se mockuje urlopen + locations._KU_CACHE = None."""
+    out: list[tuple[int, str]] = []
+    offset = 0
+    page_size = 2000
+    while True:
+        params = {
+            "where": "1=1",
+            "outFields": "kod,nazev",
+            "returnGeometry": "false",
+            "resultRecordCount": str(page_size),
+            "resultOffset": str(offset),
+            "f": "json",
+        }
+        url = RUIAN_KU_URL + "?" + urllib.parse.urlencode(params)
+        data = _ruian_get(url, timeout=30)
+        features = data.get("features", [])
+        for feat in features:
+            attrs = feat.get("attributes", {})
+            kod = attrs.get("kod")
+            nazev = attrs.get("nazev")
+            if kod is not None and nazev:
+                out.append((int(kod), nazev))
+        if len(features) < page_size:
+            break
+        offset += len(features)
+    return out
+
+
+def _get_ku_cache() -> list[tuple[int, str, str]]:
+    """Lazy-init thread-safe cache (kod, nazev, folded_nazev). První hit
+    udělá full download (≈ 13k řádků, ~0.5 s pásmo). RuianUnavailable
+    propaguje do caller."""
+    global _KU_CACHE
+    with _KU_CACHE_LOCK:
+        if _KU_CACHE is None:
+            entries = _fetch_all_ku()
+            _KU_CACHE = [(k, n, _ascii_fold(n)) for k, n in entries]
+        return _KU_CACHE
+
+
+def _resolve_ku_codes(obec_tokens: list[str]) -> list[int]:
+    """Vrátí kódy KÚ, jejichž název obsahuje VŠECHNY tokeny (po fold)
+    jako substring. Empty list pokud nic nesedí.
+    'Stribrnice' (bez háčků) → kódy pro 'Stříbrnice' i 'Stříbrnice u UH'."""
+    if not obec_tokens:
+        return []
+    folded_tokens = [_ascii_fold(t) for t in obec_tokens]
+    return [kod for kod, _nazev, folded in _get_ku_cache()
+            if all(t in folded for t in folded_tokens)]
+
+
 def _search_parcels(tokens: list[str]) -> list[dict]:
     """Parcela layer (ParcelaDefinicniBod, MapServer/0) search. Fires
     when at least one token matches '<int>' or '<int>/<int>' — the
-    canonical parcel-number format (kmenovecislo/poddelenicisla). Other
-    tokens are interpreted as obec/katastr filter, folded against the
-    layer's `katastralniuzemicisloparcely` field ('Libhošť 355/16')."""
+    canonical parcel-number format (kmenovecislo/poddelenicisla).
+
+    Other tokens are obec/KÚ filter. ArcGIS LIKE is diacritic-sensitive,
+    so we cannot fold server-side; instead we resolve obec text → KÚ kód
+    via cached layer 7 download (`_resolve_ku_codes`) and narrow the
+    parcel query with `katastralniuzemi IN (codes)`. This sidesteps the
+    200-row server cap that previously dropped Stříbrnice-style entries
+    when 'cisloparcely' matched hundreds of parcels nationwide."""
     parcel_tokens = [t for t in tokens if _PARCEL_TOKEN_RE.match(t)]
     if not parcel_tokens:
         return []
 
-    # ArcGIS layer 0 lets us filter on `cisloparcely` exact-match for the
-    # parcel-number tokens. AND-chain them (rare to give 2 numbers).
-    clauses = []
-    for t in parcel_tokens:
-        clauses.append(f"cisloparcely = '{_escape_like(t)}'")
+    other_tokens = [t for t in tokens if not _PARCEL_TOKEN_RE.match(t)]
+
+    # If user provided obec text, resolve to KÚ codes. No match → empty
+    # result (don't fan out ČR-wide; that just buries the right hit again).
+    if other_tokens:
+        ku_codes = _resolve_ku_codes(other_tokens)
+        if not ku_codes:
+            return []
+    else:
+        ku_codes = None
+
+    clauses = [f"cisloparcely = '{_escape_like(t)}'" for t in parcel_tokens]
+    if ku_codes:
+        # IN clause; 200-code cap keeps URL well under 2 kB even with 7-digit
+        # codes. In practice obec text narrows to 1-5 KÚ; the cap is defensive.
+        codes_list = ",".join(str(k) for k in ku_codes[:200])
+        clauses.append(f"katastralniuzemi IN ({codes_list})")
+
     params = {
         "where": " AND ".join(clauses),
         "outFields": "cisloparcely,katastralniuzemicisloparcely,vymeraparcely",
@@ -258,10 +335,6 @@ def _search_parcels(tokens: list[str]) -> list[dict]:
     url = RUIAN_PARCELA_URL + "?" + urllib.parse.urlencode(params)
     data = _ruian_get(url)
 
-    # Non-parcel tokens become a fold-filter on the katastr label.
-    other_tokens = [t for t in tokens if not _PARCEL_TOKEN_RE.match(t)]
-    folded_others = [_ascii_fold(t) for t in other_tokens]
-
     out = []
     for feat in data.get("features", []):
         attrs = feat.get("attributes", {})
@@ -269,10 +342,6 @@ def _search_parcels(tokens: list[str]) -> list[dict]:
         label = attrs.get("katastralniuzemicisloparcely") or attrs.get("cisloparcely", "")
         if not label or "x" not in geom or "y" not in geom:
             continue
-        if folded_others:
-            folded_label = _ascii_fold(label)
-            if not all(t in folded_label for t in folded_others):
-                continue
         # `katastralniuzemicisloparcely` = "<obec> <cisloparcely>", so the
         # obec is everything before the trailing parcel number.
         obec = label.rsplit(" ", 1)[0] if " " in label else label

@@ -18,10 +18,19 @@
     font-family: system-ui, sans-serif;
     white-space: nowrap;
   }
+  #atmo-toggle {
+    position: absolute; top: 14px; right: 14px; z-index: 25;
+    background: rgba(255,255,255,0.92); border: 1px solid #ccc;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
+    font-family: system-ui, sans-serif;
+  }
+  #atmo-toggle:hover { background: rgba(255,255,255,1); }
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
+<button id="atmo-toggle" type="button">🌫 Atmosféra VYP</button>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
 <script type="importmap">
 {
@@ -68,10 +77,16 @@ const REGION = params.get('region') || 'hnojice';
 // disk-cache of compressed payload work server-side.
 const BUST = `v=${Date.now()}`;
 // Atmosphere = sky HDR + horizon fog + panorama outer mesh (15 km terrain
-// backdrop). Off by default — pure visual fluff for the cinematic
-// recording path; the detail rings (outer/closeup/inner) cover the
-// working area on their own. Re-enable with ?atmosphere=1.
-const ATMOSPHERE = params.get('atmosphere') === '1';
+// backdrop). Off by default — pure visual fluff for the cinematic recording
+// path; the detail rings (outer/closeup/inner) cover the working area on
+// their own. Runtime toggleable via the top-right button or `?atmosphere=1`.
+let ATMOSPHERE = params.get('atmosphere') === '1';
+
+// Cached for runtime toggle; populated lazily on the first turn-on.
+let _hdrTex = null;
+let _panoramaMesh = null;
+let _panoramaLoadPromise = null;
+let _v2Region = null;   // set inside loadV2 after manifest fetch
 
 const scene = new THREE.Scene();
 // Flat sky-color background — visible whenever ATMOSPHERE is off (no HDR
@@ -111,19 +126,14 @@ renderer.toneMappingExposure = 1.0;
 const _maxAniso = renderer.capabilities.getMaxAnisotropy();
 document.body.appendChild(renderer.domElement);
 
+// HDR sky + panorama mesh + fog are now loaded lazily by _ensurePanoramaLoaded
+// (called from setAtmosphere). For `?atmosphere=1` the initial state-restore
+// kicks the load right after manifest fetch.
+//
 // Partly-cloudy midday HDRI from Polyhaven (kloofendal_48d_partly_cloudy
-// _puresky, CC0, ~5.5 MB). Sun ~48° elevation. Loaded async; until it lands
-// the scene shows the sRGB blue clear colour set on body.
-// Horizon haze — FogExp2 saturates as (density·distance)². 1.5e-5 gives
-// ~20% at 30 km — atmospheric perspective without crushing detail.
-if (ATMOSPHERE) {
-  new RGBELoader().load(`sky_cloudy.hdr?${BUST}`, (tex) => {
-    tex.mapping = THREE.EquirectangularReflectionMapping;
-    scene.background = tex;
-    scene.environment = tex;
-  }, undefined, (err) => console.warn('sky load failed:', err));
-  scene.fog = new THREE.FogExp2(0x9bb0c8, 0.000015);
-}
+// _puresky, CC0, ~5.5 MB). Sun ~48° elevation. Horizon haze — FogExp2
+// saturates as (density·distance)². 1.5e-5 gives ~20% at 30 km — atmospheric
+// perspective without crushing detail.
 
 // MeshBasicMaterial on terrain ignores lights, so these are kept low-cost
 // for future material upgrades but don't affect render today. Direction
@@ -217,6 +227,95 @@ const ktx2Loader = new KTX2Loader()
   .detectSupport(renderer);
 const texLoader = new THREE.TextureLoader();
 
+// ─── Atmosphere toggle: HDR sky + fog + panorama mesh ─────────────────────
+// Lazy-loads on first turn-on, then just toggles visibility on subsequent
+// clicks. _v2Region is set inside loadV2() once the manifest is parsed.
+async function _ensurePanoramaLoaded() {
+  if (_panoramaLoadPromise) return _panoramaLoadPromise;
+  _panoramaLoadPromise = (async () => {
+    if (!_hdrTex) {
+      try {
+        _hdrTex = await new Promise((resolve, reject) => {
+          new RGBELoader().load(`sky_cloudy.hdr?${BUST}`, resolve, undefined, reject);
+        });
+        _hdrTex.mapping = THREE.EquirectangularReflectionMapping;
+      } catch (e) {
+        console.warn('sky HDR load failed:', e);
+      }
+    }
+    if (!_panoramaMesh && _v2Region && _v2Region.panorama_glb) {
+      const gltf = await new Promise((resolve, reject) => {
+        gltfLoader.load(
+          `tiles_v2_${REGION}/${_v2Region.panorama_glb}?${BUST}`,
+          resolve, undefined, reject,
+        );
+      });
+      let m = gltf.scene.children[0];
+      if (m && !m.isMesh && m.children[0]) m = m.children[0];
+      const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(m.geometry, mat);
+      mesh.renderOrder = 0;
+      // Flip Z so scene +Z renders as world -Y (south). Matches the detail
+      // ring convention; without it the panorama is mirrored against details.
+      mesh.scale.z = -1;
+      // Disable frustum culling so fast camera rotation doesn't pop the
+      // huge bounding-sphere out for a frame.
+      mesh.frustumCulled = false;
+      mesh.userData = { kind: 'panorama', meta: _v2Region };
+      scene.add(mesh);
+      allMeshes.push(mesh);
+      _panoramaMesh = mesh;
+      // Texture is best-effort; if it fails the mesh still shows as bare
+      // geometry coloured by the material default.
+      const bb = _v2Region.sjtsk_bbox;
+      const wb = _v2Region.wgs_bbox;
+      const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=14&format=ktx2`;
+      ktx2Loader.load(url, (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = _maxAniso;
+        mat.map = tex;
+        mat.needsUpdate = true;
+      }, undefined, (e) => { console.warn('panorama tex failed:', e); });
+    }
+  })();
+  return _panoramaLoadPromise;
+}
+
+async function setAtmosphere(on) {
+  ATMOSPHERE = on;
+  const btn = document.getElementById('atmo-toggle');
+  if (btn) {
+    btn.textContent = on ? '🌤 Atmosféra ZAP' : '🌫 Atmosféra VYP';
+    btn.disabled = true;
+  }
+  try {
+    if (on) {
+      await _ensurePanoramaLoaded();
+      if (_hdrTex) {
+        scene.background = _hdrTex;
+        scene.environment = _hdrTex;
+      }
+      scene.fog = new THREE.FogExp2(0x9bb0c8, 0.000015);
+      if (_panoramaMesh) _panoramaMesh.visible = true;
+    } else {
+      scene.background = new THREE.Color(0x9bb0c8);
+      scene.environment = null;
+      scene.fog = null;
+      if (_panoramaMesh) _panoramaMesh.visible = false;
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+document.getElementById('atmo-toggle').addEventListener('click', () => {
+  setAtmosphere(!ATMOSPHERE);
+});
+// Reflect initial state from `?atmosphere=1` immediately so the button
+// label matches before loadV2 finishes.
+document.getElementById('atmo-toggle').textContent =
+  ATMOSPHERE ? '🌤 Atmosféra ZAP' : '🌫 Atmosféra VYP';
+
 async function loadV2() {
   const manifest = await fetch(`tiles_v2_${REGION}/manifest.json`, { cache: 'no-store' })
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
@@ -230,8 +329,9 @@ async function loadV2() {
   // overlay stays visible (with per-step state) until every texture has
   // either resolved or failed. Failures stay surfaced so we don't silently
   // ship with a missing ring.
-  const layers = (ATMOSPHERE ? [{ key: 'panorama', label: 'Panorama' }] : [])
-    .concat(details.map(d => ({ key: d.slug, label: d.slug.charAt(0).toUpperCase() + d.slug.slice(1) })));
+  // Panorama is tracked separately by the atmosphere toggle button (disabled
+  // while loading); the status overlay covers only the always-loaded details.
+  const layers = details.map(d => ({ key: d.slug, label: d.slug.charAt(0).toUpperCase() + d.slug.slice(1) }));
   const stateBy = {};
   // mesh state machine: pending → downloading (%) → decoding → ok | fail
   // tex state machine:  pending → downloading (%) → ok | fail
@@ -279,50 +379,11 @@ async function loadV2() {
   }
   renderStatus();
 
-  // --- Panorama: scene origin, renderOrder 0 (only if ?atmosphere=1) ---
+  // --- Panorama: lazy load via _ensurePanoramaLoaded; await only when ----
+  // ATMOSPHERE is initially on, so details still render promptly when off.
+  _v2Region = region;
   if (ATMOSPHERE) {
-    await new Promise((resolve, reject) => {
-      gltfLoader.load(`tiles_v2_${REGION}/${region.panorama_glb}?${BUST}`, (gltf) => {
-        let m = gltf.scene.children[0];
-        if (m && !m.isMesh && m.children[0]) m = m.children[0];
-        const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-        const mesh = new THREE.Mesh(m.geometry, mat);
-        mesh.renderOrder = 0;
-        // Flip Z so scene +Z renders as world -Y (south). With default camera
-        // looking toward -Z, the user looks at world NORTH and east is on the
-        // right — standard map orientation.
-        mesh.scale.z = -1;
-        // Disable frustum culling — Three.js's bounding-sphere computation
-        // can briefly mis-cull these huge meshes when the camera rotates
-        // fast, producing a "mesh pops back in" flash on the return frame.
-        mesh.frustumCulled = false;
-        mesh.userData = { kind: 'panorama', meta: region };
-        scene.add(mesh);
-        allMeshes.push(mesh);
-        setState('panorama', 'mesh', 'ok');
-        const bb = region.sjtsk_bbox;
-        const wb = region.wgs_bbox;
-        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=4096&zoom=14&format=ktx2`;
-        ktx2Loader.load(url, (tex) => {
-          tex.colorSpace = THREE.SRGBColorSpace;
-          tex.anisotropy = _maxAniso;
-          mat.map = tex;
-          mat.needsUpdate = true;
-          setState('panorama', 'tex', 'ok');
-        }, (e) => {
-          if (e && e.lengthComputable) setProgress('panorama', 'tex', e.loaded, e.total);
-        }, (e) => {
-          console.warn('panorama tex failed:', e);
-          setState('panorama', 'tex', 'fail');
-        });
-        resolve();
-      }, (e) => {
-        if (e && e.lengthComputable) {
-          setProgress('panorama', 'mesh', e.loaded, e.total);
-          if (e.total > 0 && e.loaded >= e.total) setState('panorama', 'mesh', 'decoding');
-        }
-      }, (e) => { setState('panorama', 'mesh', 'fail'); reject(e); });
-    });
+    await setAtmosphere(true);
   }
 
   // --- Detail stack: outer → closeup → inner, increasing renderOrder ---

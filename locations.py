@@ -359,24 +359,34 @@ def _search_parcels(tokens: list[str]) -> list[dict]:
     return out
 
 
-def ruian_search(q: str) -> list[dict]:
+def ruian_search(q: str, kind: str = "all") -> list[dict]:
     """Top-level RUIAN search — combines address + parcel hits. Tokens
     split on whitespace + commas. Returns list of {kind, label, sjtsk_cx,
     sjtsk_cy, obec}. Empty list = 0 hits. RuianUnavailable = network/5xx.
 
-    Diacritic-insensitive when input has any numeric token (server fetches
-    a broad candidate set keyed off that token, Python filters folded).
-    Pure-text queries fall back to literal LIKE — RUIAN's diacritic chars
-    must match exactly. See _search_addresses for details."""
+    `kind`:
+      - 'all'     (default) — parcel + address layers; preserves legacy behaviour
+      - 'parcel'  — only ParcelaDefinicniBod (MapServer/0) + KÚ resolver
+      - 'address' — only AdresniMisto (MapServer/1)
+
+    UI toggle uses 'parcel' / 'address' to disambiguate inputs that would
+    otherwise match both (e.g. '350/2 Stříbrnice' is unambiguous as a
+    parcel; without the toggle we'd also hit the address layer and waste
+    one ČÚZK round-trip).
+
+    Diacritic-insensitive for parcels (KÚ fold-cache) and addresses with
+    any numeric token (server fetches broad, Python filters folded).
+    Pure-text addresses fall back to literal LIKE — RUIAN's diacritic
+    chars must match exactly. See _search_addresses for details."""
     if not q.strip():
         return []
     tokens = [t for t in re.split(r"[\s,]+", q.strip()) if t]
     if not tokens:
         return []
-    # Parcels first (they're more specific) then addresses, deduped not
-    # needed since result types are distinct.
-    parcels = _search_parcels(tokens)
-    addresses = _search_addresses(tokens)
+    parcels = _search_parcels(tokens) if kind in ("all", "parcel") else []
+    addresses = _search_addresses(tokens) if kind in ("all", "address") else []
+    # Parcels first (they're more specific) then addresses; result types
+    # are distinct so no dedup needed.
     return parcels + addresses
 
 

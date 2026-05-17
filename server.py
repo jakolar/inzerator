@@ -1319,8 +1319,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             return
         if _path == "/api/ruian/search":
             q = _query.get("q", [""])[0]
+            kind = _query.get("kind", ["all"])[0]
+            if kind not in ("all", "parcel", "address"):
+                self._send_json(400, {"error": "kind must be 'all', 'parcel', or 'address'"})
+                return
             try:
-                results = locations.ruian_search(q)
+                results = locations.ruian_search(q, kind=kind)
             except locations.RuianUnavailable as e:
                 self._send_json(503, {"error": f"ČÚZK unavailable: {e}"})
                 return

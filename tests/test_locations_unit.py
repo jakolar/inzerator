@@ -310,6 +310,65 @@ def test_search_parcels_uses_ku_filter_in_server_query():
     assert "katastralniuzemi+IN+%28756091%29" in parcel_urls[0]
 
 
+def test_ruian_search_kind_parcel_skips_addresses():
+    """kind='parcel' calls only the parcel layer (MapServer/0), never
+    MapServer/1. Even if input has tokens that would match an address."""
+    locations._KU_CACHE = [(756091, "Stříbrnice", "stribrnice")]
+    captured_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        captured_urls.append(req.get_full_url())
+        return _mock_ruian_response([
+            {"attributes": {"cisloparcely": "350/2",
+                            "katastralniuzemicisloparcely": "Stříbrnice 350/2",
+                            "vymeraparcely": 1910.0},
+             "geometry": {"x": -550000.0, "y": -1100000.0}},
+        ])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        result = locations.ruian_search("350/2 Stribrnice", kind="parcel")
+
+    assert all(h["kind"] == "parcel" for h in result)
+    assert any("MapServer/0" in u for u in captured_urls)
+    assert not any("MapServer/1" in u for u in captured_urls)
+
+
+def test_ruian_search_kind_address_skips_parcels():
+    """kind='address' calls only MapServer/1, never MapServer/0 or KÚ layer 7."""
+    captured_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        captured_urls.append(req.get_full_url())
+        return _mock_ruian_response([
+            {"attributes": {"adresa": "č.p. 47, 78501 Hnojice"},
+             "geometry": {"x": -547980.0, "y": -1107944.0}},
+        ])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        result = locations.ruian_search("350/2 Hnojice", kind="address")
+
+    assert all(h["kind"] == "address" for h in result)
+    assert any("MapServer/1" in u for u in captured_urls)
+    assert not any("MapServer/0" in u for u in captured_urls)
+    assert not any("MapServer/7" in u for u in captured_urls)
+
+
+def test_ruian_search_kind_all_default():
+    """Default kind='all' preserves the historical behaviour: both layers fire."""
+    locations._KU_CACHE = [(756091, "Stříbrnice", "stribrnice")]
+    captured_urls = []
+
+    def fake_urlopen(req, timeout=None):
+        captured_urls.append(req.get_full_url())
+        return _mock_ruian_response([])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
+        locations.ruian_search("350/2 Stribrnice")  # no kind arg
+
+    assert any("MapServer/0" in u for u in captured_urls)
+    assert any("MapServer/1" in u for u in captured_urls)
+
+
 def test_search_parcels_empty_when_obec_unknown():
     """User types '350/2 Zizala' — no KÚ matches, return [] without
     hitting the parcel layer (better UX than ČR-wide fan-out)."""

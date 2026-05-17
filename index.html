@@ -95,6 +95,18 @@
   }
 
   let SELECTED_HIT = null;
+  let SEARCH_KIND = 'address';   // 'address' | 'parcel'
+
+  const KIND_HINTS = {
+    address: {
+      placeholder: 'Hnojice 47',
+      tip: 'Adresa: stačí napsat obec a číslo (diakritika tolerována jen u adres s číslem).',
+    },
+    parcel: {
+      placeholder: '350/2 Stříbrnice',
+      tip: 'Parcela: číslo (např. 350/2) + obec. KÚ se fold-matchne, takže funguje i bez diakritiky.',
+    },
+  };
 
   function renderForm(show) {
     const el = document.getElementById('form-container');
@@ -103,14 +115,15 @@
       <div style="background:white; padding:16px; border-radius:8px; margin-top:16px;
                   box-shadow:0 1px 2px rgba(0,0,0,0.06);">
         <h3 style="margin-top:0;">Nová lokace</h3>
+        <div style="margin-bottom:8px;">
+          <button class="btn kind-btn" data-kind="address" style="border-radius:6px 0 0 6px;">Adresa</button><button class="btn kind-btn" data-kind="parcel" style="border-radius:0 6px 6px 0;">Parcela</button>
+        </div>
         <div>
-          <input id="addr-input" type="text" placeholder="Hnojice 47 (s diakritikou!)"
+          <input id="addr-input" type="text" placeholder=""
                  style="width:60%; padding:6px;">
           <button class="btn" id="search-btn">Hledat</button>
         </div>
-        <div style="font-size:11px; color:#888; margin-top:4px;">
-          Tip: piš s diakritikou (Hnojice, Strážek). RUIAN bez diakritiky nehledá.
-        </div>
+        <div id="search-tip" style="font-size:11px; color:#888; margin-top:4px;"></div>
         <div id="search-results" style="margin-top:12px;"></div>
         <div id="selected-fields" style="margin-top:12px; display:none;">
           <p><b>Vybráno:</b> <span id="selected-label"></span></p>
@@ -136,6 +149,24 @@
       if (q.length < 2) return;
       SEARCH_DEBOUNCE = setTimeout(doSearch, 300);
     });
+    document.querySelectorAll('.kind-btn').forEach(b => {
+      b.onclick = () => setSearchKind(b.dataset.kind);
+    });
+    setSearchKind(SEARCH_KIND);
+  }
+
+  function setSearchKind(kind) {
+    SEARCH_KIND = kind;
+    const hint = KIND_HINTS[kind];
+    document.getElementById('addr-input').placeholder = hint.placeholder;
+    document.getElementById('search-tip').textContent = hint.tip;
+    document.querySelectorAll('.kind-btn').forEach(b => {
+      const active = b.dataset.kind === kind;
+      b.classList.toggle('btn-secondary', !active);
+    });
+    // Re-run search if there's existing input so user sees toggle effect.
+    const q = document.getElementById('addr-input').value.trim();
+    if (q.length >= 2) doSearch();
   }
 
   let SEARCH_DEBOUNCE = null;
@@ -149,7 +180,7 @@
     }
     resultsEl.innerHTML = '<i>Hledám…</i>';
     try {
-      const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}`);
+      const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=${SEARCH_KIND}`);
       if (r.status === 503) {
         resultsEl.innerHTML = '<div class="error">ČÚZK nedostupné. Zkus později nebo zadej S-JTSK ručně.</div>';
         return;

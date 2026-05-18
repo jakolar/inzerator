@@ -558,7 +558,12 @@ def _do_compress(job: dict, log_path: Path) -> bool:
             return False
 
         size_before = compressed_path.stat().st_size
-        log(f"[{slug}] {size_before // (1024*1024)} MB → compressing…")
+        # Per-LOD quant — outer/closeup use 12 (≈12% of step error, invisible at
+        # 2.5/1.5 m mesh resolution); inner stays at 14 (≈6% of 0.5 m step =
+        # ~30 mm) since users zoom there. quant_pos defaults to 16 in
+        # draco_compress_glb if unset.
+        quant = _LOD_PRESET[slug].get("draco_quant", 16)
+        log(f"[{slug}] {size_before // (1024*1024)} MB → compressing (quant_pos={quant})…")
 
         # Atomic-ish: move source aside FIRST so we don't lose data if
         # Draco encode crashes. If compression fails below, the original
@@ -572,7 +577,7 @@ def _do_compress(job: dict, log_path: Path) -> bool:
             return False
 
         try:
-            draco_compress_glb.compress(str(orig_path), str(compressed_path))
+            draco_compress_glb.compress(str(orig_path), str(compressed_path), quant_pos=quant)
             size_after = compressed_path.stat().st_size
             log(f"[{slug}] → {size_after // (1024*1024)} MB "
                 f"({100 * size_after // size_before}% of original)")
@@ -715,9 +720,9 @@ def cancel_job(job_id: str) -> bool:
 # Hnojice-preset LOD parametry (fixní pro všechny lokace).
 # Inner step 0.5 m kvůli zarovnání s gen_multitile village_flat profilem.
 _LOD_PRESET = {
-    "outer":   {"half": 2500, "step": "2.5", "fade": 100, "fade_to": "panorama", "zoom": 17, "size": 4096},
-    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 4096},
-    "inner":   {"half":  500, "step": "0.5", "fade":  30, "fade_to": "closeup",  "zoom": 21, "size": 8192},
+    "outer":   {"half": 2500, "step": "2.5", "fade": 100, "fade_to": "panorama", "zoom": 17, "size": 4096, "draco_quant": 12},
+    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 4096, "draco_quant": 12},
+    "inner":   {"half":  500, "step": "0.5", "fade":  30, "fade_to": "closeup",  "zoom": 21, "size": 8192, "draco_quant": 14},
 }
 
 

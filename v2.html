@@ -878,6 +878,20 @@ function setupParcelSelection(region, innerField) {
       toneMapped: false,
       transparent: false,
       depthTest: true,
+      // Inner detail mesh sits at polygonOffsetUnits=-96 (renderOrder=2 in
+      // the LOD stack). Without our own bias the tube depth is +96 units
+      // behind the terrain at the same world XZ — fine straight overhead
+      // but at shallow angles the 24-bit depth buffer's ≈1 m precision at
+      // 500 m distance smears that gap into z-fight (user's "outline
+      // disappears in mesh from some angles"). units=-128 pushes the tube
+      // ahead of inner by 32 units (a few mm world-space at typical
+      // viewer distance) — too small to poke through buildings (their
+      // ≥5 m vertical separation dominates) but enough to eliminate the
+      // fight against terrain. factor=0 keeps the bias constant on near-
+      // vertical tube cross-sections (same rationale as the LOD stack).
+      polygonOffset: true,
+      polygonOffsetFactor: 0,
+      polygonOffsetUnits: -128,
     });
     for (const ring of parcelRings) {
       for (let i = 0; i < ring.length; i++) {

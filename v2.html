@@ -160,9 +160,19 @@ controls.update();
 // EffectComposer with an HDR-preserving HalfFloat buffer. Without HalfFloat
 // the sky's high-intensity sun pixels would clamp to 1.0 before bloom sees
 // them, killing the glow effect.
+// MSAA on the composer's intermediate buffer (renderer's own `antialias: true`
+// only covers the default framebuffer; once we route through EffectComposer
+// the render goes into THIS target which had samples=0 = no AA). samples=4
+// adds hardware 4× MSAA on top of the existing 2× pixelRatio — effective
+// 16-sample supersampling on all geometry edges (parcel tube cross-sections
+// were stair-stepped from oblique angles before; cadastre LineSegments and
+// LOD seams looked equally rough).
 const composer = new EffectComposer(
   renderer,
-  new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType }),
+  new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
+    type: THREE.HalfFloatType,
+    samples: 4,
+  }),
 );
 const renderPass = new RenderPass(scene, camera);
 composer.addPass(renderPass);
@@ -1036,7 +1046,12 @@ function setupParcelSelection(region, innerField) {
         for (let j = 0; j < pts.length - 1; j++) {
           path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
         }
-        const tubeGeo = new THREE.TubeGeometry(path, pts.length, 0.45, 6, false);
+        // radialSegments 12 (was 6): hexagonal cross-section showed flat
+        // facet edges when the tube changed direction over uneven terrain
+        // (user report: "teeth" when draped over trees). 12 sides reads
+        // as round at every camera angle; geometry overhead ≈ ×2 but the
+        // tubes are tiny (hundreds of vertices each) so it doesn't matter.
+        const tubeGeo = new THREE.TubeGeometry(path, pts.length, 0.45, 12, false);
         const tube = new THREE.Mesh(tubeGeo, tubeMat);
         tube.renderOrder = 99;
         outlineGroup.add(tube);

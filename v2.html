@@ -683,6 +683,10 @@ function setupParcelSelection(region, innerField) {
       <input id="sel-mode" type="checkbox">
       <span>Výběr parcel</span>
     </label>
+    <label style="display:flex;gap:8px;align-items:center;cursor:pointer;">
+      <input id="sel-cadastre" type="checkbox">
+      <span>🗺 Zobrazit katastr</span>
+    </label>
     <button id="sel-clear" style="font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#f6f6f6;cursor:pointer;">
       Smazat výběr (<span id="sel-count">0</span>)
     </button>
@@ -690,9 +694,81 @@ function setupParcelSelection(region, innerField) {
   `;
   document.body.appendChild(menu);
   const modeChk = menu.querySelector('#sel-mode');
+  const cadChk = menu.querySelector('#sel-cadastre');
   const clearBtn = menu.querySelector('#sel-clear');
   const countEl = menu.querySelector('#sel-count');
   const hintEl = menu.querySelector('#sel-hint');
+
+  // Cadastre overlay — all-parcel outline drawn as one LineSegments batch.
+  // Separate from the selection outline (different group, different material,
+  // different renderOrder, no bloom).
+  const cadastreGroup = new THREE.Group();
+  cadastreGroup.visible = false;
+  cadastreGroup.renderOrder = 98;
+  scene.add(cadastreGroup);
+  let cadastreBuilt = false;
+
+  function buildCadastre() {
+    if (cadastreBuilt || !parcels) return;
+    const LIFT = 2.5;
+    const SUB_M = 2.0;
+    const positions = [];
+    for (const p of parcels) {
+      if (!p.ring_local || p.ring_local.length < 3) continue;
+      const ring = p.ring_local;
+      for (let i = 0; i < ring.length; i++) {
+        const a = ring[i], b = ring[(i + 1) % ring.length];
+        const dx = b[0] - a[0], dz = b[1] - a[1];
+        const segLen = Math.hypot(dx, dz);
+        const sub = Math.max(1, Math.ceil(segLen / SUB_M));
+        let prevX = null, prevY = null, prevZ = null;
+        for (let k = 0; k <= sub; k++) {
+          const t = k / sub;
+          const wx = a[0] + dx * t;
+          const wz = a[1] + dz * t;
+          const sampled = sampleInnerY(wx, wz);
+          // Outside inner footprint → linear-interp ring abs Y, minus groundZ.
+          const fallbackY = (a[2] + (b[2] - a[2]) * t) - groundZ;
+          const y = (sampled !== null ? sampled : fallbackY) + LIFT;
+          if (prevX !== null) {
+            positions.push(prevX, prevY, prevZ, wx, y, wz);
+          }
+          prevX = wx; prevY = y; prevZ = wz;
+        }
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    // Orange-yellow line, depth-test on so buildings occlude, depth-write off
+    // so the cadastre doesn't bury anything drawn after it. No polygonOffset
+    // (LineBasicMaterial doesn't honour it for line primitives) — the 2.5 m
+    // LIFT keeps it clear of depth-precision noise against terrain at typical
+    // viewer distance.
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffaa33,
+      transparent: true, opacity: 0.75,
+      depthTest: true, depthWrite: false,
+      toneMapped: true,
+    });
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = 98;
+    cadastreGroup.add(lines);
+    cadastreBuilt = true;
+    console.info(`[v2] cadastre overlay: ${parcels.length} parcels, ${positions.length / 6} segments`);
+  }
+
+  cadChk.addEventListener('change', async () => {
+    if (cadChk.checked) {
+      if (!parcels) {
+        hintEl.textContent = 'Načítám parcely pro katastr…';
+        await fetchParcels();
+      }
+      if (parcels) buildCadastre();
+      cadastreGroup.visible = true;
+    } else {
+      cadastreGroup.visible = false;
+    }
+  });
 
   async function fetchParcels() {
     hintEl.textContent = 'Načítám parcely…';

@@ -18,18 +18,21 @@
     font-family: system-ui, sans-serif;
     white-space: nowrap;
   }
-  #atmo-toggle {
-    position: absolute; top: 14px; right: 14px; z-index: 25;
+  #atmo-toggle, #shot-btn {
+    position: absolute; top: 14px; z-index: 25;
     background: rgba(255,255,255,0.92); border: 1px solid #ccc;
     border-radius: 6px; padding: 6px 10px; font-size: 13px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
     font-family: system-ui, sans-serif;
   }
-  #atmo-toggle:hover { background: rgba(255,255,255,1); }
+  #atmo-toggle { right: 14px; }
+  #shot-btn    { right: 174px; }
+  #atmo-toggle:hover, #shot-btn:hover { background: rgba(255,255,255,1); }
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
+<button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
 <button id="atmo-toggle" type="button">🌫 Atmosféra VYP</button>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
 <script type="importmap">
@@ -316,6 +319,38 @@ document.getElementById('atmo-toggle').addEventListener('click', () => {
 document.getElementById('atmo-toggle').textContent =
   ATMOSPHERE ? '🌤 Atmosféra ZAP' : '🌫 Atmosféra VYP';
 
+// ─── Screenshot ──────────────────────────────────────────────────────────
+// renderer.preserveDrawingBuffer is already true (recording path needs it),
+// so the canvas back-buffer is readable after composer.render() completes.
+// One animation-frame delay so the latest render is in flight, then toBlob.
+function downloadScreenshot() {
+  requestAnimationFrame(() => {
+    renderer.domElement.toBlob((blob) => {
+      if (!blob) { console.warn('toBlob returned null'); return; }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = url;
+      a.download = `${REGION}-${ts}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Revoke after a tick so Safari finishes the download trigger first.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, 'image/png');
+  });
+}
+document.getElementById('shot-btn').addEventListener('click', downloadScreenshot);
+// Cmd/Ctrl+S keyboard shortcut. Intercepted so the browser's own "save page"
+// dialog doesn't open. Plain 's' is left alone so it doesn't collide with
+// orbit controls' rotate-from-keyboard if that's ever wired up.
+window.addEventListener('keydown', (e) => {
+  if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    downloadScreenshot();
+  }
+});
+
 async function loadV2() {
   const manifest = await fetch(`tiles_v2_${REGION}/manifest.json`, { cache: 'no-store' })
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
@@ -525,8 +560,25 @@ async function loadV2() {
     const n = Math.round(2 * d.half / d.step) + 1;
     const pos = innerForField.geometry.getAttribute('position');
     if (pos && pos.count >= n * n) {
+      // Draco reorders vertices for compression — `pos.array[k*3]` is NOT
+      // row-major any more (was when gen_detail wrote the GLB). Reconstruct
+      // the grid by computing (c, r) from each vertex's (x, z): both stay
+      // close enough to the original sample grid even after quant=14 (≈30
+      // mm jitter << 0.5 m step) that rounding snaps cleanly. Keep the MAX
+      // Y per cell so skirt verts (same x,z as boundary terrain but lower
+      // Y) don't overwrite the terrain row.
       const ys = new Float32Array(n * n);
-      for (let k = 0; k < n * n; k++) ys[k] = pos.array[k * 3 + 1];
+      ys.fill(NaN);
+      const arr = pos.array;
+      let filled = 0;
+      for (let i = 0; i < pos.count; i++) {
+        const x = arr[i * 3], y = arr[i * 3 + 1], z = arr[i * 3 + 2];
+        const c = Math.round((x + d.half) / d.step);
+        const r = Math.round((z + d.half) / d.step);
+        if (c < 0 || c >= n || r < 0 || r >= n) continue;
+        const k = r * n + c;
+        if (isNaN(ys[k]) || y > ys[k]) { if (isNaN(ys[k])) filled++; ys[k] = y; }
+      }
       _innerField = {
         ys, n,
         half: d.half, step: d.step,
@@ -535,7 +587,7 @@ async function loadV2() {
         sceneCx: innerForField.position.x,
         sceneCz: innerForField.position.z,
       };
-      console.info(`[v2] inner heightfield extracted: ${n}×${n} @ ${d.step} m`);
+      console.info(`[v2] inner heightfield: ${filled}/${n*n} cells (${(100*filled/(n*n)).toFixed(1)}%) @ ${d.step} m`);
     }
   }
 
@@ -713,6 +765,9 @@ function setupParcelSelection(region, innerField) {
     const y10 = ys[(iz + 1) * n + ix];
     const y01 = ys[iz * n + (ix + 1)];
     const y11 = ys[(iz + 1) * n + (ix + 1)];
+    // Any of the 4 corners NaN (cell never filled by a Draco-decoded vertex,
+    // e.g. carved hole or missed snap) → fall back to caller's ring-corner Y.
+    if (isNaN(y00) || isNaN(y10) || isNaN(y01) || isNaN(y11)) return null;
     // gen_detail emits T1=[(0,0),(1,0)x,(0,1)z], T2=[(1,0),(0,1),(1,1)]
     if (tx + tz <= 1.0) return (1 - tx - tz) * y00 + tz * y10 + tx * y01;
     return (1 - tz) * y01 + (1 - tx) * y10 + (tx + tz - 1) * y11;

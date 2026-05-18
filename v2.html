@@ -948,6 +948,23 @@ function setupParcelSelection(region, innerField) {
     return pick;
   }
 
+  // Soft-pick fallback for clicks that land in gaps (road, courtyard,
+  // public space between parcels — opatovice village center is a known
+  // example where the address pin falls on a road, ~68 m from any
+  // parcel). Returns the nearest parcel within `maxDist` metres (by
+  // any ring vertex's XZ distance to the click point), or null.
+  function nearestParcel(sceneX, sceneZ, maxDist) {
+    let best = null, bestD = maxDist;
+    for (const p of parcels) {
+      if (!p.ring_local || p.ring_local.length < 3) continue;
+      for (const v of p.ring_local) {
+        const d = Math.hypot(v[0] - sceneX, v[1] - sceneZ);
+        if (d < bestD) { best = p; bestD = d; }
+      }
+    }
+    return best ? { parcel: best, dist: bestD } : null;
+  }
+
   // Drape one edge (between two consecutive ring vertices) by linear
   // interpolation in scene XZ + the ring-vertex Y values from the server.
   // Sample the inner mesh's Y heightfield at world (x, z) using the same
@@ -1175,9 +1192,18 @@ function setupParcelSelection(region, innerField) {
       }
     }
     if (!p) {
-      console.info(`[parcel-pick] no parcel at scene XZ=(${pickPoint.x.toFixed(1)}, ${pickPoint.z.toFixed(1)}); planeY=${pickPlane.constant.toFixed(1)}; target.y=${controls.target.y.toFixed(1)}`);
-      hintEl.textContent = `Tam není parcela. (XZ=${pickPoint.x.toFixed(0)},${pickPoint.z.toFixed(0)})`;
-      return;
+      // Soft-pick: snap to nearest parcel within 30 m (covers cases where
+      // the click lands on a road / courtyard between parcels — common at
+      // village centres where the address pin falls in public space).
+      const near = nearestParcel(pickPoint.x, pickPoint.z, 30);
+      if (near) {
+        p = near.parcel;
+        hintEl.textContent = `Snap → ${p.label} (vzdálenost ${near.dist.toFixed(0)} m)`;
+      } else {
+        console.info(`[parcel-pick] no parcel at scene XZ=(${pickPoint.x.toFixed(1)}, ${pickPoint.z.toFixed(1)}); planeY=${pickPlane.constant.toFixed(1)}; target.y=${controls.target.y.toFixed(1)}`);
+        hintEl.textContent = `Tam není parcela (XZ=${pickPoint.x.toFixed(0)},${pickPoint.z.toFixed(0)}). Klikni blíž parcele.`;
+        return;
+      }
     }
     if (selected.has(p.id)) selected.delete(p.id);
     else selected.add(p.id);

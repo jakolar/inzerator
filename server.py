@@ -510,7 +510,15 @@ def _fetch_parcels_area(gcx, gcy, radius):
     bx_max, by_max = gcx + radius, gcy + radius
     url = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/5/query"
 
-    # Page through results (RÚIAN max 1000 per response).
+    # Page through results. Layer 5 reports maxRecordCount=1_000_000 (Sep
+    # 2026), but the actual per-response soft limit varies (~1000-2000); we
+    # ask for 5000 to fit most villages in a single round-trip and paginate
+    # with orderByFields=objectid so consecutive pages are deterministic.
+    # Without orderBy ArcGIS may dedup/skip across pages — earlier code
+    # without it terminated at 1999 features for opatovice (true count 5045)
+    # because the 2nd page returned 999 unique features and the < page_size
+    # break fired, silently dropping ~60% of the cadastre.
+    page_size = 5000
     offset = 0
     raw_features = []
     while True:
@@ -523,15 +531,20 @@ def _fetch_parcels_area(gcx, gcy, radius):
             "spatialRel": "esriSpatialRelIntersects",
             "outFields": "id,kmenovecislo,poddelenicisla,druhpozemkukod,vymeraparcely",
             "outSR": "5514", "f": "json", "returnGeometry": "true",
+            "orderByFields": "objectid",
             "resultOffset": str(offset),
-            "resultRecordCount": "1000",
+            "resultRecordCount": str(page_size),
         }
-        raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(params), timeout=30))
+        raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(params), timeout=60))
         feats = raw.get("features", [])
         raw_features.extend(feats)
-        if len(feats) < 1000:
+        # exceededTransferLimit signals "there are more pages"; absence means
+        # we got the tail. Some ArcGIS servers omit this field on the final
+        # page, others return False — handle both.
+        more = raw.get("exceededTransferLimit") or len(feats) >= page_size
+        if not more:
             break
-        offset += 1000
+        offset += len(feats)
 
     # Open every cached DSM TIFF once; per-vertex sample picks the right one.
     tifs = []
@@ -2224,10 +2237,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404)
             return
 
-        # Disk-cache the compressed payload keyed on file mtime + encoding.
+        # Disk-cache the compressed payload keyed on file mtime + encoding +
+        # quality level. Brotli quality 11 (max) compresses ~30% better than
+        # q=6 on already-Draco GLBs (33.6 MB → 20 MB vs 28 MB at q=6) but
+        # takes 10-20× longer to encode. We cache so the slow encode is a
+        # one-time cost per Draco re-compress; subsequent requests serve the
+        # cached blob directly.
         st = os.stat(file_path)
+        BROTLI_Q = 11
         enc = "br" if prefer_br else "gzip"
-        cache_path = f"{file_path}.{enc}.{int(st.st_mtime)}"
+        suffix = f"br{BROTLI_Q}" if enc == "br" else "gzip6"
+        cache_path = f"{file_path}.{suffix}.{int(st.st_mtime)}"
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 compressed = f.read()
@@ -2237,7 +2257,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             if prefer_br:
                 try:
                     import brotli
-                    compressed = brotli.compress(data, quality=6)
+                    compressed = brotli.compress(data, quality=BROTLI_Q)
                 except Exception:
                     enc = "gzip"
                     compressed = gz.compress(data, compresslevel=6)

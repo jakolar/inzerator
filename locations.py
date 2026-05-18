@@ -545,36 +545,48 @@ def _do_compress(job: dict, log_path: Path) -> bool:
     orig_dir = region_dir / "_orig_uncompressed"
     orig_dir.mkdir(parents=True, exist_ok=True)
 
+    force = bool(job.get("force_recompress"))
     details = ("outer", "closeup", "inner")
     for slug in details:
         compressed_path = details_dir / f"{slug}.glb"
         orig_path = orig_dir / f"{slug}.glb"
 
-        if orig_path.exists():
-            log(f"[{slug}] already compressed (orig stored), skip")
-            continue
-        if not compressed_path.exists():
-            log(f"FAIL: {slug} — no source .glb at {compressed_path}")
-            return False
+        if force:
+            # Re-Draco from _orig_uncompressed/<step>.glb (must exist; the
+            # current details/<step>.glb is already lossy-quantised so re-
+            # Dracoing it can't improve quality). Skip details where the orig
+            # is missing — leaves the existing Draco glb in place.
+            if not orig_path.exists():
+                log(f"FAIL: {slug} — no _orig_uncompressed/{slug}.glb to re-Draco from "
+                    f"(this detail was generated before per-LOD quant landed; only the "
+                    f"current details/ glb is on disk)")
+                return False
+        else:
+            if orig_path.exists():
+                log(f"[{slug}] already compressed (orig stored), skip")
+                continue
+            if not compressed_path.exists():
+                log(f"FAIL: {slug} — no source .glb at {compressed_path}")
+                return False
 
-        size_before = compressed_path.stat().st_size
+        size_before = compressed_path.stat().st_size if compressed_path.exists() else orig_path.stat().st_size
         # Per-LOD quant — outer/closeup use 12 (≈12% of step error, invisible at
         # 2.5/1.5 m mesh resolution); inner stays at 14 (≈6% of 0.5 m step =
         # ~30 mm) since users zoom there. quant_pos defaults to 16 in
         # draco_compress_glb if unset.
         quant = _LOD_PRESET[slug].get("draco_quant", 16)
-        log(f"[{slug}] {size_before // (1024*1024)} MB → compressing (quant_pos={quant})…")
+        mode = "re-compressing" if force else "compressing"
+        log(f"[{slug}] {size_before // (1024*1024)} MB → {mode} (quant_pos={quant})…")
 
-        # Atomic-ish: move source aside FIRST so we don't lose data if
-        # Draco encode crashes. If compression fails below, the original
-        # is still in _orig_uncompressed/ and the next retry will see
-        # `compressed_path.exists() == False`, treat as fail, and surface
-        # the issue rather than silently re-running.
-        try:
-            compressed_path.rename(orig_path)
-        except OSError as e:
-            log(f"FAIL: {slug} — rename source aside: {e}")
-            return False
+        # First-time compress: move source aside FIRST so we don't lose data
+        # if Draco crashes (recovery in `except`).
+        # Force-recompress: orig already exists, just write a new dst on top.
+        if not force:
+            try:
+                compressed_path.rename(orig_path)
+            except OSError as e:
+                log(f"FAIL: {slug} — rename source aside: {e}")
+                return False
 
         try:
             draco_compress_glb.compress(str(orig_path), str(compressed_path), quant_pos=quant)
@@ -597,7 +609,8 @@ def _do_compress(job: dict, log_path: Path) -> bool:
     return True
 
 
-def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
+def _new_job(slug: str, label: str, cx: float, cy: float,
+             force_recompress: bool = False) -> dict:
     return {
         "job_id": str(uuid.uuid4()),
         "slug": slug,
@@ -605,6 +618,11 @@ def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
         "cx": cx,
         "cy": cy,
         "cancelled": False,
+        # When true, the compress step re-Dracos every detail from
+        # _orig_uncompressed/<step>.glb even if the orig file already exists
+        # (i.e. previously compressed). Used by the dashboard's "Recompress"
+        # button to pick up a new draco_quant preset.
+        "force_recompress": force_recompress,
         "created_at": time.time(),
         "steps": [
             {"name": name, "state": "pending", "error": None,
@@ -614,7 +632,8 @@ def _new_job(slug: str, label: str, cx: float, cy: float) -> dict:
     }
 
 
-def enqueue_job(slug: str, label: str, cx: float, cy: float) -> str | None:
+def enqueue_job(slug: str, label: str, cx: float, cy: float,
+                force_recompress: bool = False) -> str | None:
     """Add new job. Returns job_id, or None if a non-terminal job with the
     same slug is already queued or running (caller maps to 409).
 
@@ -631,7 +650,7 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float) -> str | None:
             existing = JOBS.get(CURRENT_JOB)
             if existing and existing["slug"] == slug:
                 return None
-        job = _new_job(slug, label, cx, cy)
+        job = _new_job(slug, label, cx, cy, force_recompress=force_recompress)
         JOBS[job["job_id"]] = job
         JOB_QUEUE.append(job["job_id"])
         JOB_CV.notify()   # vzbudí worker

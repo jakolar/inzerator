@@ -2426,8 +2426,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_json(400, {"error": "cx, cy must be numbers"})
             return
+        force_recompress = bool(body.get("force_recompress"))
         status = locations.location_status(slug)
-        if status == "ready":
+        if status == "ready" and not force_recompress:
             self._send_json(409, {
                 "error": "slug already exists and is ready",
                 "slug": slug,
@@ -2435,8 +2436,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     set(loc["slug"] for loc in locations.list_locations())),
             })
             return
+        if force_recompress:
+            # Drop .compress_ok so the worker's resume-skip doesn't bail on
+            # the compress step. Other sentinels stay → only compress reruns.
+            sentinel = locations.expected_glb(slug, "compress")
+            if sentinel.exists():
+                try:
+                    sentinel.unlink()
+                except OSError as e:
+                    self._send_json(500, {"error": f"could not drop .compress_ok: {e}"})
+                    return
         # 'partial' or 'missing' = OK; worker will resume-skip completed steps
-        job_id = locations.enqueue_job(slug, label, cx, cy)
+        job_id = locations.enqueue_job(slug, label, cx, cy,
+                                       force_recompress=force_recompress)
         if job_id is None:
             self._send_json(409, {"error": f"a job for slug '{slug}' is already queued or running"})
             return

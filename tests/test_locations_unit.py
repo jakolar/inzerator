@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+
 import locations
 import pytest
 from unittest.mock import patch, MagicMock
@@ -308,6 +310,79 @@ def test_search_parcels_uses_ku_filter_in_server_query():
     assert len(parcel_urls) == 1
     # urlencode of 'katastralniuzemi IN (756091)' → escaped form
     assert "katastralniuzemi+IN+%28756091%29" in parcel_urls[0]
+
+
+def test_enqueue_job_propagates_force_recompress():
+    """force_recompress flag flows into job dict so the worker can branch."""
+    locations.JOBS.clear(); locations.JOB_QUEUE.clear()
+    job_id = locations.enqueue_job("slug-a", "Slug A", -100.0, -200.0, force_recompress=True)
+    assert job_id is not None
+    assert locations.JOBS[job_id]["force_recompress"] is True
+    locations.JOBS.clear(); locations.JOB_QUEUE.clear()
+
+
+def test_enqueue_job_default_force_recompress_false():
+    """Backwards-compat: callers that don't pass force_recompress get False."""
+    locations.JOBS.clear(); locations.JOB_QUEUE.clear()
+    job_id = locations.enqueue_job("slug-b", "Slug B", -100.0, -200.0)
+    assert locations.JOBS[job_id]["force_recompress"] is False
+    locations.JOBS.clear(); locations.JOB_QUEUE.clear()
+
+
+def test_do_compress_force_re_dracos_from_orig(tmp_path, monkeypatch):
+    """force_recompress=True ignores `orig_path already exists` skip;
+    re-Dracos from _orig_uncompressed/ and overwrites details/."""
+    monkeypatch.chdir(tmp_path)
+    slug = "force-x"
+    region = tmp_path / f"tiles_v2_{slug}"
+    (region / "details").mkdir(parents=True)
+    (region / "_orig_uncompressed").mkdir()
+    # Both orig and compressed exist (= location previously compressed).
+    for name in ("outer", "closeup", "inner"):
+        (region / "_orig_uncompressed" / f"{name}.glb").write_bytes(b"ORIG-" + name.encode())
+        (region / "details" / f"{name}.glb").write_bytes(b"OLD-DRACO-" + name.encode())
+
+    calls = []
+    def fake_compress(src, dst, quant_pos=16):
+        calls.append((Path(src).name, Path(dst).name, quant_pos))
+        Path(dst).write_bytes(b"NEW-DRACO-" + Path(src).read_bytes())
+
+    fake_mod = type("M", (), {"compress": staticmethod(fake_compress)})
+    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+
+    job = {"slug": slug, "force_recompress": True, "cancelled": False}
+    ok = locations._do_compress(job, region / "log.txt")
+    assert ok
+    # All three details re-compressed (not skipped).
+    assert {c[0] for c in calls} == {"outer.glb", "closeup.glb", "inner.glb"}
+    # New Draco payload written into details/.
+    for name in ("outer", "closeup", "inner"):
+        assert (region / "details" / f"{name}.glb").read_bytes() == b"NEW-DRACO-ORIG-" + name.encode()
+    # Per-LOD quant_pos passed through (outer/closeup=12, inner=14)
+    quants = {c[0]: c[2] for c in calls}
+    assert quants["outer.glb"] == 12
+    assert quants["closeup.glb"] == 12
+    assert quants["inner.glb"] == 14
+
+
+def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
+    """force_recompress with no _orig_uncompressed file should fail cleanly,
+    not destroy the existing details/<step>.glb."""
+    monkeypatch.chdir(tmp_path)
+    slug = "force-y"
+    region = tmp_path / f"tiles_v2_{slug}"
+    (region / "details").mkdir(parents=True)
+    # No _orig_uncompressed/ dir at all.
+    (region / "details" / "outer.glb").write_bytes(b"EXISTING-DRACO")
+
+    fake_mod = type("M", (), {"compress": staticmethod(lambda *a, **k: None)})
+    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+
+    job = {"slug": slug, "force_recompress": True, "cancelled": False}
+    ok = locations._do_compress(job, region / "log.txt")
+    assert ok is False
+    # details/outer.glb untouched
+    assert (region / "details" / "outer.glb").read_bytes() == b"EXISTING-DRACO"
 
 
 def test_ruian_search_kind_parcel_skips_addresses():

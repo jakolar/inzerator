@@ -326,10 +326,9 @@ document.getElementById('atmo-toggle').textContent =
 // Pipeline: rAF (latest render lands) → 2D canvas at 1× CSS pixels
 // (retina draws into a 2× × 2× backing store, but the user "sees" 1×;
 // downscaling halves linear → ¼ the pixels → ¼ the JPEG bytes), then
-// JPEG q=0.95 (top-end where compression still has meaningful gains
-// vs lossless — q=0.88 was too aggressive on photo content with smooth
-// gradients, dropped some chromatic detail). End result on a 1440-pt
-// window: ~1.5-3 MB.
+// JPEG q=0.98 (near-lossless; the rare last band where extra quality
+// is still cheaper than a PNG dump). On a 1440-pt retina-downscaled
+// window: ~3-6 MB.
 //
 // Overrides: `?png=1` lossless PNG (still downscaled), `?fullres=1`
 // keeps retina × downscale (full original resolution).
@@ -339,7 +338,7 @@ function downloadScreenshot() {
     const fullRes = params.get('fullres') === '1';
     const mime = wantPng ? 'image/png' : 'image/jpeg';
     const ext  = wantPng ? 'png' : 'jpg';
-    const quality = wantPng ? undefined : 0.95;
+    const quality = wantPng ? undefined : 0.98;
 
     const src = renderer.domElement;
     let outCanvas = src;

@@ -323,21 +323,27 @@ document.getElementById('atmo-toggle').textContent =
 // renderer.preserveDrawingBuffer is already true (recording path needs it),
 // so the canvas back-buffer is readable after composer.render() completes.
 // One animation-frame delay so the latest render is in flight, then toBlob.
+// JPEG q=0.92: 4K canvas dumps as ~3-5 MB (PNG was 30-50 MB on retina);
+// terrain ortofoto already has JPEG-lineage so q=0.92 introduces no visible
+// loss beyond what's baked in. Append ?png=1 to the URL for lossless dump.
 function downloadScreenshot() {
   requestAnimationFrame(() => {
+    const wantPng = params.get('png') === '1';
+    const mime = wantPng ? 'image/png' : 'image/jpeg';
+    const ext  = wantPng ? 'png' : 'jpg';
     renderer.domElement.toBlob((blob) => {
       if (!blob) { console.warn('toBlob returned null'); return; }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       a.href = url;
-      a.download = `${REGION}-${ts}.png`;
+      a.download = `${REGION}-${ts}.${ext}`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       // Revoke after a tick so Safari finishes the download trigger first.
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }, 'image/png');
+    }, mime, 0.92);
   });
 }
 document.getElementById('shot-btn').addEventListener('click', downloadScreenshot);

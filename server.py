@@ -2260,7 +2260,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(compressed)
 
     def _proxy_cadastre(self):
-        """Fetch ČÚZK katastrální mapa WMS as transparent PNG overlay."""
+        """Fetch ČÚZK katastrální mapa WMS as transparent PNG overlay.
+
+        Query params:
+          BBOX  — S-JTSK envelope, "xmin,ymin,xmax,ymax" (required)
+          layer — ČÚZK WMS layer name (default 'KN' = full cadastre with
+                  parcel numbers; 'DKM' = boundaries only; see WMS caps for
+                  more)
+          size  — output PNG side in px (default 2048, max 4096). Numbers
+                  start appearing at ≥ 1.5 px/m in the rendered bbox, so
+                  inner (1 km) at 2048² = 2 px/m → readable numbers; closeup
+                  (3 km) at 2048² = 0.7 px/m → numbers tiny.
+          style — line styling: thin/normal/medium/thick (dilation+blur).
+        """
         import numpy as np
         query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
 
@@ -2269,14 +2281,22 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Missing BBOX")
             return
 
+        layer = query.get("layer", ["KN"])[0]
+        if not layer.replace("_", "").replace(",", "").isalnum():
+            self.send_error(400, "Invalid layer name")
+            return
+        try:
+            size = min(4096, max(256, int(query.get("size", ["2048"])[0])))
+        except ValueError:
+            size = 2048
         style = query.get("style", ["normal"])[0]
-        # Higher resolution WMS for thicker/antialiased lines
-        wms_size = {"thin": 512, "normal": 1024, "medium": 1536, "thick": 2048}.get(style, 1024)
+        # Request WMS at the full output size — no upsampling on our side.
+        wms_size = size
 
         wms_url = (
             f"https://services.cuzk.cz/wms/wms.asp?"
             f"SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
-            f"&LAYERS=DKM&SRS=EPSG:5514&BBOX={bbox_str}"
+            f"&LAYERS={layer}&SRS=EPSG:5514&BBOX={bbox_str}"
             f"&WIDTH={wms_size}&HEIGHT={wms_size}&FORMAT=image/png&TRANSPARENT=TRUE&STYLES="
         )
 
@@ -2327,8 +2347,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             else:
                 result = Image.fromarray(arr)
 
-            # Resize to output size
-            result = result.resize((1024, 1024), Image.LANCZOS)
+            # WMS already returned at the requested `size`; no downscale.
             buf = BytesIO()
             result.save(buf, "PNG")
             data_bytes = buf.getvalue()

@@ -784,7 +784,11 @@ function setupParcelSelection(region, innerField) {
     const wxMin = cx + lxMin, wxMax = cx + lxMax;
     const wyMin = cy + lzMin, wyMax = cy + lzMax;
 
-    const url = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&style=normal`;
+    // Layer KN = full cadastre (boundaries + parcel numbers + buildings).
+    // size=2048 → ≈2 px/m on inner (1 km bbox), enough for parcel numbers
+    // to render; closeup (3 km) gets ~0.7 px/m so numbers are small but
+    // boundary precision still wins vs the old 1024² render.
+    const url = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&layer=KN&size=2048`;
     texLoader.load(url, (texture) => {
       texture.colorSpace = THREE.SRGBColorSpace;
       texture.anisotropy = _maxAniso;

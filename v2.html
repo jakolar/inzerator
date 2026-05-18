@@ -603,25 +603,44 @@ function setupParcelSelection(region, innerField) {
   const countEl = menu.querySelector('#sel-count');
   const hintEl = menu.querySelector('#sel-hint');
 
+  async function fetchParcels() {
+    hintEl.textContent = 'Načítám parcely…';
+    try {
+      const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=1500`);
+      if (!r.ok) {
+        const msg = r.status === 503
+          ? 'ČÚZK je nedostupné (server retry už proběhl).'
+          : `HTTP ${r.status}`;
+        // parcels stays null so re-toggle or "Zkusit znovu" retries.
+        hintEl.innerHTML = `${msg} <button id="sel-retry" style="font-size:11px;padding:2px 6px;margin-left:4px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer;">Zkusit znovu</button>`;
+        hintEl.querySelector('#sel-retry').onclick = fetchParcels;
+        return;
+      }
+      parcels = await r.json();
+      for (const p of parcels) parcelsByLabel.set(p.label, p);
+      hintEl.textContent = `${parcels.length} parcel načteno. Klikej.`;
+    } catch (e) {
+      hintEl.innerHTML = `Chyba: ${escapeHtmlV2(e.message)} <button id="sel-retry" style="font-size:11px;padding:2px 6px;margin-left:4px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer;">Zkusit znovu</button>`;
+      hintEl.querySelector('#sel-retry').onclick = fetchParcels;
+      parcels = null;   // explicit; allows re-toggle to retry too
+    }
+  }
+
   modeChk.addEventListener('change', async () => {
     mode = modeChk.checked;
     if (mode && !parcels) {
-      hintEl.textContent = 'Načítám parcely…';
-      try {
-        const r = await fetch(`/api/parcels?gcx=${gcx}&gcy=${gcy}&radius=1500`);
-        parcels = await r.json();
-        for (const p of parcels) parcelsByLabel.set(p.label, p);
-        hintEl.textContent = `${parcels.length} parcel načteno. Klikej.`;
-      } catch (e) {
-        hintEl.textContent = `Chyba: ${e.message}`;
-        parcels = [];
-      }
+      await fetchParcels();
     } else if (mode) {
       hintEl.textContent = `${parcels.length} parcel — klikej.`;
     } else {
       hintEl.textContent = 'Výběr vypnut.';
     }
   });
+
+  function escapeHtmlV2(s) {
+    return String(s).replace(/[&<>"']/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
 
   clearBtn.addEventListener('click', () => {
     selected.clear();

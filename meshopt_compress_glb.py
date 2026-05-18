@@ -46,12 +46,10 @@ def compress(src_path, dst_path) -> None:
     `dst_path`. Raises subprocess.CalledProcessError on encode failure.
 
     Flags:
-      -c: standard meshopt encoding (we don't use -cc; user reported
-        visible aliasing on flat features like football-pitch lines and
-        moving to the slightly less aggressive encoder removes any
-        suspicion of encoder-side rounding/reordering artefacts. Both
-        are documented as lossless for float32 attributes but -c is
-        the conservative choice; wire cost ~3.4 vs 2.6 MB per inner glb).
+      -cc: compact meshopt encoder (tighter blocks; bit-exact lossless
+        for float32 attributes). Tried -c briefly when chasing reported
+        aliasing on flat features; visual result identical so reverted
+        to -cc for the size win (-25% wire vs -c).
       -vpf: float32 positions instead of 14-bit integers — avoids the
         KHR_mesh_quantization node TRS dequantize bake on the viewer
         side (a 144 MB Float32 copy across 3 detail meshes locked low-
@@ -63,12 +61,12 @@ def compress(src_path, dst_path) -> None:
         gltfpack treats TEXCOORD_0 as dead and strips it → black mesh
         because Three.js can't sample the ortofoto texture without UVs.
 
-    Wire size (per inner.glb, brotli q=11): ~3.4 MB; ČR full inner-only
-    coverage ≈ 270 GB.
+    Wire size (per inner.glb, brotli q=11): ~2.7 MB; ČR full inner-only
+    coverage ≈ 200 GB.
     """
     src = str(Path(src_path).resolve())
     dst = str(Path(dst_path).resolve())
-    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-c", "-vpf", "-vtf", "-kv"]
+    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-cc", "-vpf", "-vtf", "-kv"]
     # Capture stderr so failures don't pollute the job log with raw gltfpack
     # noise; subprocess.CalledProcessError carries it for the caller.
     subprocess.run(

@@ -570,8 +570,13 @@ function setupParcelSelection(region, innerField) {
   // API gives absolute elevation in ring_local[2]; convert to scene Y by
   // subtracting ground_z (otherwise outlines float 200 m above ground).
   const groundZ = region.ground_z || 0;
-  const parcelsByLabel = new Map();    // label → parcel record
-  const selected = new Set();          // labels of currently selected parcels
+  // parcel.id keyed; parcel.label (RUIAN parcel number like '1457') is NOT
+  // unique inside a 1500 m radius — adjacent KÚs reuse numbers (ujezd has
+  // ≈300 collisions in 1998 rows). Using `id` avoids the wrong-parcel-on-
+  // -click bug where redrawOutlines/unionCentroid look up the last-stored
+  // duplicate instead of the parcel the user actually picked.
+  const parcelsById = new Map();
+  const selected = new Set();          // parcel.id values
   const outlineGroup = new THREE.Group();
   outlineGroup.renderOrder = 99;
   scene.add(outlineGroup);
@@ -617,7 +622,9 @@ function setupParcelSelection(region, innerField) {
         return;
       }
       parcels = await r.json();
-      for (const p of parcels) parcelsByLabel.set(p.label, p);
+      for (const p of parcels) {
+        if (p.id) parcelsById.set(p.id, p);
+      }
       hintEl.textContent = `${parcels.length} parcel načteno. Klikej.`;
     } catch (e) {
       hintEl.innerHTML = `Chyba: ${escapeHtmlV2(e.message)} <button id="sel-retry" style="font-size:11px;padding:2px 6px;margin-left:4px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer;">Zkusit znovu</button>`;
@@ -775,8 +782,8 @@ function setupParcelSelection(region, innerField) {
     // twice → drop them so the union perimeter draws cleanly.
     const edgeCount = new Map();
     const parcelRings = [];
-    for (const label of selected) {
-      const p = parcelsByLabel.get(label);
+    for (const id of selected) {
+      const p = parcelsById.get(id);
       if (!p) continue;
       const ring = p.ring_local.map(v => new THREE.Vector3(v[0], v[2] - groundZ, v[1]));
       parcelRings.push(ring);
@@ -884,8 +891,8 @@ function setupParcelSelection(region, innerField) {
       hintEl.textContent = `Tam není parcela. (XZ=${pickPoint.x.toFixed(0)},${pickPoint.z.toFixed(0)})`;
       return;
     }
-    if (selected.has(p.label)) selected.delete(p.label);
-    else selected.add(p.label);
+    if (selected.has(p.id)) selected.delete(p.id);
+    else selected.add(p.id);
     redrawOutlines();
     hintEl.textContent = `Vybráno: ${selected.size} (poslední: ${p.label}, ${p.area_m2} m²)`;
   });
@@ -898,8 +905,8 @@ function setupParcelSelection(region, innerField) {
     // Area-weighted centroid of all selected parcels (mean of ring vertices,
     // weighted by parcel area).
     let sx = 0, sz = 0, sy = 0, w = 0;
-    for (const label of selected) {
-      const p = parcelsByLabel.get(label);
+    for (const id of selected) {
+      const p = parcelsById.get(id);
       if (!p) continue;
       let cx = 0, cz = 0, cy = 0;
       // ring_local entry = [scene_x, scene_z, absolute_elevation]; convert

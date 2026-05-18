@@ -178,42 +178,27 @@ def _ruian_get(url, timeout=15):
         raise RuianUnavailable(str(e)) from e
 
 
-def _search_addresses(tokens: list[str]) -> list[dict]:
-    """Address layer (AdresniMisto, MapServer/1) search with diacritic
-    tolerance. RUIAN stores 'Fügnerova 355/16, 40502 Děčín'; user types
-    'Fugnerova 355/16 Decin'. ČÚZK ArcGIS has no fold function, so:
-      1. Narrow the server-side query to a numeric token (e.g. '355/16')
-         which is diacritic-invariant — returns ~100 candidate addresses.
-      2. Python-side ASCII-fold each candidate and require every user
-         token (also folded) to substring-match.
-    When the input has no numeric token, fall back to literal LIKE
-    (no diacritic tolerance — user needs the correct characters)."""
-    if not tokens:
-        return []
-    numeric = [t for t in tokens if _NUMERIC_TOKEN_RE.search(t)]
-    use_folded_filter = bool(numeric)
-    query_tokens = numeric if use_folded_filter else tokens
-
-    clauses = [
-        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
-        for t in query_tokens
-    ]
+def _address_query(where_clauses: list[str], record_count: int) -> list[dict]:
+    """Single AdresniMisto query helper — issue one ČÚZK call with the given
+    WHERE clauses joined by AND, return raw features list."""
     params = {
-        "where": " AND ".join(clauses),
+        "where": " AND ".join(where_clauses),
         "outFields": "adresa,psc,cislodomovni,kod",
         "outSR": "5514",
         "returnGeometry": "true",
-        # When we filter Python-side fetch broader; otherwise no filtering
-        # so 10 is plenty for the literal-LIKE path.
-        "resultRecordCount": "1000" if use_folded_filter else "10",
+        "resultRecordCount": str(record_count),
         "f": "json",
     }
     url = RUIAN_ADRESNI_MISTO_URL + "?" + urllib.parse.urlencode(params)
     data = _ruian_get(url)
+    return data.get("features", [])
 
-    folded_tokens = [_ascii_fold(t) for t in tokens] if use_folded_filter else None
+
+def _features_to_hits(features: list[dict], folded_tokens: list[str] | None) -> list[dict]:
+    """Convert ČÚZK address features → search hits, optionally fold-filtering
+    each candidate against the user's tokens. Returns at most 10."""
     out = []
-    for feat in data.get("features", []):
+    for feat in features:
         attrs = feat.get("attributes", {})
         geom = feat.get("geometry", {})
         adresa = attrs.get("adresa", "")
@@ -235,6 +220,54 @@ def _search_addresses(tokens: list[str]) -> list[dict]:
         if len(out) >= 10:
             break
     return out
+
+
+def _search_addresses(tokens: list[str]) -> list[dict]:
+    """Address layer (AdresniMisto, MapServer/1) search.
+
+    Two-phase to balance precision with diacritic tolerance:
+
+    1. **Literal LIKE on ALL tokens** server-side. Fast, exact. Works for
+       inputs where the obec / street has no diacritics or the user typed
+       them correctly ('Hilmarovo 55 Kopidlno' → 1 hit out of 95k '55'
+       candidates because 'Hilmarovo' narrows server-side).
+
+    2. **Fallback on 0 hits when a numeric token exists**: re-query with
+       only the numeric LIKE (diacritic-invariant), fetch broader (1000
+       rows), Python-fold and substring-match every token. Handles
+       'Fugnerova 355/16 Decin' where ČÚZK has 'Děčín'/'Fügnerova' with
+       diacritics — literal LIKE would miss but the broad numeric-keyed
+       fetch + fold catches them.
+
+    Pure-text queries with 0 hits just return [] — there's no fallback
+    that helps without a numeric anchor (broad fetch of every address is
+    ~5M rows, not feasible)."""
+    if not tokens:
+        return []
+
+    # Phase 1 — literal LIKE on all tokens. 10 rows is plenty when the
+    # server filter already narrows by the unique tokens.
+    literal_clauses = [
+        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
+        for t in tokens
+    ]
+    features = _address_query(literal_clauses, record_count=10)
+    hits = _features_to_hits(features, folded_tokens=None)
+    if hits:
+        return hits
+
+    # Phase 2 — diacritic-tolerant fallback. Only meaningful with a numeric
+    # anchor (otherwise we'd fetch the entire address layer).
+    numeric = [t for t in tokens if _NUMERIC_TOKEN_RE.search(t)]
+    if not numeric:
+        return []
+    broad_clauses = [
+        f"UPPER(adresa) LIKE UPPER('%{_escape_like(t)}%')"
+        for t in numeric
+    ]
+    features = _address_query(broad_clauses, record_count=1000)
+    folded_tokens = [_ascii_fold(t) for t in tokens]
+    return _features_to_hits(features, folded_tokens=folded_tokens)
 
 
 def _fetch_all_ku() -> list[tuple[int, str]]:

@@ -202,20 +202,36 @@ def test_ruian_search_escapes_quotes_in_literal_path():
 
 
 def test_ruian_search_diacritic_tolerance():
-    """User types 'Fugnerova 355/16 Decin' (no diacritics). Numeric token
-    '355/16' makes server fetch broad, Python-side ASCII-fold filter
-    must accept 'Fügnerova … 40502 Děčín' as a match."""
+    """User types 'Fugnerova 355/16 Decin' (no diacritics) — RUIAN has
+    'Fügnerova/Děčín' with diacritics. Phase 1 (literal LIKE on all
+    tokens) returns 0 (LIKE is diacritic-sensitive). Phase 2 (broad LIKE
+    on numeric token only) returns candidates which Python fold-filters."""
     fake_features = [
-        # The target — should be returned
         {"attributes": {"adresa": "Fügnerova 355/16, 40502 Děčín I-Děčín, Děčín"},
          "geometry": {"x": -750000.0, "y": -960000.0}},
-        # Same parcel-number elsewhere — should be filtered out
         {"attributes": {"adresa": "Riegrova 355/16, 25001 Brandýs nad Labem"},
          "geometry": {"x": -740000.0, "y": -1040000.0}},
     ]
-    with patch("locations.urlopen", return_value=_mock_ruian_response(fake_features)):
+    addr_calls = [0]
+
+    def fake_urlopen(req, timeout=None):
+        url = req.get_full_url() if hasattr(req, "get_full_url") else req
+        # Parcel/KÚ layers: empty (no parcel candidates / no KÚ match).
+        if "MapServer/0" in url or "MapServer/7" in url:
+            return _mock_ruian_response([])
+        # Address layer (MapServer/1): phase 1 (multi-token literal LIKE)
+        # returns empty (server LIKE is diacritic-sensitive); phase 2 (broad
+        # numeric LIKE) returns the candidates for Python fold-filter.
+        if "MapServer/1" in url:
+            addr_calls[0] += 1
+            if addr_calls[0] == 1:
+                return _mock_ruian_response([])
+            return _mock_ruian_response(fake_features)
+        return _mock_ruian_response([])
+
+    with patch("locations.urlopen", side_effect=fake_urlopen):
         result = locations.ruian_search("Fugnerova 355/16 Decin")
-    # Only the Děčín hit survives ASCII-fold filter (Fugnerova + 355/16 + Decin)
+
     addresses = [h for h in result if h["kind"] == "address"]
     assert len(addresses) == 1
     assert addresses[0]["label"] == "Fügnerova 355/16, 40502 Děčín I-Děčín, Děčín"

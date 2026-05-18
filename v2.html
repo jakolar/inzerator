@@ -744,74 +744,129 @@ function setupParcelSelection(region, innerField) {
   const countEl = menu.querySelector('#sel-count');
   const hintEl = menu.querySelector('#sel-hint');
 
-  // Cadastre overlay — all-parcel outline drawn as one LineSegments batch.
-  // Separate from the selection outline (different group, different material,
-  // different renderOrder, no bloom).
-  const cadastreGroup = new THREE.Group();
-  cadastreGroup.visible = false;
-  cadastreGroup.renderOrder = 98;
-  scene.add(cadastreGroup);
-  let cadastreBuilt = false;
+  // Cadastre overlay — raster from ČÚZK DKM WMS via /proxy/cadastre, applied
+  // as a separate mesh per detail. Sits directly on the terrain surface
+  // (same vertex positions as detail mesh, walls filtered out so the line
+  // texture doesn't smear vertically). Replaces the older LineSegments
+  // vector approach which had to LIFT 2.5 m to dodge depth precision.
+  const cadastreMeshes = [];
+  let cadastreLoading = false;
 
-  function buildCadastre() {
-    if (cadastreBuilt || !parcels) return;
-    const LIFT = 2.5;
-    const SUB_M = 2.0;
-    const positions = [];
-    for (const p of parcels) {
-      if (!p.ring_local || p.ring_local.length < 3) continue;
-      const ring = p.ring_local;
-      for (let i = 0; i < ring.length; i++) {
-        const a = ring[i], b = ring[(i + 1) % ring.length];
-        const dx = b[0] - a[0], dz = b[1] - a[1];
-        const segLen = Math.hypot(dx, dz);
-        const sub = Math.max(1, Math.ceil(segLen / SUB_M));
-        let prevX = null, prevY = null, prevZ = null;
-        for (let k = 0; k <= sub; k++) {
-          const t = k / sub;
-          const wx = a[0] + dx * t;
-          const wz = a[1] + dz * t;
-          const sampled = sampleInnerY(wx, wz);
-          // Outside inner footprint → linear-interp ring abs Y, minus groundZ.
-          const fallbackY = (a[2] + (b[2] - a[2]) * t) - groundZ;
-          const y = (sampled !== null ? sampled : fallbackY) + LIFT;
-          if (prevX !== null) {
-            positions.push(prevX, prevY, prevZ, wx, y, wz);
-          }
-          prevX = wx; prevY = y; prevZ = wz;
-        }
-      }
+  function clearCadastre() {
+    for (const m of cadastreMeshes) {
+      scene.remove(m);
+      m.geometry.dispose();
+      if (m.material.map) m.material.map.dispose();
+      m.material.dispose();
     }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    // Orange-yellow line, depth-test on so buildings occlude, depth-write off
-    // so the cadastre doesn't bury anything drawn after it. No polygonOffset
-    // (LineBasicMaterial doesn't honour it for line primitives) — the 2.5 m
-    // LIFT keeps it clear of depth-precision noise against terrain at typical
-    // viewer distance.
-    const mat = new THREE.LineBasicMaterial({
-      color: 0xffaa33,
-      transparent: true, opacity: 0.75,
-      depthTest: true, depthWrite: false,
-      toneMapped: true,
-    });
-    const lines = new THREE.LineSegments(geo, mat);
-    lines.renderOrder = 98;
-    cadastreGroup.add(lines);
-    cadastreBuilt = true;
-    console.info(`[v2] cadastre overlay: ${parcels.length} parcels, ${positions.length / 6} segments`);
+    cadastreMeshes.length = 0;
   }
 
-  cadChk.addEventListener('change', async () => {
-    if (cadChk.checked) {
-      if (!parcels) {
-        hintEl.textContent = 'Načítám parcely pro katastr…';
-        await fetchParcels();
+  function buildCadastreForMesh(detailMesh) {
+    const meta = detailMesh.userData && detailMesh.userData.meta;
+    if (!meta || !meta.center_sjtsk) return;
+    const geo = detailMesh.geometry;
+    const pos = geo.attributes.position.array;
+    const origIdx = geo.index ? geo.index.array : null;
+    if (!origIdx) return;
+
+    // Actual vertex extent in local coords (handles Draco quant jitter and
+    // skirt verts equally — we use the full envelope).
+    let lxMin = Infinity, lxMax = -Infinity, lzMin = Infinity, lzMax = -Infinity;
+    for (let i = 0; i < pos.length; i += 3) {
+      const lx = pos[i], lz = pos[i + 2];
+      if (lx < lxMin) lxMin = lx; if (lx > lxMax) lxMax = lx;
+      if (lz < lzMin) lzMin = lz; if (lz > lzMax) lzMax = lz;
+    }
+    // gen_detail / gen_panorama convention: world_y_sjtsk = cy + local_z
+    // (different from gen_multitile's flip). bbox for WMS in S-JTSK:
+    const cx = meta.center_sjtsk[0], cy = meta.center_sjtsk[1];
+    const wxMin = cx + lxMin, wxMax = cx + lxMax;
+    const wyMin = cy + lzMin, wyMax = cy + lzMax;
+
+    const url = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&style=normal`;
+    texLoader.load(url, (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = _maxAniso;
+
+      // Filter near-vertical faces (building walls in SM5) — texturing them
+      // with cadastre lines smears the pixels into vertical stripes.
+      const keepFaces = [];
+      for (let f = 0; f < origIdx.length; f += 3) {
+        const a = origIdx[f], b = origIdx[f + 1], c = origIdx[f + 2];
+        const ax = pos[a*3], ay = pos[a*3+1], az = pos[a*3+2];
+        const bx = pos[b*3], by = pos[b*3+1], bz = pos[b*3+2];
+        const fx = pos[c*3], fy = pos[c*3+1], fz = pos[c*3+2];
+        const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+        const e2x = fx-ax, e2y = fy-ay, e2z = fz-az;
+        const nx = e1y*e2z - e1z*e2y;
+        const ny = e1z*e2x - e1x*e2z;
+        const nz = e1x*e2y - e1y*e2x;
+        const nlen = Math.sqrt(nx*nx + ny*ny + nz*nz);
+        if (nlen < 1e-6) continue;
+        if (Math.abs(ny) / nlen > 0.5) keepFaces.push(a, b, c);
       }
-      if (parcels) buildCadastre();
-      cadastreGroup.visible = true;
+
+      // UV: linear over local-space bbox (mesh.scale.z=-1 flips the v sign
+      // so the WMS image, which has origin top-left = max y in S-JTSK, lines
+      // up. lzMin in local corresponds to the SOUTH edge after scale=-1 →
+      // top of the image in scene render).
+      const lxRange = lxMax - lxMin, lzRange = lzMax - lzMin;
+      const uvs = new Float32Array(pos.length / 3 * 2);
+      for (let i = 0; i < pos.length; i += 3) {
+        uvs[(i/3)*2]     = (pos[i] - lxMin) / lxRange;
+        uvs[(i/3)*2 + 1] = (pos[i+2] - lzMin) / lzRange;
+      }
+      const cadGeo = new THREE.BufferGeometry();
+      cadGeo.setAttribute('position', geo.attributes.position.clone());
+      cadGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      cadGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(keepFaces), 1));
+
+      const cadMat = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        alphaTest: 0.3,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -160,   // dominates inner's -96 → never z-fights
+      });
+      const cadMesh = new THREE.Mesh(cadGeo, cadMat);
+      cadMesh.position.copy(detailMesh.position);
+      cadMesh.scale.copy(detailMesh.scale);
+      cadMesh.renderOrder = 100;
+      cadMesh.frustumCulled = false;
+      scene.add(cadMesh);
+      cadastreMeshes.push(cadMesh);
+    }, undefined, (err) => {
+      console.warn(`[cadastre] WMS fetch failed for ${meta.slug}:`, err);
+    });
+  }
+
+  async function reloadCadastre() {
+    if (cadastreLoading) return;
+    cadastreLoading = true;
+    clearCadastre();
+    // Apply to closeup + inner only — outer is 5×5 km square so the WMS
+    // texture would be ~5 m/texel after the proxy's 1024² resize, blurry
+    // cadastre lines invisible at that scale. closeup (3 km) and inner
+    // (1 km) give readable lines.
+    for (const m of allMeshes) {
+      const meta = m.userData && m.userData.meta;
+      if (!meta || (meta.slug !== 'closeup' && meta.slug !== 'inner')) continue;
+      buildCadastreForMesh(m);
+    }
+    cadastreLoading = false;
+  }
+
+  cadChk.addEventListener('change', () => {
+    if (cadChk.checked) {
+      hintEl.textContent = 'Načítám katastrální mapu z ČÚZK WMS…';
+      reloadCadastre();
     } else {
-      cadastreGroup.visible = false;
+      clearCadastre();
+      hintEl.textContent = mode ? `${parcels ? parcels.length : 0} parcel — klikej.` : 'Výběr vypnut.';
     }
   });
 

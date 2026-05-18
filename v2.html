@@ -90,6 +90,7 @@ let _hdrTex = null;
 let _panoramaMesh = null;
 let _panoramaLoadPromise = null;
 let _v2Region = null;   // set inside loadV2 after manifest fetch
+let _v2Details = null;  // manifest.details — used to carve panorama clipbox
 
 const scene = new THREE.Scene();
 // Flat sky-color background — visible whenever ATMOSPHERE is off (no HDR
@@ -256,6 +257,40 @@ async function _ensurePanoramaLoaded() {
       let m = gltf.scene.children[0];
       if (m && !m.isMesh && m.children[0]) m = m.children[0];
       const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+      // Clip-out the outermost-detail XZ bbox so panorama (DMR5G ground-only,
+      // coarser) doesn't punch UP through SM5-derived building roofs / cliffs
+      // inside the detail rings. Same shader-discard pattern the detail stack
+      // uses on its smaller children. clipBox in scene XZ, computed from the
+      // detail with the largest half (= "outer" in the standard pipeline).
+      const biggestDetail = _v2Details && _v2Details.length
+        ? _v2Details.reduce((a, b) => b.half > a.half ? b : a)
+        : null;
+      if (biggestDetail) {
+        const sxc = biggestDetail.center_sjtsk[0] - _v2Region.center_sjtsk[0];
+        const szc = -(biggestDetail.center_sjtsk[1] - _v2Region.center_sjtsk[1]);
+        const clipBox = new THREE.Vector4(
+          sxc - biggestDetail.half, szc - biggestDetail.half,
+          sxc + biggestDetail.half, szc + biggestDetail.half,
+        );
+        mat.userData.uClipBox = clipBox;
+        mat.onBeforeCompile = (shader) => {
+          shader.uniforms.uClipBox = { value: clipBox };
+          shader.vertexShader = shader.vertexShader.replace(
+            '#include <common>',
+            '#include <common>\nvarying vec3 vWorldPos_clip;',
+          ).replace(
+            '#include <worldpos_vertex>',
+            '#include <worldpos_vertex>\nvWorldPos_clip = worldPosition.xyz;',
+          );
+          shader.fragmentShader = shader.fragmentShader.replace(
+            '#include <common>',
+            '#include <common>\nuniform vec4 uClipBox;\nvarying vec3 vWorldPos_clip;',
+          ).replace(
+            'void main() {',
+            'void main() {\n  if (vWorldPos_clip.x > uClipBox.x && vWorldPos_clip.x < uClipBox.z && vWorldPos_clip.z > uClipBox.y && vWorldPos_clip.z < uClipBox.w) discard;',
+          );
+        };
+      }
       const mesh = new THREE.Mesh(m.geometry, mat);
       mesh.renderOrder = 0;
       // Flip Z so scene +Z renders as world -Y (south). Matches the detail
@@ -444,6 +479,7 @@ async function loadV2() {
   // --- Panorama: lazy load via _ensurePanoramaLoaded; await only when ----
   // ATMOSPHERE is initially on, so details still render promptly when off.
   _v2Region = region;
+  _v2Details = details;
   if (ATMOSPHERE) {
     await setAtmosphere(true);
   }

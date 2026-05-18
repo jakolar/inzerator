@@ -322,16 +322,37 @@ document.getElementById('atmo-toggle').textContent =
 // ─── Screenshot ──────────────────────────────────────────────────────────
 // renderer.preserveDrawingBuffer is already true (recording path needs it),
 // so the canvas back-buffer is readable after composer.render() completes.
-// One animation-frame delay so the latest render is in flight, then toBlob.
-// JPEG q=0.92: 4K canvas dumps as ~3-5 MB (PNG was 30-50 MB on retina);
-// terrain ortofoto already has JPEG-lineage so q=0.92 introduces no visible
-// loss beyond what's baked in. Append ?png=1 to the URL for lossless dump.
+//
+// Pipeline: rAF (latest render lands) → 2D canvas at 1× CSS pixels
+// (retina draws into a 2× × 2× backing store, but the user "sees" 1×;
+// downscaling halves linear → ¼ the pixels → ¼ the JPEG bytes), then
+// JPEG q=0.88. End result on a 1440-pt window: ~1.5-3 MB instead of the
+// 20+ MB raw canvas dump.
+//
+// Overrides: `?png=1` for a lossless PNG (still downscaled), `?fullres=1`
+// to skip the downscale (full retina, useful for marketing-print exports).
 function downloadScreenshot() {
   requestAnimationFrame(() => {
     const wantPng = params.get('png') === '1';
+    const fullRes = params.get('fullres') === '1';
     const mime = wantPng ? 'image/png' : 'image/jpeg';
     const ext  = wantPng ? 'png' : 'jpg';
-    renderer.domElement.toBlob((blob) => {
+    const quality = wantPng ? undefined : 0.88;
+
+    const src = renderer.domElement;
+    let outCanvas = src;
+    if (!fullRes && window.devicePixelRatio > 1) {
+      const w = Math.round(src.width / window.devicePixelRatio);
+      const h = Math.round(src.height / window.devicePixelRatio);
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
+      const ctx = tmp.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(src, 0, 0, w, h);
+      outCanvas = tmp;
+    }
+
+    outCanvas.toBlob((blob) => {
       if (!blob) { console.warn('toBlob returned null'); return; }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -341,9 +362,8 @@ function downloadScreenshot() {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      // Revoke after a tick so Safari finishes the download trigger first.
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }, mime, 0.92);
+    }, mime, quality);
   });
 }
 document.getElementById('shot-btn').addEventListener('click', downloadScreenshot);

@@ -239,6 +239,33 @@ const ktx2Loader = new KTX2Loader()
   .detectSupport(renderer);
 const texLoader = new THREE.TextureLoader();
 
+// Bake the KHR_mesh_quantization node TRS into the geometry's position
+// attribute so downstream code (which builds fresh Mesh objects from
+// m.geometry without copying the node transform) sees world-space floats.
+// Without this the positions stay as Uint16 0..16383 and render at the
+// origin, OR after a naive applyMatrix4 the negative world coords clamp
+// back to 0 (Uint16 array can't hold negatives → black smear).
+function _bakeQuantMatrix(mesh) {
+  mesh.updateMatrixWorld(true);
+  const pos = mesh.geometry.attributes.position;
+  if (!(pos.array instanceof Float32Array)) {
+    // Promote to Float32 so applyMatrix4 can write negative/world-scale
+    // values without clamping. Memory cost: 4M verts × 12 bytes = 48 MB
+    // per inner mesh — same as Draco decode emitted, no regression.
+    const f32 = new Float32Array(pos.array.length);
+    for (let i = 0; i < pos.array.length; i++) f32[i] = pos.array[i];
+    mesh.geometry.setAttribute('position', new THREE.BufferAttribute(f32, 3));
+  }
+  mesh.geometry.applyMatrix4(mesh.matrixWorld);
+  // Reset the node transform so wrapping nodes can layer their own
+  // position/scale on top without double-applying the quant unmap.
+  mesh.matrix.identity();
+  mesh.position.set(0, 0, 0);
+  mesh.scale.set(1, 1, 1);
+  mesh.quaternion.identity();
+  mesh.matrixWorld.identity();
+}
+
 // ─── Atmosphere toggle: HDR sky + fog + panorama mesh ─────────────────────
 // Lazy-loads on first turn-on, then just toggles visibility on subsequent
 // clicks. _v2Region is set inside loadV2() once the manifest is parsed.
@@ -265,12 +292,16 @@ async function _ensurePanoramaLoaded() {
       let m = gltf.scene.children[0];
       if (m && !m.isMesh && m.children[0]) m = m.children[0];
       // Meshopt GLBs use KHR_mesh_quantization: positions are stored as
-      // unsigned 16-bit ints in [0..65535] and the glTF node matrix
-      // dequantizes them to world coords. The downstream code constructs
-      // fresh Mesh objects from m.geometry without that matrix, so we
-      // bake it into the position attribute here (one-time cost).
-      gltf.scene.updateMatrixWorld(true);
-      m.geometry.applyMatrix4(m.matrixWorld);
+      // unsigned 16-bit ints (0..16383 with gltfpack -cc) and the glTF
+      // node TRS dequantises to world coords. We construct fresh Mesh
+      // objects from m.geometry below, so the node matrix must be baked
+      // into the position attribute here.
+      //
+      // CRUCIAL: convert the position attribute to Float32 FIRST. Three.js
+      // applyMatrix4 writes back into the same typed array; Uint16 cannot
+      // hold the negative world coords (X/Z range -500..+500) → all values
+      // underflow to 0, producing a black-smear at the origin.
+      _bakeQuantMatrix(m);
       const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
       // Clip-out the outermost-detail XZ bbox so panorama (DMR5G ground-only,
       // coarser) doesn't punch UP through SM5-derived building roofs / cliffs
@@ -506,12 +537,7 @@ async function loadV2() {
       gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?${BUST}`, (gltf) => {
         let m = gltf.scene.children[0];
         if (m && !m.isMesh && m.children[0]) m = m.children[0];
-        // Meshopt + KHR_mesh_quantization stores positions as ushort 0..65535
-        // with the node matrix dequantising to world. We construct a fresh
-        // Mesh from m.geometry below, so the node matrix must be baked into
-        // the position attribute here (cheap, one-time per load).
-        gltf.scene.updateMatrixWorld(true);
-        m.geometry.applyMatrix4(m.matrixWorld);
+        _bakeQuantMatrix(m);
         const mat = new THREE.MeshBasicMaterial({
           side: THREE.DoubleSide,
           // Cross-LOD wins via `polygonOffset` per renderOrder step.

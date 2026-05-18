@@ -827,14 +827,14 @@ function setupParcelSelection(region, innerField) {
   // ── Left-click in selection mode → toggle parcel ──
   // Picking uses ray-plane intersection (O(1)) instead of raycasting through
   // the 14M-tri LOD stack — earlier raycast froze the tab for tens of
-  // seconds. Two-pass refinement converges on the parcel's actual ground
-  // elevation in scene coords:
-  //   1) intersect a plane at the typical village ground Y (≈0 in scene
-  //      coords, since `region.ground_z` is set so the village floor
-  //      lands near scene Y=0)
-  //   2) look up which parcel contains the first hit's XZ; if found,
-  //      re-intersect at THAT parcel's actual mean ground Y so the
-  //      lateral offset from oblique camera angles is correct
+  // seconds. Three-phase refinement:
+  //   1) seed-plane = controls.target.y (post-retarget = inner-mesh centroid)
+  //   2) up to 4 iterations: sample inner heightfield Y at the current pick
+  //      XZ, re-intersect at THAT Y. Converges to the actual ground Y under
+  //      the cursor — fixes the "ground_z mismatch" pick error on regions
+  //      where village-floor scene Y ≠ centroid (Ujezd 384→418, Kryry, etc.).
+  //   3) parcel-aware final refinement: re-intersect at the picked parcel's
+  //      own mean Y so a tall building's pick doesn't latch onto a neighbour.
   const raycaster = new THREE.Raycaster();
   const mouse = new THREE.Vector2();
   const pickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -849,21 +849,30 @@ function setupParcelSelection(region, innerField) {
     for (const v of ring) sum += v[2] - groundZ;
     return sum / ring.length;
   }
+  function refinePlaneToHeightfield(seedY) {
+    if (!intersectAtY(seedY)) return false;
+    if (!innerField) return true;   // best-effort without heightfield
+    let planeY = seedY;
+    for (let it = 0; it < 4; it++) {
+      const fieldY = sampleInnerY(pickPoint.x, pickPoint.z);
+      if (fieldY === null) return true;   // outside inner mesh footprint
+      if (Math.abs(fieldY - planeY) < 0.5) return true;   // converged
+      planeY = fieldY;
+      if (!intersectAtY(planeY)) return false;
+    }
+    return true;
+  }
   renderer.domElement.addEventListener('click', (e) => {
     if (!mode || !parcels) return;
     const rect = renderer.domElement.getBoundingClientRect();
     mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
-    // Pass 1 — pick at village-floor altitude. Use controls.target.y as the
-    // best estimate (post-load re-target above sets it to the inner mesh
-    // centroid Y, which is the village's actual elevation in scene units).
-    // Falling back to 0 only if no re-target happened (Hnojice case).
-    if (!intersectAtY(controls.target.y || 0)) return;
+    // Pass 1 + 2 — converge plane Y to the heightfield Y under the cursor.
+    if (!refinePlaneToHeightfield(controls.target.y || 0)) return;
     let p = pickParcelAt(pickPoint.x, pickPoint.z);
     if (p) {
-      // Pass 2 — refine to the parcel's own mean ground Y, then re-test
-      // (a tall building click might otherwise pick a neighbour parcel).
+      // Pass 3 — re-intersect at the parcel's own mean Y, then re-test.
       const refinedY = meanSceneY(p.ring_local);
       if (intersectAtY(refinedY)) {
         const p2 = pickParcelAt(pickPoint.x, pickPoint.z);
@@ -871,7 +880,8 @@ function setupParcelSelection(region, innerField) {
       }
     }
     if (!p) {
-      hintEl.textContent = 'Tam není parcela.';
+      console.info(`[parcel-pick] no parcel at scene XZ=(${pickPoint.x.toFixed(1)}, ${pickPoint.z.toFixed(1)}); planeY=${pickPlane.constant.toFixed(1)}; target.y=${controls.target.y.toFixed(1)}`);
+      hintEl.textContent = `Tam není parcela. (XZ=${pickPoint.x.toFixed(0)},${pickPoint.z.toFixed(0)})`;
       return;
     }
     if (selected.has(p.label)) selected.delete(p.label);

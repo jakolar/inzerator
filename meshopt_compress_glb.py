@@ -42,14 +42,22 @@ def _find_gltfpack() -> list[str]:
 
 
 def compress(src_path, dst_path) -> None:
-    """Run gltfpack -cc on `src_path`, writing meshopt-compressed GLB to
+    """Run gltfpack on `src_path`, writing meshopt-compressed GLB to
     `dst_path`. Raises subprocess.CalledProcessError on encode failure.
 
-    `-cc` is the "compact" mode (slightly slower encode for tighter blocks).
-    Default quantization stays at 16-bit positions, 12-bit texcoords."""
+    Flags:
+      -cc: compact mode (slightly slower encode for tighter blocks)
+      -vpf: float32 positions instead of 14-bit integers — avoids the
+        KHR_mesh_quantization node TRS dequantize round-trip on the
+        viewer side (Three.js's bake required a 144 MB Float32 copy
+        across 3 detail meshes on main thread + GPU upload, which
+        bricked low-spec Macs during initial load). Trade: 2.0 → 2.5 MB
+        per inner glb on the wire after brotli q=11 (+25%), but viewer
+        renders the geometry directly without any transform bake.
+    """
     src = str(Path(src_path).resolve())
     dst = str(Path(dst_path).resolve())
-    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-cc"]
+    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-cc", "-vpf"]
     # Capture stderr so failures don't pollute the job log with raw gltfpack
     # noise; subprocess.CalledProcessError carries it for the caller.
     subprocess.run(

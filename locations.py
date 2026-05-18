@@ -716,7 +716,7 @@ def cancel_job(job_id: str) -> bool:
 # Inner step 0.5 m kvůli zarovnání s gen_multitile village_flat profilem.
 _LOD_PRESET = {
     "outer":   {"half": 2500, "step": "2.5", "fade": 100, "fade_to": "panorama", "zoom": 17, "size": 4096},
-    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 8192},
+    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 4096},
     "inner":   {"half":  500, "step": "0.5", "fade":  30, "fade_to": "closeup",  "zoom": 21, "size": 8192},
 }
 

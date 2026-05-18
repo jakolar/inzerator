@@ -463,7 +463,13 @@ async function loadV2() {
         const bb = detail.sjtsk_bbox;
         const wb = detail.wgs_bbox;
         const zoom = detail.zoom || 19;
-        const size = detail.size || 4096;
+        // Closeup ring covers a 3×3 km square at ~1.5 m mesh step; at 4096²
+        // texels that's ~0.73 m/texel, finer than the mesh resolution so
+        // 8192² (manifest default in older regions) adds no visible detail
+        // but ~4× wire bytes. Cap client-side; new regions also generated
+        // at 4096 via locations._LOD_PRESET.
+        const rawSize = detail.size || 4096;
+        const size = detail.slug === 'closeup' ? Math.min(rawSize, 4096) : rawSize;
         // Per-detail texture format:
         //   'inner'   → PNG (lossless; the village core under heaviest zoom
         //               sees zero JPEG/Basis artefacts — large file but the

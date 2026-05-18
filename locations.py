@@ -628,7 +628,19 @@ def _do_compress(job: dict, log_path: Path) -> bool:
                 f"({100 * size_after // size_before}% of original)")
         except Exception as e:
             log(f"FAIL: {slug} — Draco compress: {e}")
-            # Restore the uncompressed file so retry doesn't see a hole.
+            if force:
+                # In force mode the orig file in _orig_uncompressed/ is the
+                # ONLY lossless copy; the (partially-written, possibly
+                # corrupt) compressed_path still sits in details/. Don't
+                # rename — that would move the orig OUT of _orig_uncompressed/
+                # and a future Recompress would hit "no orig" and fail
+                # permanently. Leaving compressed_path as-is means the viewer
+                # might load a corrupt glb until the next Recompress; that's
+                # recoverable, data loss isn't.
+                return False
+            # Non-force: orig_path is the source we moved aside from
+            # compressed_path. Rename it back so retry doesn't see a hole
+            # where the .glb should be.
             try:
                 orig_path.rename(compressed_path)
             except OSError:

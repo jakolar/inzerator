@@ -381,6 +381,33 @@ def test_do_compress_force_re_dracos_from_orig(tmp_path, monkeypatch):
     assert quants["inner.glb"] == 14
 
 
+def test_do_compress_force_encode_crash_keeps_orig(tmp_path, monkeypatch):
+    """force_recompress: Draco encode raises. The except path must NOT
+    rename `_orig_uncompressed/<slug>.glb` away (it's the only lossless
+    copy), so a future Recompress can still re-Draco from it."""
+    monkeypatch.chdir(tmp_path)
+    slug = "force-crash"
+    region = tmp_path / f"tiles_v2_{slug}"
+    (region / "details").mkdir(parents=True)
+    (region / "_orig_uncompressed").mkdir()
+    (region / "_orig_uncompressed" / "outer.glb").write_bytes(b"LOSSLESS-ORIG")
+    (region / "details" / "outer.glb").write_bytes(b"OLD-DRACO")
+
+    def crashing_compress(src, dst, quant_pos=16):
+        raise RuntimeError("simulated draco encode crash")
+    fake_mod = type("M", (), {"compress": staticmethod(crashing_compress)})
+    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+
+    job = {"slug": slug, "force_recompress": True, "cancelled": False}
+    ok = locations._do_compress(job, region / "log.txt")
+    assert ok is False
+    # The lossless original MUST still be in _orig_uncompressed/ — otherwise
+    # the next Recompress hits the "no orig to re-Draco from" guard and the
+    # data is permanently unrecoverable without manual file rescue.
+    assert (region / "_orig_uncompressed" / "outer.glb").exists()
+    assert (region / "_orig_uncompressed" / "outer.glb").read_bytes() == b"LOSSLESS-ORIG"
+
+
 def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
     """force_recompress with no _orig_uncompressed file should fail cleanly,
     not destroy the existing details/<step>.glb."""

@@ -359,44 +359,40 @@ def test_do_compress_force_re_dracos_from_orig(tmp_path, monkeypatch):
         (region / "details" / f"{name}.glb").write_bytes(b"OLD-DRACO-" + name.encode())
 
     calls = []
-    def fake_compress(src, dst, quant_pos=16):
-        calls.append((Path(src).name, Path(dst).name, quant_pos))
-        Path(dst).write_bytes(b"NEW-DRACO-" + Path(src).read_bytes())
+    def fake_compress(src, dst):
+        # meshopt has no per-LOD knob — single signature, no quant_pos
+        calls.append((Path(src).name, Path(dst).name))
+        Path(dst).write_bytes(b"NEW-MESHOPT-" + Path(src).read_bytes())
 
     fake_mod = type("M", (), {"compress": staticmethod(fake_compress)})
-    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+    monkeypatch.setitem(__import__("sys").modules, "meshopt_compress_glb", fake_mod)
 
     job = {"slug": slug, "force_recompress": True, "cancelled": False}
     ok = locations._do_compress(job, region / "log.txt")
     assert ok
     # All three details re-compressed (not skipped).
     assert {c[0] for c in calls} == {"outer.glb", "closeup.glb", "inner.glb"}
-    # New Draco payload written into details/.
+    # New Meshopt payload written into details/.
     for name in ("outer", "closeup", "inner"):
-        assert (region / "details" / f"{name}.glb").read_bytes() == b"NEW-DRACO-ORIG-" + name.encode()
-    # Per-LOD quant_pos passed through (outer/closeup=12, inner=14)
-    quants = {c[0]: c[2] for c in calls}
-    assert quants["outer.glb"] == 12
-    assert quants["closeup.glb"] == 12
-    assert quants["inner.glb"] == 14
+        assert (region / "details" / f"{name}.glb").read_bytes() == b"NEW-MESHOPT-ORIG-" + name.encode()
 
 
 def test_do_compress_force_encode_crash_keeps_orig(tmp_path, monkeypatch):
-    """force_recompress: Draco encode raises. The except path must NOT
+    """force_recompress: meshopt encode raises. The except path must NOT
     rename `_orig_uncompressed/<slug>.glb` away (it's the only lossless
-    copy), so a future Recompress can still re-Draco from it."""
+    copy), so a future Recompress can still re-compress from it."""
     monkeypatch.chdir(tmp_path)
     slug = "force-crash"
     region = tmp_path / f"tiles_v2_{slug}"
     (region / "details").mkdir(parents=True)
     (region / "_orig_uncompressed").mkdir()
     (region / "_orig_uncompressed" / "outer.glb").write_bytes(b"LOSSLESS-ORIG")
-    (region / "details" / "outer.glb").write_bytes(b"OLD-DRACO")
+    (region / "details" / "outer.glb").write_bytes(b"OLD-MESHOPT")
 
-    def crashing_compress(src, dst, quant_pos=16):
-        raise RuntimeError("simulated draco encode crash")
+    def crashing_compress(src, dst):
+        raise RuntimeError("simulated meshopt encode crash")
     fake_mod = type("M", (), {"compress": staticmethod(crashing_compress)})
-    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+    monkeypatch.setitem(__import__("sys").modules, "meshopt_compress_glb", fake_mod)
 
     job = {"slug": slug, "force_recompress": True, "cancelled": False}
     ok = locations._do_compress(job, region / "log.txt")
@@ -419,7 +415,7 @@ def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
     (region / "details" / "outer.glb").write_bytes(b"EXISTING-DRACO")
 
     fake_mod = type("M", (), {"compress": staticmethod(lambda *a, **k: None)})
-    monkeypatch.setitem(__import__("sys").modules, "draco_compress_glb", fake_mod)
+    monkeypatch.setitem(__import__("sys").modules, "meshopt_compress_glb", fake_mod)
 
     job = {"slug": slug, "force_recompress": True, "cancelled": False}
     ok = locations._do_compress(job, region / "log.txt")

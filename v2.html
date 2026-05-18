@@ -47,7 +47,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -225,15 +225,13 @@ tick();
 // ─── Load manifest + panorama + detail meshes ────────────────────────────
 const status = document.getElementById('status');
 const allMeshes = [];
-// Draco compression — GLBs are ~98% smaller on disk and on the wire
-// (panorama 14MB → 0.3MB, outer 165MB → 4MB). Decoder WASM is loaded once
-// from jsDelivr (bundled three.js build matches gltf-pipeline / DracoPy 2.x;
-// gstatic's older path can lag the format Draco-encoded GLBs emit).
-const dracoLoader = new DRACOLoader();
-dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
-dracoLoader.setDecoderConfig({ type: 'wasm' });
+// Mesh compression — pipeline writes meshopt (gltfpack -cc) GLBs with
+// EXT_meshopt_compression + KHR_mesh_quantization. After brotli q=11 on
+// the wire, inner.glb is ~2 MB (was ~20 MB with Draco). Decoder is a
+// ~50 KB WASM module loaded on demand. GLTFLoader awaits MeshoptDecoder.ready
+// internally; safe to set even before the WASM has finished initialising.
 const gltfLoader = new GLTFLoader();
-gltfLoader.setDRACOLoader(dracoLoader);
+gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 // KTX2 (Basis Universal) GPU-compressed textures — ~50% smaller than JPEG
 // on the wire, ~4× smaller in VRAM. Transcoder is loaded once from CDN.
 const ktx2Loader = new KTX2Loader()
@@ -266,6 +264,13 @@ async function _ensurePanoramaLoaded() {
       });
       let m = gltf.scene.children[0];
       if (m && !m.isMesh && m.children[0]) m = m.children[0];
+      // Meshopt GLBs use KHR_mesh_quantization: positions are stored as
+      // unsigned 16-bit ints in [0..65535] and the glTF node matrix
+      // dequantizes them to world coords. The downstream code constructs
+      // fresh Mesh objects from m.geometry without that matrix, so we
+      // bake it into the position attribute here (one-time cost).
+      gltf.scene.updateMatrixWorld(true);
+      m.geometry.applyMatrix4(m.matrixWorld);
       const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
       // Clip-out the outermost-detail XZ bbox so panorama (DMR5G ground-only,
       // coarser) doesn't punch UP through SM5-derived building roofs / cliffs
@@ -501,6 +506,12 @@ async function loadV2() {
       gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?${BUST}`, (gltf) => {
         let m = gltf.scene.children[0];
         if (m && !m.isMesh && m.children[0]) m = m.children[0];
+        // Meshopt + KHR_mesh_quantization stores positions as ushort 0..65535
+        // with the node matrix dequantising to world. We construct a fresh
+        // Mesh from m.geometry below, so the node matrix must be baked into
+        // the position attribute here (cheap, one-time per load).
+        gltf.scene.updateMatrixWorld(true);
+        m.geometry.applyMatrix4(m.matrixWorld);
         const mat = new THREE.MeshBasicMaterial({
           side: THREE.DoubleSide,
           // Cross-LOD wins via `polygonOffset` per renderOrder step.

@@ -566,11 +566,15 @@ def _do_compress(job: dict, log_path: Path) -> bool:
         except OSError:
             pass
 
-    # Lazy import — keeps test environments without DracoPy importable.
+    # Lazy import — keeps test environments without the compressor module
+    # importable. We switched from Draco (custom DracoPy wrapper) to
+    # meshopt (gltfpack subprocess) for 10× smaller wire bytes under brotli
+    # AND faster decode. Module name kept stable so existing tests that
+    # monkeypatch sys.modules["meshopt_compress_glb"] keep working.
     try:
-        import draco_compress_glb
+        import meshopt_compress_glb
     except ImportError as e:
-        log(f"FAIL: draco_compress_glb import failed: {e}")
+        log(f"FAIL: meshopt_compress_glb import failed: {e}")
         return False
 
     region_dir = Path(f"{TILES_DIR_PREFIX}{job['slug']}")
@@ -603,16 +607,15 @@ def _do_compress(job: dict, log_path: Path) -> bool:
                 return False
 
         size_before = compressed_path.stat().st_size if compressed_path.exists() else orig_path.stat().st_size
-        # Per-LOD quant — outer/closeup use 12 (≈12% of step error, invisible at
-        # 2.5/1.5 m mesh resolution); inner stays at 14 (≈6% of 0.5 m step =
-        # ~30 mm) since users zoom there. quant_pos defaults to 16 in
-        # draco_compress_glb if unset.
-        quant = _LOD_PRESET[slug].get("draco_quant", 16)
+        # meshopt has no per-LOD knob — gltfpack -cc applies 16-bit positions
+        # uniformly, error scales with bbox size (1000m / 65536 = 1.5cm for
+        # inner, 3.8cm for closeup, 7.6cm for outer — all well below
+        # respective mesh steps).
         mode = "re-compressing" if force else "compressing"
-        log(f"[{slug}] {size_before // (1024*1024)} MB → {mode} (quant_pos={quant})…")
+        log(f"[{slug}] {size_before // (1024*1024)} MB → {mode} (meshopt -cc)…")
 
         # First-time compress: move source aside FIRST so we don't lose data
-        # if Draco crashes (recovery in `except`).
+        # if meshopt crashes (recovery in `except`).
         # Force-recompress: orig already exists, just write a new dst on top.
         if not force:
             try:
@@ -622,12 +625,12 @@ def _do_compress(job: dict, log_path: Path) -> bool:
                 return False
 
         try:
-            draco_compress_glb.compress(str(orig_path), str(compressed_path), quant_pos=quant)
+            meshopt_compress_glb.compress(str(orig_path), str(compressed_path))
             size_after = compressed_path.stat().st_size
             log(f"[{slug}] → {size_after // (1024*1024)} MB "
                 f"({100 * size_after // size_before}% of original)")
         except Exception as e:
-            log(f"FAIL: {slug} — Draco compress: {e}")
+            log(f"FAIL: {slug} — meshopt compress: {e}")
             if force:
                 # In force mode the orig file in _orig_uncompressed/ is the
                 # ONLY lossless copy; the (partially-written, possibly
@@ -784,9 +787,9 @@ def cancel_job(job_id: str) -> bool:
 # Hnojice-preset LOD parametry (fixní pro všechny lokace).
 # Inner step 0.5 m kvůli zarovnání s gen_multitile village_flat profilem.
 _LOD_PRESET = {
-    "outer":   {"half": 2500, "step": "2.5", "fade": 100, "fade_to": "panorama", "zoom": 17, "size": 4096, "draco_quant": 12},
-    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 4096, "draco_quant": 12},
-    "inner":   {"half":  500, "step": "0.5", "fade":  30, "fade_to": "closeup",  "zoom": 21, "size": 8192, "draco_quant": 14},
+    "outer":   {"half": 2500, "step": "2.5", "fade": 100, "fade_to": "panorama", "zoom": 17, "size": 4096},
+    "closeup": {"half": 1500, "step": "1.5", "fade":  50, "fade_to": "outer",    "zoom": 21, "size": 4096},
+    "inner":   {"half":  500, "step": "0.5", "fade":  30, "fade_to": "closeup",  "zoom": 21, "size": 8192},
 }
 
 

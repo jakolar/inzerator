@@ -48,16 +48,23 @@ def compress(src_path, dst_path) -> None:
     Flags:
       -cc: compact mode (slightly slower encode for tighter blocks)
       -vpf: float32 positions instead of 14-bit integers — avoids the
-        KHR_mesh_quantization node TRS dequantize round-trip on the
-        viewer side (Three.js's bake required a 144 MB Float32 copy
-        across 3 detail meshes on main thread + GPU upload, which
-        bricked low-spec Macs during initial load). Trade: 2.0 → 2.5 MB
-        per inner glb on the wire after brotli q=11 (+25%), but viewer
-        renders the geometry directly without any transform bake.
+        KHR_mesh_quantization node TRS dequantize bake on the viewer
+        side (a 144 MB Float32 copy across 3 detail meshes locked low-
+        spec Macs during initial load).
+      -vtf: float32 tex coords (same reason as -vpf).
+      -kv: keep vertex attributes even if not referenced by any material.
+        gen_detail emits the source GLB without a material binding (the
+        viewer assigns its own MeshBasicMaterial post-load); without -kv
+        gltfpack treats TEXCOORD_0 as dead and strips it → black mesh
+        because Three.js can't sample the ortofoto texture without UVs.
+
+    Wire size (per inner.glb, brotli q=11): ~2.6 MB, still ~8× smaller
+    than the previous Draco pipeline (20 MB) and 13× smaller than the
+    raw GLB this is encoded from.
     """
     src = str(Path(src_path).resolve())
     dst = str(Path(dst_path).resolve())
-    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-cc", "-vpf"]
+    cmd = _find_gltfpack() + ["-i", src, "-o", dst, "-cc", "-vpf", "-vtf", "-kv"]
     # Capture stderr so failures don't pollute the job log with raw gltfpack
     # noise; subprocess.CalledProcessError carries it for the caller.
     subprocess.run(

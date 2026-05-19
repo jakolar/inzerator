@@ -405,8 +405,11 @@ def test_do_compress_force_encode_crash_keeps_orig(tmp_path, monkeypatch):
 
 
 def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
-    """force_recompress with no _orig_uncompressed file should fail cleanly,
-    not destroy the existing details/<step>.glb."""
+    """force_recompress with no _orig_uncompressed file: deployed glb stays
+    intact (no data destruction). Step soft-skips that target rather than
+    failing the whole compress (legacy regions may have a deployed but no
+    backup glb, e.g. panorama from a manual Draco run before per-LOD
+    compress landed)."""
     monkeypatch.chdir(tmp_path)
     slug = "force-y"
     region = tmp_path / f"tiles_v2_{slug}"
@@ -419,8 +422,9 @@ def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
 
     job = {"slug": slug, "force_recompress": True, "cancelled": False}
     ok = locations._do_compress(job, region / "log.txt")
-    assert ok is False
-    # details/outer.glb untouched
+    # Soft-skip: missing orig is non-fatal, step succeeds, deployed glb
+    # untouched.
+    assert ok is True
     assert (region / "details" / "outer.glb").read_bytes() == b"EXISTING-DRACO"
 
 

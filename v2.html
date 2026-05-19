@@ -33,9 +33,9 @@
 </head>
 <body>
 <div id="status">Loading…</div>
-<button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Inner HD VYP</button>
+<button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Zapnout HD</button>
 <button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
-<button id="atmo-toggle" type="button">🌫 Atmosféra VYP</button>
+<button id="atmo-toggle" type="button">🌫 Zapnout atmosféru</button>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
 <script type="importmap">
 {
@@ -367,7 +367,7 @@ async function setAtmosphere(on) {
   ATMOSPHERE = on;
   const btn = document.getElementById('atmo-toggle');
   if (btn) {
-    btn.textContent = on ? '🌤 Atmosféra ZAP' : '🌫 Atmosféra VYP';
+    btn.textContent = on ? '🌤 Vypnout atmosféru' : '🌫 Zapnout atmosféru';
     btn.disabled = true;
   }
   try {
@@ -406,11 +406,11 @@ document.getElementById('hires-toggle').addEventListener('click', () => {
   _setHiresUrlAndReload(!HIRES);
 });
 document.getElementById('hires-toggle').textContent =
-  HIRES ? '🔬 Inner HD ZAP' : '🔍 Inner HD VYP';
+  HIRES ? '🔬 Vypnout HD' : '🔍 Zapnout HD';
 // Reflect initial state from `?atmosphere=1` immediately so the button
 // label matches before loadV2 finishes.
 document.getElementById('atmo-toggle').textContent =
-  ATMOSPHERE ? '🌤 Atmosféra ZAP' : '🌫 Atmosféra VYP';
+  ATMOSPHERE ? '🌤 Vypnout atmosféru' : '🌫 Zapnout atmosféru';
 
 // ─── Screenshot ──────────────────────────────────────────────────────────
 // renderer.preserveDrawingBuffer is already true (recording path needs it),

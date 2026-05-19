@@ -583,21 +583,34 @@ def _do_compress(job: dict, log_path: Path) -> bool:
     orig_dir.mkdir(parents=True, exist_ok=True)
 
     force = bool(job.get("force_recompress"))
-    details = ("outer", "closeup", "inner")
-    for slug in details:
-        compressed_path = details_dir / f"{slug}.glb"
-        orig_path = orig_dir / f"{slug}.glb"
+    # Compress targets — panorama lives one level up (region_dir/panorama.glb),
+    # the three detail rings live in details/. _orig_uncompressed/ keeps a
+    # flat layout (all four side-by-side) regardless of where the deployed
+    # copy sits.
+    targets = [
+        ("panorama", region_dir / "panorama.glb",   orig_dir / "panorama.glb"),
+        ("outer",    details_dir / "outer.glb",     orig_dir / "outer.glb"),
+        ("closeup",  details_dir / "closeup.glb",   orig_dir / "closeup.glb"),
+        ("inner",    details_dir / "inner.glb",     orig_dir / "inner.glb"),
+    ]
+    for slug, compressed_path, orig_path in targets:
+        # Skip targets whose source doesn't exist at all (e.g. panorama from
+        # a half-finished pipeline run where gen_panorama didn't complete).
+        if not compressed_path.exists() and not orig_path.exists():
+            log(f"[{slug}] no source on disk, skip")
+            continue
 
         if force:
-            # Re-Draco from _orig_uncompressed/<step>.glb (must exist; the
-            # current details/<step>.glb is already lossy-quantised so re-
-            # Dracoing it can't improve quality). Skip details where the orig
-            # is missing — leaves the existing Draco glb in place.
+            # Re-encode from _orig_uncompressed/<step>.glb (must exist; the
+            # current deployed glb is already lossy-quantised so re-encoding
+            # it can't improve quality). Soft-skip targets where the orig is
+            # missing but a compressed copy exists — that means the file was
+            # generated before per-LOD compress landed (e.g. legacy panorama
+            # from manual Draco run).
             if not orig_path.exists():
-                log(f"FAIL: {slug} — no _orig_uncompressed/{slug}.glb to re-Draco from "
-                    f"(this detail was generated before per-LOD quant landed; only the "
-                    f"current details/ glb is on disk)")
-                return False
+                log(f"[{slug}] no _orig_uncompressed/{slug}.glb, skip "
+                    f"(deployed glb stays as-is)")
+                continue
         else:
             if orig_path.exists():
                 log(f"[{slug}] already compressed (orig stored), skip")

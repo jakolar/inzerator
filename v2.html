@@ -1066,10 +1066,20 @@ function setupParcelSelection(region, innerField) {
   function drapeEdge(a, b) {
     const SUB_M = 1.0;
     const LIFT = 0.4;
-    const WALL_THRESH = 1.5;
+    // Higher WALL_THRESH (3 m, was 1.5) lets tree canopies and small
+    // terrain bumps stay smoothly draped; only real building walls /
+    // big retaining walls still trigger the sharp L-corner climb.
+    const WALL_THRESH = 3.0;
+    // Smoothing window: average each sample's Y with N neighbours on
+    // either side. Wipes out the sub-metre DSM jitter that made grass-
+    // field edges look wavy. Set to 0 to disable (raw heightfield drape).
+    const SMOOTH_HALF_WINDOW = 3;
+
     const dx = b.x - a.x, dz = b.z - a.z, dy = b.y - a.y;
     const segLen = Math.hypot(dx, dz);
     const n = Math.max(1, Math.ceil(segLen / SUB_M));
+
+    // Pass 1: sample raw heightfield Y at every sub-step.
     const raw = [];
     for (let k = 0; k <= n; k++) {
       const t = k / n;
@@ -1079,22 +1089,49 @@ function setupParcelSelection(region, innerField) {
       const y = (sampled !== null ? sampled : a.y + dy * t) + LIFT;
       raw.push([wx, y, wz]);
     }
+
+    // Pass 2: smooth Y with a centred moving average. We preserve sharp
+    // step transitions (building walls) by detecting them on the RAW
+    // values and resetting the smoothing window around them — without
+    // this, a 5 m wall would get spread into a 5-sample slope.
+    const smoothed = raw.map(p => p.slice());
+    if (SMOOTH_HALF_WINDOW > 0 && raw.length >= 3) {
+      // Mark indices where the local Y jump exceeds WALL_THRESH; window
+      // never crosses these boundaries.
+      const isWall = new Array(raw.length).fill(false);
+      for (let k = 1; k < raw.length; k++) {
+        if (Math.abs(raw[k][1] - raw[k - 1][1]) >= WALL_THRESH) isWall[k] = true;
+      }
+      for (let k = 0; k < raw.length; k++) {
+        let sum = raw[k][1], count = 1;
+        for (let d = 1; d <= SMOOTH_HALF_WINDOW; d++) {
+          if (k - d >= 0 && !isWall[k - d + 1]) { sum += raw[k - d][1]; count++; }
+          else break;
+        }
+        for (let d = 1; d <= SMOOTH_HALF_WINDOW; d++) {
+          if (k + d < raw.length && !isWall[k + d]) { sum += raw[k + d][1]; count++; }
+          else break;
+        }
+        smoothed[k][1] = sum / count;
+      }
+    }
+
+    // Pass 3: L-corner insertion on the SMOOTHED values so post-smooth
+    // transitions that still exceed WALL_THRESH read as walls; smaller
+    // ones stay smooth.
     const out = [];
-    for (let k = 0; k < raw.length - 1; k++) {
-      const [px, py, pz] = raw[k];
-      const [qx, qy, qz] = raw[k + 1];
+    for (let k = 0; k < smoothed.length - 1; k++) {
+      const [px, py, pz] = smoothed[k];
+      const [qx, qy, qz] = smoothed[k + 1];
       out.push(new THREE.Vector3(px, py, pz));
       if (Math.abs(qy - py) >= WALL_THRESH) {
         const mx = (px + qx) / 2;
         const mz = (pz + qz) / 2;
-        // Two-point L corner: horizontal to wall midpoint at low Y,
-        // vertical to wall midpoint at high Y. Works for both rising
-        // (entering a roof) and falling (leaving one).
         out.push(new THREE.Vector3(mx, py, mz));
         out.push(new THREE.Vector3(mx, qy, mz));
       }
     }
-    const [lx, ly, lz] = raw[raw.length - 1];
+    const [lx, ly, lz] = smoothed[smoothed.length - 1];
     out.push(new THREE.Vector3(lx, ly, lz));
     return out;
   }

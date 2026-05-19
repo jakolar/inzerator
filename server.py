@@ -620,6 +620,195 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIRECTORY, **kwargs)
 
+    def _proxy_ortofoto_vhr(self, query):
+        """Fetch ČÚZK ortofoto at 0.125 m/px native via the public WMS at
+        `ags.cuzk.gov.cz/arcgis1/services/ORTOFOTO/MapServer/WMSServer`.
+
+        Native pixel resolution: 12.5 cm/px (vs 25 cm in our cached SM5
+        ATOM source). For a 1×1 km inner detail that's a 8000×8000 ideal
+        sample — the WMS caps WIDTH/HEIGHT at 4000 per request, so we
+        split into an N×N sub-tile grid (~4 requests for inner), stitch
+        in PIL, then route through the same resize + KTX2 encode pipeline
+        as the raw branch.
+
+        Cache key includes 'hires' so VHR + non-VHR cache entries coexist.
+        """
+        from PIL import Image
+        from io import BytesIO
+        import hashlib
+        import urllib.request as _urlreq
+
+        bbox_str = query.get("BBOX", [""])[0]
+        if not bbox_str:
+            self.send_error(400, "Missing BBOX")
+            return
+        try:
+            sjtsk_xmin, sjtsk_ymin, sjtsk_xmax, sjtsk_ymax = (
+                float(x) for x in bbox_str.split(","))
+        except ValueError:
+            self.send_error(400, "BBOX must be xmin,ymin,xmax,ymax in S-JTSK")
+            return
+
+        out_format = query.get("format", ["jpeg"])[0].lower()
+        if out_format not in ("jpeg", "jpg", "png", "ktx2"):
+            out_format = "jpeg"
+
+        cache_key_src = "hires|" + "|".join(
+            f"{k}={query.get(k, [''])[0]}"
+            for k in ("BBOX", "size", "format", "ktx2", "quality")
+        )
+        cache_key = hashlib.sha256(cache_key_src.encode()).hexdigest()[:16]
+        cache_dir = Path("cache/orto_render")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"vhr_{cache_key}.{out_format}"
+        _mime_for = {"png": "image/png", "ktx2": "image/ktx2"}
+        if cache_path.exists():
+            data = cache_path.read_bytes()
+            mime = _mime_for.get(out_format, "image/jpeg")
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Ortofoto-Cache", "hit-vhr")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        # Target native resolution at 0.125 m/px.
+        bbox_w = sjtsk_xmax - sjtsk_xmin
+        bbox_h = sjtsk_ymax - sjtsk_ymin
+        native_w = int(round(bbox_w / 0.125))
+        native_h = int(round(bbox_h / 0.125))
+
+        # Cap pixels we ever ask the WMS for — bbox > 5×5 km is silly here.
+        MAX_TILE = 4000
+        n_x = (native_w + MAX_TILE - 1) // MAX_TILE
+        n_y = (native_h + MAX_TILE - 1) // MAX_TILE
+        sub_w = native_w // n_x
+        sub_h = native_h // n_y
+        # adjust last column/row to absorb integer-division remainder
+        last_sub_w = native_w - sub_w * (n_x - 1)
+        last_sub_h = native_h - sub_h * (n_y - 1)
+
+        Image.MAX_IMAGE_PIXELS = None
+        composite = Image.new("RGB", (native_w, native_h), (0, 0, 0))
+
+        WMS = ("https://ags.cuzk.gov.cz/arcgis1/services/ORTOFOTO/"
+               "MapServer/WMSServer")
+        fetched_count = 0
+        for ix in range(n_x):
+            for iy in range(n_y):
+                # WMS Y axis goes south-up, image rows go north-down. We
+                # iterate iy bottom-up so paste row 0 = top (north) of image.
+                sxmin = sjtsk_xmin + bbox_w * ix / n_x
+                sxmax = sjtsk_xmin + bbox_w * (ix + 1) / n_x
+                symin = sjtsk_ymin + bbox_h * iy / n_y
+                symax = sjtsk_ymin + bbox_h * (iy + 1) / n_y
+                w = last_sub_w if ix == n_x - 1 else sub_w
+                h = last_sub_h if iy == n_y - 1 else sub_h
+                params = urllib.parse.urlencode({
+                    "service": "WMS",
+                    "version": "1.1.1",
+                    "request": "GetMap",
+                    "layers": "0",
+                    "styles": "",
+                    "SRS": "EPSG:5514",
+                    "BBOX": f"{sxmin},{symin},{sxmax},{symax}",
+                    "WIDTH": w,
+                    "HEIGHT": h,
+                    "FORMAT": "image/jpeg",
+                })
+                req = _urlreq.Request(f"{WMS}?{params}",
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                try:
+                    with _urlreq.urlopen(req, timeout=60) as resp:
+                        ct = resp.headers.get("Content-Type", "")
+                        body = resp.read()
+                except Exception as e:
+                    self.send_error(502, f"ČÚZK VHR WMS fetch: {e}")
+                    return
+                if not ct.startswith("image/"):
+                    self.send_error(502,
+                        f"ČÚZK WMS returned {ct}: {body[:200]!r}")
+                    return
+                sub = Image.open(BytesIO(body))
+                paste_x = sub_w * ix
+                paste_y = (native_h - sub_h * iy - sub.size[1])
+                composite.paste(sub, (paste_x, paste_y))
+                fetched_count += 1
+
+        # Resize + encode reusing the same pipeline as the raw branch.
+        size_str = query.get("size", [""])[0]
+        if size_str:
+            try:
+                target = max(64, min(int(size_str), 8192))
+                ratio = composite.width / max(composite.height, 1)
+                if ratio >= 1:
+                    new_w, new_h = target, max(1, int(target / ratio))
+                else:
+                    new_h, new_w = target, max(1, int(target * ratio))
+                if new_w < composite.width or new_h < composite.height:
+                    composite = composite.resize((new_w, new_h), Image.LANCZOS)
+            except ValueError:
+                pass
+
+        buf = BytesIO()
+        if out_format == "png":
+            composite.save(buf, "PNG", optimize=True)
+            mime = "image/png"
+            data = buf.getvalue()
+        elif out_format == "ktx2":
+            composite.save(buf, "JPEG", quality=95, optimize=True, subsampling=0)
+            import subprocess, tempfile, uuid
+            ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
+            try:
+                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+            except ValueError:
+                q_val = 128
+            tmpdir = Path(tempfile.gettempdir())
+            stem = f"orto_vhr_{uuid.uuid4().hex}"
+            tmp_jpg = tmpdir / f"{stem}.jpg"
+            tmp_ktx2 = tmpdir / f"{stem}.ktx2"
+            cmd = ["basisu", "-ktx2", "-mipmap", "-y_flip"]
+            if ktx2_mode == "uastc":
+                cmd += ["-uastc", "-uastc_rdo_l", "2.0"]
+            else:
+                cmd += ["-q", str(q_val)]
+            cmd += [str(tmp_jpg), "-output_file", str(tmp_ktx2)]
+            try:
+                tmp_jpg.write_bytes(buf.getvalue())
+                subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+                data = tmp_ktx2.read_bytes()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.send_error(500, f"basisu KTX2 encode failed: {e}")
+                return
+            finally:
+                tmp_jpg.unlink(missing_ok=True)
+                tmp_ktx2.unlink(missing_ok=True)
+            mime = "image/ktx2"
+        else:
+            composite.save(buf, "JPEG", quality=95, optimize=True, subsampling=0)
+            mime = "image/jpeg"
+            data = buf.getvalue()
+
+        cache_tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        cache_tmp.write_bytes(data)
+        cache_tmp.replace(cache_path)
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Ortofoto-Source", f"VHR-WMS ({fetched_count} subtiles)")
+        self.send_header("X-Ortofoto-Native-PxSize-cm", "12.5")
+        self.send_header("X-Ortofoto-Native-Px", f"{native_w}x{native_h}")
+        self.send_header("X-Ortofoto-Cache", "miss-vhr")
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+
     def _proxy_ortofoto_raw(self, query):
         """Crop ČÚZK ortofoto from the locally cached raw SM5 JPEG.
 
@@ -961,9 +1150,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         """Compose ČÚZK ortofoto from tiles matching S-JTSK bbox."""
         import math
         query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+        # ?hires=1 — fetch from ČÚZK public WMS at 0.125 m/px native (2× the
+        # cached SM5 source). Tiled into 4000×4000 sub-requests because the
+        # WMS server caps WIDTH/HEIGHT around 4096. Free / no auth.
+        if query.get("hires", [""])[0] == "1":
+            return self._proxy_ortofoto_vhr(query)
         # ?source=raw — crop directly from the locally cached raw SM5 JPEG
-        # (ČÚZK native 12.5 cm/px). Eliminates tile-service upscaling +
-        # our composite/re-encode pipeline. Highest available quality.
+        # (ČÚZK 0.25 m/px). Eliminates tile-service upscaling + our
+        # composite/re-encode pipeline. Highest available quality from cache.
         if query.get("source", [""])[0] == "raw":
             return self._proxy_ortofoto_raw(query)
         bbox_str = query.get("BBOX", [""])[0]

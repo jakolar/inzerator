@@ -18,20 +18,22 @@
     font-family: system-ui, sans-serif;
     white-space: nowrap;
   }
-  #atmo-toggle, #shot-btn {
+  #atmo-toggle, #shot-btn, #hires-toggle {
     position: absolute; top: 14px; z-index: 25;
     background: rgba(255,255,255,0.92); border: 1px solid #ccc;
     border-radius: 6px; padding: 6px 10px; font-size: 13px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
     font-family: system-ui, sans-serif;
   }
-  #atmo-toggle { right: 14px; }
-  #shot-btn    { right: 174px; }
-  #atmo-toggle:hover, #shot-btn:hover { background: rgba(255,255,255,1); }
+  #atmo-toggle  { right: 14px; }
+  #shot-btn     { right: 174px; }
+  #hires-toggle { right: 314px; }
+  #atmo-toggle:hover, #shot-btn:hover, #hires-toggle:hover { background: rgba(255,255,255,1); }
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
+<button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Inner HD VYP</button>
 <button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
 <button id="atmo-toggle" type="button">🌫 Atmosféra VYP</button>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
@@ -85,6 +87,12 @@ const BUST = `v=${Date.now()}`;
 // path; the detail rings (outer/closeup/inner) cover the working area on
 // their own. Runtime toggleable via the top-right button or `?atmosphere=1`.
 let ATMOSPHERE = params.get('atmosphere') === '1';
+
+// Hires ortho = ČÚZK 0.125 m/px WMS source for the inner texture (vs
+// the 0.25 m cached SM5 default). Off by default — wire/encode cost is
+// higher (4× sub-tile fetches on first load, ~30-60 s vs ~10-15 s
+// cached). Sticky via URL param so reload keeps the chosen mode.
+let HIRES = params.get('hires') === '1';
 // Diagnostic switch for meshopt-vs-Draco texture shimmer/zubatost:
 // `?textureFilter=base` samples only the base ortho level for detail meshes.
 // If the artefact disappears, mipmap LOD selection is the likely culprit.
@@ -385,6 +393,20 @@ async function setAtmosphere(on) {
 document.getElementById('atmo-toggle').addEventListener('click', () => {
   setAtmosphere(!ATMOSPHERE);
 });
+
+// HD-ortho toggle: reload page with ?hires flipped. Texture cache for the
+// new mode warms up on first visit (4× WMS subtile fetch, ~30-60 s); after
+// that the server-side render-cache serves both modes instant.
+function _setHiresUrlAndReload(on) {
+  const p = new URLSearchParams(location.search);
+  if (on) p.set('hires', '1'); else p.delete('hires');
+  location.search = p.toString();
+}
+document.getElementById('hires-toggle').addEventListener('click', () => {
+  _setHiresUrlAndReload(!HIRES);
+});
+document.getElementById('hires-toggle').textContent =
+  HIRES ? '🔬 Inner HD ZAP' : '🔍 Inner HD VYP';
 // Reflect initial state from `?atmosphere=1` immediately so the button
 // label matches before loadV2 finishes.
 document.getElementById('atmo-toggle').textContent =
@@ -618,7 +640,11 @@ async function loadV2() {
         //   'closeup' → KTX2 UASTC (same codec, smaller bbox)
         //   others    → KTX2 ETC1S (small, slight loss invisible at distance)
         const ktxMode = (detail.slug === 'inner' || detail.slug === 'closeup') ? 'uastc' : 'etc1s';
-        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}`;
+        // Inner texture honours the HD toggle (fetches from ČÚZK WMS at
+        // 0.125 m/px vs the cached 0.25 m SM5 source). Other LODs always
+        // use the cached source — they're at coarser bbox/size anyway.
+        const hiresParam = (detail.slug === 'inner' && HIRES) ? '&hires=1' : '';
+        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}${hiresParam}`;
         const loader = ktx2Loader;
         loader.load(url, (tex) => {
           _configureDetailTexture(tex);

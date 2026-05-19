@@ -48,6 +48,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -84,6 +85,12 @@ const BUST = `v=${Date.now()}`;
 // path; the detail rings (outer/closeup/inner) cover the working area on
 // their own. Runtime toggleable via the top-right button or `?atmosphere=1`.
 let ATMOSPHERE = params.get('atmosphere') === '1';
+// Diagnostic switch for meshopt-vs-Draco texture shimmer/zubatost:
+// `?textureFilter=base` samples only the base ortho level for detail meshes.
+// If the artefact disappears, mipmap LOD selection is the likely culprit.
+const DETAIL_TEXTURE_FILTER = params.get('textureFilter') || 'mip';
+const ONLY_DETAIL = params.get('onlyDetail'); // debug: outer | closeup | inner
+const INNER_GLB_OVERRIDE = params.get('innerGlb'); // debug: e.g. details/inner.meshopt-noq.glb
 
 // Cached for runtime toggle; populated lazily on the first turn-on.
 let _hdrTex = null;
@@ -226,12 +233,15 @@ tick();
 const status = document.getElementById('status');
 const allMeshes = [];
 // Mesh compression — pipeline writes meshopt (gltfpack -cc) GLBs with
-// EXT_meshopt_compression + KHR_mesh_quantization. After brotli q=11 on
-// the wire, inner.glb is ~2 MB (was ~20 MB with Draco). Decoder is a
-// ~50 KB WASM module loaded on demand. GLTFLoader awaits MeshoptDecoder.ready
-// internally; safe to set even before the WASM has finished initialising.
+// EXT_meshopt_compression. DRACOLoader is registered too so older
+// Draco-encoded GLBs (or A/B-test reverts) keep loading transparently;
+// GLTFLoader picks the right decoder per extension.
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/draco/gltf/');
+dracoLoader.setDecoderConfig({ type: 'wasm' });
 const gltfLoader = new GLTFLoader();
 gltfLoader.setMeshoptDecoder(MeshoptDecoder);
+gltfLoader.setDRACOLoader(dracoLoader);
 // KTX2 (Basis Universal) GPU-compressed textures — ~50% smaller than JPEG
 // on the wire, ~4× smaller in VRAM. Transcoder is loaded once from CDN.
 const ktx2Loader = new KTX2Loader()
@@ -239,10 +249,22 @@ const ktx2Loader = new KTX2Loader()
   .detectSupport(renderer);
 const texLoader = new THREE.TextureLoader();
 
-// (Earlier: KHR_mesh_quantization bake helper — removed when the pipeline
-// switched to `gltfpack -vpf` so positions are emitted as Float32 with
-// identity node TRS. Geometry attribute is world-space-ready on load,
-// no transform bake needed on the main thread.)
+function _configureDetailTexture(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = _maxAniso;
+  if (DETAIL_TEXTURE_FILTER === 'base') {
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.anisotropy = 1;
+  }
+}
+
+// (Earlier: KHR_mesh_quantization bake helper — removed. Pipeline now
+// pre-snaps positions to 14-bit grid in Python before gltfpack -vpf,
+// so meshopt output is Float32 with identity TRS — no client-side bake
+// needed, no synchronous loop on the main thread, no Chrome brick.)
+function _bakeQuantMatrix(_mesh) { /* no-op; kept as call-site stub */ }
 
 // ─── Atmosphere toggle: HDR sky + fog + panorama mesh ─────────────────────
 // Lazy-loads on first turn-on, then just toggles visibility on subsequent
@@ -269,6 +291,7 @@ async function _ensurePanoramaLoaded() {
       });
       let m = gltf.scene.children[0];
       if (m && !m.isMesh && m.children[0]) m = m.children[0];
+      _bakeQuantMatrix(m);
       const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
       // Clip-out the outermost-detail XZ bbox so panorama (DMR5G ground-only,
       // coarser) doesn't punch UP through SM5-derived building roofs / cliffs
@@ -293,7 +316,7 @@ async function _ensurePanoramaLoaded() {
             '#include <common>\nvarying vec3 vWorldPos_clip;',
           ).replace(
             '#include <worldpos_vertex>',
-            '#include <worldpos_vertex>\nvWorldPos_clip = worldPosition.xyz;',
+            '#include <worldpos_vertex>\nvWorldPos_clip = (modelMatrix * vec4(transformed, 1.0)).xyz;',
           );
           shader.fragmentShader = shader.fragmentShader.replace(
             '#include <common>',
@@ -433,7 +456,10 @@ async function loadV2() {
   // Render LODs from largest half (outer) to smallest (closeup) with
   // increasing renderOrder. polygonOffset pushes each level slightly forward
   // in depth so coplanar regions at the inter-LOD fade band don't z-fight.
-  const details = (manifest.details || []).slice().sort((a, b) => b.half - a.half);
+  const detailsAll = (manifest.details || []).slice().sort((a, b) => b.half - a.half);
+  const details = ONLY_DETAIL
+    ? detailsAll.filter(d => d.slug === ONLY_DETAIL)
+    : detailsAll;
 
   // Loading tracker — every layer has a mesh + a texture step. The status
   // overlay stays visible (with per-step state) until every texture has
@@ -501,9 +527,13 @@ async function loadV2() {
   for (let i = 0; i < details.length; i++) {
     const detail = details[i];
     await new Promise((resolve, reject) => {
-      gltfLoader.load(`tiles_v2_${REGION}/${detail.glb_url}?${BUST}`, (gltf) => {
+      const glbUrl = (detail.slug === 'inner' && INNER_GLB_OVERRIDE)
+        ? INNER_GLB_OVERRIDE
+        : detail.glb_url;
+      gltfLoader.load(`tiles_v2_${REGION}/${glbUrl}?${BUST}`, (gltf) => {
         let m = gltf.scene.children[0];
         if (m && !m.isMesh && m.children[0]) m = m.children[0];
+        _bakeQuantMatrix(m);
         const mat = new THREE.MeshBasicMaterial({
           side: THREE.DoubleSide,
           // Cross-LOD wins via `polygonOffset` per renderOrder step.
@@ -549,7 +579,7 @@ async function loadV2() {
               '#include <common>\nvarying vec3 vWorldPos_clip;',
             ).replace(
               '#include <worldpos_vertex>',
-              '#include <worldpos_vertex>\nvWorldPos_clip = worldPosition.xyz;',
+              '#include <worldpos_vertex>\nvWorldPos_clip = (modelMatrix * vec4(transformed, 1.0)).xyz;',
             );
             shader.fragmentShader = shader.fragmentShader.replace(
               '#include <common>',
@@ -582,23 +612,16 @@ async function loadV2() {
         const rawSize = detail.size || 4096;
         const size = detail.slug === 'closeup' ? Math.min(rawSize, 4096) : rawSize;
         // Per-detail texture format:
-        //   'inner'   → PNG (lossless; the village core under heaviest zoom
-        //               sees zero JPEG/Basis artefacts — large file but the
-        //               only texture loaded at this LOD)
-        //   'closeup' → KTX2 UASTC (near-original, GPU-native, mid-range)
+        //   'inner'   → KTX2 UASTC (8192² for max sharpness at heaviest zoom;
+        //               PNG was 84 MB/file, UASTC ~28 MB with no perceivable
+        //               loss on photographic ortho content)
+        //   'closeup' → KTX2 UASTC (same codec, smaller bbox)
         //   others    → KTX2 ETC1S (small, slight loss invisible at distance)
-        let url, loader;
-        if (detail.slug === 'inner') {
-          url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=png`;
-          loader = texLoader;
-        } else {
-          const ktxMode = detail.slug === 'closeup' ? 'uastc' : 'etc1s';
-          url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}`;
-          loader = ktx2Loader;
-        }
+        const ktxMode = (detail.slug === 'inner' || detail.slug === 'closeup') ? 'uastc' : 'etc1s';
+        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}`;
+        const loader = ktx2Loader;
         loader.load(url, (tex) => {
-          tex.colorSpace = THREE.SRGBColorSpace;
-          tex.anisotropy = _maxAniso;
+          _configureDetailTexture(tex);
           mat.map = tex;
           mat.transparent = false;
           mat.opacity = 1;

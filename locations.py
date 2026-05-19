@@ -607,12 +607,12 @@ def _do_compress(job: dict, log_path: Path) -> bool:
                 return False
 
         size_before = compressed_path.stat().st_size if compressed_path.exists() else orig_path.stat().st_size
-        # meshopt has no per-LOD knob — gltfpack -cc applies 16-bit positions
-        # uniformly, error scales with bbox size (1000m / 65536 = 1.5cm for
-        # inner, 3.8cm for closeup, 7.6cm for outer — all well below
-        # respective mesh steps).
+        # meshopt_compress_glb pre-snaps positions to the old Draco-compatible
+        # 14-bit uniform-cube grid, then runs gltfpack with -noq so the viewer
+        # gets Float32 attributes without KHR_mesh_quantization/EXPONENTIAL
+        # filtering artefacts.
         mode = "re-compressing" if force else "compressing"
-        log(f"[{slug}] {size_before // (1024*1024)} MB → {mode} (meshopt -cc)…")
+        log(f"[{slug}] {size_before // (1024*1024)} MB → {mode} (meshopt -cc -noq)…")
 
         # First-time compress: move source aside FIRST so we don't lose data
         # if meshopt crashes (recovery in `except`).

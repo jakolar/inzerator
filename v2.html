@@ -100,6 +100,19 @@ const DETAIL_TEXTURE_FILTER = params.get('textureFilter') || 'mip';
 const ONLY_DETAIL = params.get('onlyDetail'); // debug: outer | closeup | inner
 const INNER_GLB_OVERRIDE = params.get('innerGlb'); // debug: e.g. details/inner.meshopt-noq.glb
 
+// --- BARE-Y feature (toggle "no buildings/trees" on detail meshes) ---
+// Shared across every detail material's onBeforeCompile so a single
+// checkbox flips the entire LOD stack at once. 0 = DSM (current view),
+// 1 = bare-earth (DMR5G). Smoothly mix() in the vertex shader.
+// Remove this declaration + the onBeforeCompile branch + the checkbox to
+// revert the feature; older GLBs without `_BARE_Y` keep working as-is.
+const _uBareMode = { value: 0 };
+// Escape hatch: ?nobare=1 disables the bare-Y shader inject entirely so
+// we can bisect whether the inject is the cause of an inner-not-rendering
+// regression. Geometry attribute still loaded; just no shader override.
+const NO_BARE = params.get('nobare') === '1';
+// --- end BARE-Y ---
+
 // Cached for runtime toggle; populated lazily on the first turn-on.
 let _hdrTex = null;
 let _panoramaMesh = null;
@@ -586,30 +599,60 @@ async function loadV2() {
         // polygonOffset doesn't fully suppress. Fragment-side discard on
         // world XZ is exact, sidestepping that whole class of artefact.
         const smaller = details[i + 1];
+        // --- BARE-Y feature: per-vertex bare-earth Y is stashed in the
+        // `TEXCOORD_1` glTF attribute (= Three.js `uv1`) because gltfpack
+        // drops underscore-prefixed customs even with -kv. Bare Y lives in
+        // uv1.x; .y is unused. NO_BARE disables the shader inject. ---
+        const _hasBareY = !NO_BARE && !!(m.geometry.attributes && m.geometry.attributes.uv1);
+        // --- end BARE-Y ---
+        let clipBox = null;
         if (smaller) {
           const sxc = smaller.center_sjtsk[0] - region.center_sjtsk[0];
           const szc = -(smaller.center_sjtsk[1] - region.center_sjtsk[1]);
-          const clipBox = new THREE.Vector4(
+          clipBox = new THREE.Vector4(
             sxc - smaller.half, szc - smaller.half,
             sxc + smaller.half, szc + smaller.half,
           );
           mat.userData.uClipBox = clipBox;
+        }
+        if (clipBox || _hasBareY) {
           mat.onBeforeCompile = (shader) => {
-            shader.uniforms.uClipBox = { value: clipBox };
-            shader.vertexShader = shader.vertexShader.replace(
-              '#include <common>',
-              '#include <common>\nvarying vec3 vWorldPos_clip;',
-            ).replace(
-              '#include <worldpos_vertex>',
-              '#include <worldpos_vertex>\nvWorldPos_clip = (modelMatrix * vec4(transformed, 1.0)).xyz;',
-            );
-            shader.fragmentShader = shader.fragmentShader.replace(
-              '#include <common>',
-              '#include <common>\nuniform vec4 uClipBox;\nvarying vec3 vWorldPos_clip;',
-            ).replace(
-              'void main() {',
-              'void main() {\n  if (vWorldPos_clip.x > uClipBox.x && vWorldPos_clip.x < uClipBox.z && vWorldPos_clip.z > uClipBox.y && vWorldPos_clip.z < uClipBox.w) discard;',
-            );
+            let vert = shader.vertexShader;
+            let frag = shader.fragmentShader;
+            if (clipBox) {
+              shader.uniforms.uClipBox = { value: clipBox };
+              vert = vert.replace(
+                '#include <common>',
+                '#include <common>\nvarying vec3 vWorldPos_clip;',
+              ).replace(
+                '#include <worldpos_vertex>',
+                '#include <worldpos_vertex>\nvWorldPos_clip = (modelMatrix * vec4(transformed, 1.0)).xyz;',
+              );
+              frag = frag.replace(
+                '#include <common>',
+                '#include <common>\nuniform vec4 uClipBox;\nvarying vec3 vWorldPos_clip;',
+              ).replace(
+                'void main() {',
+                'void main() {\n  if (vWorldPos_clip.x > uClipBox.x && vWorldPos_clip.x < uClipBox.z && vWorldPos_clip.z > uClipBox.y && vWorldPos_clip.z < uClipBox.w) discard;',
+              );
+            }
+            // --- BARE-Y feature: vertex Y blends DSM ↔ bare via uBareMode.
+            // begin_vertex sets `transformed = vec3(position)`; we override
+            // its Y before any later chunk (worldpos_vertex, etc.) reads it.
+            // Bare Y comes via uv1.x (= TEXCOORD_1.x in glTF). ---
+            if (_hasBareY) {
+              shader.uniforms.uBareMode = _uBareMode;
+              vert = vert.replace(
+                '#include <common>',
+                '#include <common>\nattribute vec2 uv1;\nuniform float uBareMode;',
+              ).replace(
+                '#include <begin_vertex>',
+                '#include <begin_vertex>\ntransformed.y = mix(transformed.y, uv1.x, uBareMode);',
+              );
+            }
+            // --- end BARE-Y ---
+            shader.vertexShader = vert;
+            shader.fragmentShader = frag;
           };
         }
         const mesh = new THREE.Mesh(m.geometry, mat);
@@ -623,6 +666,8 @@ async function loadV2() {
         scene.add(mesh);
         allMeshes.push(mesh);
         setState(detail.slug, 'mesh', 'ok');
+        // BARE-Y debug: log attribute presence
+        console.info(`[v2] ${detail.slug} attrs:`, Object.keys(m.geometry.attributes), 'uv1?', !!m.geometry.attributes.uv1);
         const bb = detail.sjtsk_bbox;
         const wb = detail.wgs_bbox;
         const zoom = detail.zoom || 19;
@@ -817,6 +862,13 @@ function setupParcelSelection(region, innerField) {
       <input id="sel-cadastre" type="checkbox">
       <span>🗺 Zobrazit katastr</span>
     </label>
+    <!-- BARE-Y feature toggle. Removing this label + the listener below
+         reverts the feature; older regions without _BARE_Y attribute keep
+         working since the checkbox just stays a no-op. -->
+    <label id="sel-bare-wrap" style="display:none;gap:8px;align-items:center;cursor:pointer;">
+      <input id="sel-bare" type="checkbox">
+      <span>🌳 Skrýt vegetaci & domy</span>
+    </label>
     <button id="sel-clear" style="font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#f6f6f6;cursor:pointer;">
       Smazat výběr (<span id="sel-count">0</span>)
     </button>
@@ -828,6 +880,20 @@ function setupParcelSelection(region, innerField) {
   const clearBtn = menu.querySelector('#sel-clear');
   const countEl = menu.querySelector('#sel-count');
   const hintEl = menu.querySelector('#sel-hint');
+  // --- BARE-Y feature: reveal the toggle only when at least one detail
+  // mesh carries the _BARE_Y attribute (older regions stay clean). ---
+  const bareChk = menu.querySelector('#sel-bare');
+  const bareWrap = menu.querySelector('#sel-bare-wrap');
+  const hasBareYDetail = allMeshes.some(
+    m => m.userData?.kind === 'detail' && m.geometry?.attributes?.uv1,
+  );
+  if (hasBareYDetail) {
+    bareWrap.style.display = 'flex';
+    bareChk.addEventListener('change', () => {
+      _uBareMode.value = bareChk.checked ? 1 : 0;
+    });
+  }
+  // --- end BARE-Y ---
 
   // Cadastre overlay — raster from ČÚZK DKM WMS via /proxy/cadastre, applied
   // as a separate mesh per detail. Sits directly on the terrain surface

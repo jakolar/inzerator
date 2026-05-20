@@ -144,6 +144,9 @@ def add_skirt(tile, depth, half, step):
     vertices = tile["vertices"]
     faces = tile["faces"]
     uvs = tile["uvs"]
+    # --- BARE-Y feature: extend bare_ys parallel to vertices if present ---
+    bare_ys = tile.get("bare_ys")
+    # --- end BARE-Y ---
 
     def emit_strip(edge_vert_indices, outward):
         skirt_start = len(vertices)
@@ -151,6 +154,10 @@ def add_skirt(tile, depth, half, step):
             vx, vy, vz = vertices[vi]
             vertices.append([vx, vy - depth, vz])
             uvs.append(list(uvs[vi]))  # duplicate UV row (independent list)
+            # --- BARE-Y feature: skirt drops by same depth on the bare track ---
+            if bare_ys is not None:
+                bare_ys.append(bare_ys[vi] - depth)
+            # --- end BARE-Y ---
         for k in range(len(edge_vert_indices) - 1):
             t1, t2 = edge_vert_indices[k], edge_vert_indices[k + 1]
             s1, s2 = skirt_start + k, skirt_start + k + 1
@@ -243,6 +250,72 @@ def save_glb(tile, output_path):
     )
     gltf.set_binary_blob(all_bytes)
     gltf.save(output_path)
+
+    # --- BARE-Y feature: post-process the saved GLB to append a custom
+    # `_BARE_Y` attribute (per-vertex float). pygltflib's Attributes class
+    # only allows the standard names so we patch the JSON+BIN chunks here
+    # after save(). Skip cleanly if bare_ys is None/absent. ---
+    bare_ys = tile.get("bare_ys")
+    if bare_ys is not None and len(bare_ys) == len(verts):
+        _patch_bare_y(output_path, bare_ys)
+    # --- end BARE-Y ---
+
+
+def _patch_bare_y(glb_path, bare_ys):
+    """Append a per-vertex bare-earth Y as a `TEXCOORD_1` (VEC2 float)
+    attribute to an existing GLB. Uses TEXCOORD_1 instead of a `_BARE_Y`
+    custom attribute because gltfpack/meshopt drops underscore-prefixed
+    customs even with `-kv`. Bare Y lives in TEXCOORD_1.x; .y is unused
+    (kept = bare Y too so packing is symmetric and the attribute looks
+    less suspicious to meshopt's heuristics). Viewer reads it via the
+    Three.js mapping TEXCOORD_1 → `geometry.attributes.uv1`.
+    """
+    import struct
+    data = Path(glb_path).read_bytes()
+    json_len = struct.unpack_from("<I", data, 12)[0]
+    json_str = data[20:20 + json_len].decode()
+    bin_start = 20 + json_len + 8
+    bin_len = struct.unpack_from("<I", data, 20 + json_len)[0]
+    bin_data = data[bin_start:bin_start + bin_len]
+
+    gltf = json.loads(json_str)
+
+    bare_arr = np.asarray(bare_ys, dtype=np.float32)
+    # Interleave (bare_y, bare_y) per vertex → VEC2.
+    vec2 = np.stack([bare_arr, bare_arr], axis=1).astype(np.float32)
+    bare_bytes = vec2.tobytes()
+    # Align bin_data to 4 before appending (GLB requires 4-byte aligned
+    # bufferView starts for FLOAT data).
+    pad = (-len(bin_data)) % 4
+    new_bin = bin_data + b"\x00" * pad + bare_bytes
+    new_bin = new_bin + b"\x00" * ((-len(new_bin)) % 4)
+
+    bv_offset = len(bin_data) + pad
+    new_bv = {"buffer": 0, "byteOffset": bv_offset,
+              "byteLength": len(bare_bytes), "byteStride": 8,
+              "target": 34962}  # ARRAY_BUFFER
+    gltf["bufferViews"].append(new_bv)
+    bv_idx = len(gltf["bufferViews"]) - 1
+
+    new_acc = {"bufferView": bv_idx, "componentType": 5126,  # FLOAT
+               "count": len(bare_ys), "type": "VEC2",
+               "min": [float(bare_arr.min()), float(bare_arr.min())],
+               "max": [float(bare_arr.max()), float(bare_arr.max())]}
+    gltf["accessors"].append(new_acc)
+    acc_idx = len(gltf["accessors"]) - 1
+
+    gltf["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_1"] = acc_idx
+    gltf["buffers"][0]["byteLength"] = len(new_bin)
+
+    new_json = json.dumps(gltf, separators=(",", ":")).encode()
+    new_json += b" " * ((-len(new_json)) % 4)
+    new_total = 12 + 8 + len(new_json) + 8 + len(new_bin)
+    with open(glb_path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, new_total))  # 'glTF' magic
+        f.write(struct.pack("<II", len(new_json), 0x4E4F534A))  # JSON chunk type
+        f.write(new_json)
+        f.write(struct.pack("<II", len(new_bin), 0x004E4942))   # BIN chunk type
+        f.write(new_bin)
 
 
 def main():

@@ -179,6 +179,22 @@ def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, parent,
     treated as LIDAR cliff-edge/backscatter artefacts and replaced before
     meshing.
     """
+    # --- BARE-Y feature (toggle "no buildings/trees" in viewer) ---
+    # Load DMR5G bare-earth grid once (also used by ceiling/floor filter
+    # below). Reused per-vertex to emit a `_BARE_Y` attribute in the GLB so
+    # the viewer can blend POSITION.y ↔ bare_y via a uniform. Remove the
+    # whole bracketed block + the bare_ys references and the gen_panorama
+    # save_glb branch to revert.
+    _bare_grid = _bare_half = _bare_step = _bare_cx = _bare_cy = None
+    if bare_earth is not None:
+        _bare_glb = bare_earth.get("panorama_glb") or bare_earth.get("glb_url")
+        if _bare_glb:
+            _bare_grid, _bare_half, _bare_step = _load_mesh_grid(
+                manifest_dir, _bare_glb, bare_earth["half"], bare_earth["step"]
+            )
+            _bare_cx, _bare_cy = bare_earth["center_sjtsk"]
+    # --- end BARE-Y ---
+
     if no_sm5:
         sm5_data = sm5_valid = None
     else:
@@ -237,45 +253,38 @@ def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, parent,
         sm5_data = np.where(needs_fix, med, sm5_float).astype(sm5_data.dtype)
         sm5_float = sm5_data.astype("float64")
 
-        if bare_earth is not None and dmr_ceiling > 0:
-            bare_glb = bare_earth.get("panorama_glb") or bare_earth.get("glb_url")
-            if bare_glb:
-                bare_grid, bare_half, bare_step = _load_mesh_grid(
-                    manifest_dir, bare_glb, bare_earth["half"], bare_earth["step"]
-                )
-                bare_cx, bare_cy = bare_earth["center_sjtsk"]
+        if _bare_grid is not None and dmr_ceiling > 0:
+            rows = np.arange(sm5_h, dtype=np.float64)
+            cols = np.arange(sm5_w, dtype=np.float64)
+            world_x = cx - half + cols[None, :] * step
+            world_y = cy + half - rows[:, None] * step
+            bare_y = _sample_grid_y_array(
+                _bare_grid, _bare_half, _bare_step, _bare_cx, _bare_cy,
+                world_x, world_y,
+            ) + ground_z
 
-                rows = np.arange(sm5_h, dtype=np.float64)
-                cols = np.arange(sm5_w, dtype=np.float64)
-                world_x = cx - half + cols[None, :] * step
-                world_y = cy + half - rows[:, None] * step
-                bare_y = _sample_grid_y_array(
-                    bare_grid, bare_half, bare_step, bare_cx, bare_cy,
-                    world_x, world_y,
-                ) + ground_z
+            above_bare = sm5_valid & (sm5_float > bare_y + dmr_ceiling)
+            if np.any(above_bare):
+                med = median_filter(sm5_float, size=3)
+                replacement = np.where(med <= bare_y + dmr_ceiling, med, bare_y)
+                sm5_data = np.where(above_bare, replacement, sm5_float).astype(sm5_data.dtype)
+                print(f"  DMR5G ceiling fixed {int(np.count_nonzero(above_bare))} SM5 spike cells "
+                      f"(>{dmr_ceiling:g} m above bare earth)")
+                sm5_float = sm5_data.astype("float64")
 
-                above_bare = sm5_valid & (sm5_float > bare_y + dmr_ceiling)
-                if np.any(above_bare):
-                    med = median_filter(sm5_float, size=3)
-                    replacement = np.where(med <= bare_y + dmr_ceiling, med, bare_y)
-                    sm5_data = np.where(above_bare, replacement, sm5_float).astype(sm5_data.dtype)
-                    print(f"  DMR5G ceiling fixed {int(np.count_nonzero(above_bare))} SM5 spike cells "
-                          f"(>{dmr_ceiling:g} m above bare earth)")
-                    sm5_float = sm5_data.astype("float64")
-
-                # DMR5G floor — symmetric to ceiling. SM5 can have multi-cell
-                # deep-pit artefacts (cluster nodata-fill glitches) up to
-                # several hundred metres below bare earth. The single-cell
-                # pit detector earlier misses cluster pits ≥2 cells wide. A
-                # cell sitting more than `dmr_ceiling` metres below DMR5G is
-                # physically impossible (LIDAR doesn't see below ground) —
-                # replace with bare_y. Hřensko-mega 4 km mesh had 750 cells
-                # in one cluster reaching -385 m relative.
-                below_bare = sm5_valid & (sm5_float < bare_y - dmr_ceiling)
-                if np.any(below_bare):
-                    sm5_data = np.where(below_bare, bare_y.astype(sm5_data.dtype), sm5_data)
-                    print(f"  DMR5G floor fixed {int(np.count_nonzero(below_bare))} SM5 deep-pit cells "
-                          f"(>{dmr_ceiling:g} m below bare earth)")
+            # DMR5G floor — symmetric to ceiling. SM5 can have multi-cell
+            # deep-pit artefacts (cluster nodata-fill glitches) up to
+            # several hundred metres below bare earth. The single-cell
+            # pit detector earlier misses cluster pits ≥2 cells wide. A
+            # cell sitting more than `dmr_ceiling` metres below DMR5G is
+            # physically impossible (LIDAR doesn't see below ground) —
+            # replace with bare_y. Hřensko-mega 4 km mesh had 750 cells
+            # in one cluster reaching -385 m relative.
+            below_bare = sm5_valid & (sm5_float < bare_y - dmr_ceiling)
+            if np.any(below_bare):
+                sm5_data = np.where(below_bare, bare_y.astype(sm5_data.dtype), sm5_data)
+                print(f"  DMR5G floor fixed {int(np.count_nonzero(below_bare))} SM5 deep-pit cells "
+                      f"(>{dmr_ceiling:g} m below bare earth)")
         if smooth_sigma > 0:
             # Soften the DSM before meshing so building-edge cliffs don't
             # produce near-vertical mesh faces that smear the ortofoto
@@ -297,6 +306,9 @@ def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, parent,
 
     vertices = []
     world_coords = []
+    # --- BARE-Y feature ---
+    bare_ys = [] if _bare_grid is not None else None
+    # --- end BARE-Y ---
     for r in range(n):
         for c in range(n):
             local_x = -half + c * step
@@ -334,6 +346,14 @@ def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, parent,
 
             vertices.append([local_x, y, local_z])
             world_coords.append((world_x, world_y))
+            # --- BARE-Y feature: sample DMR5G at vertex position, fall back
+            # to parent_y (= panorama, which is itself DMR5G) outside grid. ---
+            if bare_ys is not None:
+                bare_ys.append(float(_sample_grid_y(
+                    _bare_grid, _bare_half, _bare_step,
+                    _bare_cx, _bare_cy, world_x, world_y,
+                )))
+            # --- end BARE-Y ---
 
     # Faces — 2 triangles per quad, dropped only where the quad's full bbox
     # lies STRICTLY inside a child detail's L-∞ bbox (all 4 vertices inside).
@@ -376,6 +396,11 @@ def build_detail(cx, cy, half, step, fade_width, ground_z, manifest_dir, parent,
         "uvs": uvs,
         "sjtsk_bbox": [cx - half, cy - half, cx + half, cy + half],
         "wgs_bbox": [lon_min, lat_min, lon_max, lat_max],
+        # --- BARE-Y feature: optional per-vertex bare-earth Y (None when
+        # no DMR5G ref is available). gen_panorama.save_glb adds a _BARE_Y
+        # accessor if present; viewer uses it as alternate vertex Y. ---
+        "bare_ys": bare_ys,
+        # --- end BARE-Y ---
         # Stash for optional post-build simplification.
         "_simplify_meta": {
             "cx": cx, "cy": cy,

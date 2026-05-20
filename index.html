@@ -188,12 +188,26 @@
     }
     resultsEl.innerHTML = '<i>Hledám…</i>';
     try {
-      const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=${SEARCH_KIND}`);
+      let r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=${SEARCH_KIND}`);
       if (r.status === 503) {
         resultsEl.innerHTML = '<div class="error">ČÚZK nedostupné. Zkus později nebo zadej S-JTSK ručně.</div>';
         return;
       }
-      const data = await r.json();
+      let data = await r.json();
+      // Auto-fallback: pokud v address módu nic, zkus parcel (a naopak).
+      // Typický scénář: user napíše "Borová u Poličky 2664" (= parcel)
+      // v defaultním Adresa módu → 0 výsledků. Místo "nic" mu nabídneme
+      // co najdeme v opačném módu.
+      if (data.length === 0) {
+        const otherKind = SEARCH_KIND === 'address' ? 'parcel' : 'address';
+        const r2 = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=${otherKind}`);
+        if (r2.ok) {
+          const data2 = await r2.json();
+          if (data2.length > 0) {
+            data = data2;
+          }
+        }
+      }
       if (data.length === 0) {
         resultsEl.innerHTML = `
           <div class="error">Nic nenalezeno. Zkus i s diakritikou.</div>

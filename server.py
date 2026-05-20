@@ -655,7 +655,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
         cache_key_src = "hires|" + "|".join(
             f"{k}={query.get(k, [''])[0]}"
-            for k in ("BBOX", "size", "format", "ktx2", "quality")
+            for k in ("BBOX", "WBBOX", "size", "format", "ktx2", "quality")
         )
         cache_key = hashlib.sha256(cache_key_src.encode()).hexdigest()[:16]
         cache_dir = Path("cache/orto_render")
@@ -738,9 +738,54 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 composite.paste(sub, (paste_x, paste_y))
                 fetched_count += 1
 
+        # WGS84 reprojection. The detail mesh UVs are computed over a
+        # WGS-aligned envelope (gen_detail.py:367), so the texture must be
+        # WGS-axis-aligned too — otherwise the SJTSK-axis composite shows
+        # a ~7.7° rotation against the mesh (S-JTSK Krovak axes are rotated
+        # against WGS by that angle). Over a 1 km bbox the corner offset
+        # is ~135 m, which matches the user-reported "200 m square corner
+        # missing" symptom. raw branch already does this; VHR was the only
+        # path skipping it. Same reproject helper as raw.
+        wbbox_str = query.get("WBBOX", [""])[0]
+        if wbbox_str:
+            try:
+                west, south, east, north = (float(x) for x in wbbox_str.split(","))
+            except ValueError:
+                self.send_error(400, "WBBOX must be west,south,east,north (WGS84)")
+                return
+            import numpy as np
+            import rasterio
+            import rasterio.transform
+            import rasterio.warp
+            src_arr = np.array(composite)
+            src_chw = src_arr.transpose(2, 0, 1).copy()
+            src_transform = rasterio.transform.from_origin(
+                sjtsk_xmin, sjtsk_ymax,
+                (sjtsk_xmax - sjtsk_xmin) / composite.width,
+                (sjtsk_ymax - sjtsk_ymin) / composite.height,
+            )
+            try:
+                size_param = max(64, min(int(query.get("size", ["4096"])[0]), 8192))
+            except ValueError:
+                size_param = 4096
+            out_w = out_h = size_param
+            dst_transform = rasterio.transform.from_bounds(
+                west, south, east, north, out_w, out_h,
+            )
+            dst_arr = np.zeros((3, out_h, out_w), dtype=np.uint8)
+            rasterio.warp.reproject(
+                src_chw, dst_arr,
+                src_transform=src_transform, src_crs="EPSG:5514",
+                dst_transform=dst_transform, dst_crs="EPSG:4326",
+                resampling=rasterio.warp.Resampling.lanczos,
+            )
+            composite = Image.fromarray(dst_arr.transpose(1, 2, 0))
+
         # Resize + encode reusing the same pipeline as the raw branch.
         size_str = query.get("size", [""])[0]
-        if size_str:
+        if size_str and not wbbox_str:
+            # WBBOX path already sized the output via reproject; only
+            # raw-SJTSK path needs the secondary resize.
             try:
                 target = max(64, min(int(size_str), 8192))
                 ratio = composite.width / max(composite.height, 1)
@@ -2481,11 +2526,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
           layer — ČÚZK WMS layer name (default 'KN' = full cadastre with
                   parcel numbers; 'DKM' = boundaries only; see WMS caps for
                   more)
-          size  — output PNG side in px (default 2048, max 4096). Numbers
+          size  — output PNG side in px (default 4096, max 8192). Numbers
                   start appearing at ≥ 1.5 px/m in the rendered bbox, so
-                  inner (1 km) at 2048² = 2 px/m → readable numbers; closeup
-                  (3 km) at 2048² = 0.7 px/m → numbers tiny.
+                  inner (1 km) at 4096² = 4 px/m → very readable numbers;
+                  closeup (3 km) at 4096² = 1.4 px/m → numbers legible.
           style — line styling: thin/normal/medium/thick (dilation+blur).
+          bg    — 'transparent' (default, alpha-cuts white for orto overlay)
+                  or 'white' (keep WMS white background, opaque PNG → hides
+                  orto for clean cadastre-only view).
         """
         import numpy as np
         query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
@@ -2500,10 +2548,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Invalid layer name")
             return
         try:
-            size = min(4096, max(256, int(query.get("size", ["2048"])[0])))
+            size = min(8192, max(256, int(query.get("size", ["4096"])[0])))
         except ValueError:
-            size = 2048
+            size = 4096
         style = query.get("style", ["normal"])[0]
+        bg = query.get("bg", ["transparent"])[0]
         # Request WMS at the full output size — no upsampling on our side.
         wms_size = size
 
@@ -2525,12 +2574,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             img = Image.open(BytesIO(img_data)).convert("RGBA")
             arr = np.array(img)
 
-            # Make white/light background transparent, keep already-transparent pixels
-            orig_alpha = arr[:, :, 3].copy()
-            # int32 — (250 - lightness) * 255 overflows int16 (max 32767 < 63750)
-            lightness = np.minimum(arr[:,:,0], np.minimum(arr[:,:,1], arr[:,:,2])).astype(np.int32)
-            bg_alpha = np.clip((250 - lightness) * 255 // 50, 0, 255).astype(np.uint8)
-            arr[:, :, 3] = np.minimum(orig_alpha, bg_alpha)
+            if bg == "white":
+                # Keep WMS output as-is (white background opaque). Used when
+                # cadastre is meant to fully cover the orto for a clean read.
+                pass
+            else:
+                # Make white/light background transparent, keep already-transparent pixels
+                orig_alpha = arr[:, :, 3].copy()
+                # int32 — (250 - lightness) * 255 overflows int16 (max 32767 < 63750)
+                lightness = np.minimum(arr[:,:,0], np.minimum(arr[:,:,1], arr[:,:,2])).astype(np.int32)
+                bg_alpha = np.clip((250 - lightness) * 255 // 50, 0, 255).astype(np.uint8)
+                arr[:, :, 3] = np.minimum(orig_alpha, bg_alpha)
 
             if style in ("medium", "thick"):
                 dilation_iter = 2 if style == "medium" else 3

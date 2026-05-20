@@ -644,7 +644,7 @@ async function loadV2() {
         // 0.125 m/px vs the cached 0.25 m SM5 source). Other LODs always
         // use the cached source — they're at coarser bbox/size anyway.
         const hiresParam = (detail.slug === 'inner' && HIRES) ? '&hires=1' : '';
-        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}${hiresParam}`;
+        const url = `/proxy/ortofoto?BBOX=${bb.join(',')}&WBBOX=${wb.join(',')}&size=${size}&zoom=${zoom}&format=ktx2&ktx2=${ktxMode}${hiresParam}&${BUST}`;
         const loader = ktx2Loader;
         loader.load(url, (tex) => {
           _configureDetailTexture(tex);
@@ -716,8 +716,41 @@ async function loadV2() {
     }
   }
 
+  // Bare-earth heightfield from panorama (DMR5G, ground only — no buildings
+  // or trees). Used to cap parcel-outline drape so the line stays near the
+  // ground beneath tall thin features (trees, narrow chimneys) while still
+  // climbing real building walls. Panorama covers ~30 km @ 50 m step so
+  // even a coarse sample is plenty for cadastre-line draping.
+  let _bareField = null;
+  if (_panoramaMesh) {
+    const meta = _panoramaMesh.userData.meta;
+    const n = Math.round(2 * meta.half / meta.step) + 1;
+    const pos = _panoramaMesh.geometry.getAttribute('position');
+    if (pos && pos.count >= n * n) {
+      const ys = new Float32Array(n * n);
+      ys.fill(NaN);
+      const arr = pos.array;
+      for (let i = 0; i < pos.count; i++) {
+        const x = arr[i * 3], y = arr[i * 3 + 1], z = arr[i * 3 + 2];
+        const c = Math.round((x + meta.half) / meta.step);
+        const r = Math.round((z + meta.half) / meta.step);
+        if (c < 0 || c >= n || r < 0 || r >= n) continue;
+        const k = r * n + c;
+        // Skirt verts share x,z with edge cells but drop in Y — keep MAX
+        // so the field reflects the actual ground row.
+        if (isNaN(ys[k]) || y > ys[k]) ys[k] = y;
+      }
+      _bareField = {
+        ys, n,
+        half: meta.half, step: meta.step,
+        sceneCx: _panoramaMesh.position.x,
+        sceneCz: _panoramaMesh.position.z,
+      };
+    }
+  }
+
   // Manual-debug handle in the console.
-  window._v2 = { region, details, allMeshes, scene, camera, controls, renderer, innerField: _innerField };
+  window._v2 = { region, details, allMeshes, scene, camera, controls, renderer, innerField: _innerField, bareField: _bareField };
 
   // Re-target camera vertically to the inner mesh's centroid Y. region.ground_z
   // is the panorama-wide reference elevation, which equals village elevation
@@ -816,31 +849,29 @@ function setupParcelSelection(region, innerField) {
 
   function buildCadastreForMesh(detailMesh) {
     const meta = detailMesh.userData && detailMesh.userData.meta;
-    if (!meta || !meta.center_sjtsk) return;
+    if (!meta || !meta.center_sjtsk || !meta.sjtsk_bbox) return;
     const geo = detailMesh.geometry;
     const pos = geo.attributes.position.array;
     const origIdx = geo.index ? geo.index.array : null;
     if (!origIdx) return;
 
-    // Actual vertex extent in local coords (handles Draco quant jitter and
-    // skirt verts equally — we use the full envelope).
-    let lxMin = Infinity, lxMax = -Infinity, lzMin = Infinity, lzMax = -Infinity;
-    for (let i = 0; i < pos.length; i += 3) {
-      const lx = pos[i], lz = pos[i + 2];
-      if (lx < lxMin) lxMin = lx; if (lx > lxMax) lxMax = lx;
-      if (lz < lzMin) lzMin = lz; if (lz > lzMax) lzMax = lz;
-    }
-    // gen_detail / gen_panorama convention: world_y_sjtsk = cy + local_z
-    // (different from gen_multitile's flip). bbox for WMS in S-JTSK:
+    // Use the manifest's authoritative SJTSK bbox (matches what the ortho
+    // proxy is queried with). Vertex-extent inference would drift by the
+    // skirt + Draco/meshopt quantization jitter and produce a slightly
+    // mis-registered overlay vs the orto texture.
+    const [wxMin, wyMin, wxMax, wyMax] = meta.sjtsk_bbox;
     const cx = meta.center_sjtsk[0], cy = meta.center_sjtsk[1];
-    const wxMin = cx + lxMin, wxMax = cx + lxMax;
-    const wyMin = cy + lzMin, wyMax = cy + lzMax;
+    // Local-space envelope corresponding to the manifest bbox. gen_detail
+    // convention: local_x = wx - cx, local_z = wy - cy.
+    const lxMin = wxMin - cx, lxMax = wxMax - cx;
+    const lzMin = wyMin - cy, lzMax = wyMax - cy;
 
     // Layer KN = full cadastre (boundaries + parcel numbers + buildings).
-    // size=2048 → ≈2 px/m on inner (1 km bbox), enough for parcel numbers
-    // to render; closeup (3 km) gets ~0.7 px/m so numbers are small but
-    // boundary precision still wins vs the old 1024² render.
-    const url = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&layer=KN&size=2048`;
+    // size=4096 → ≈4 px/m on inner (1 km bbox), large/sharp parcel numbers;
+    // closeup (3 km) gets ~1.4 px/m → numbers small but legible.
+    // bg=transparent (default) → white background alpha-cuts, only the
+    // lines/numbers/buildings overlay the orto underneath.
+    const url = `/proxy/cadastre?BBOX=${wxMin},${wyMin},${wxMax},${wyMax}&layer=KN&size=4096`;
     texLoader.load(url, (texture) => {
       texture.colorSpace = THREE.SRGBColorSpace;
       texture.anisotropy = _maxAniso;
@@ -1024,9 +1055,9 @@ function setupParcelSelection(region, innerField) {
   // side, so the outline lies exactly on the rendered surface. Returns
   // null when the point falls outside the inner mesh footprint.
   // Mesh has scale.z = -1, so world Z maps to local Z via negation.
-  function sampleInnerY(wx, wz) {
-    if (!innerField) return null;
-    const { ys, n, half, step, sceneCx, sceneCz } = innerField;
+  function _sampleField(field, wx, wz) {
+    if (!field) return null;
+    const { ys, n, half, step, sceneCx, sceneCz } = field;
     const lx = wx - sceneCx;
     const lz = -(wz - sceneCz);
     if (lx < -half || lx > half || lz < -half || lz > half) return null;
@@ -1042,12 +1073,30 @@ function setupParcelSelection(region, innerField) {
     const y10 = ys[(iz + 1) * n + ix];
     const y01 = ys[iz * n + (ix + 1)];
     const y11 = ys[(iz + 1) * n + (ix + 1)];
-    // Any of the 4 corners NaN (cell never filled by a Draco-decoded vertex,
-    // e.g. carved hole or missed snap) → fall back to caller's ring-corner Y.
     if (isNaN(y00) || isNaN(y10) || isNaN(y01) || isNaN(y11)) return null;
-    // gen_detail emits T1=[(0,0),(1,0)x,(0,1)z], T2=[(1,0),(0,1),(1,1)]
     if (tx + tz <= 1.0) return (1 - tx - tz) * y00 + tz * y10 + tx * y01;
     return (1 - tz) * y01 + (1 - tx) * y10 + (tx + tz - 1) * y11;
+  }
+
+  function sampleInnerY(wx, wz) {
+    return _sampleField(innerField, wx, wz);
+  }
+
+  // Drape sampler: inner DSM capped to bare-earth + DRAPE_TREE_CAP.
+  // DSM includes buildings AND trees. Real building walls are typically 3-8m
+  // tall and survive (cap is above them). Trees 15-30m tall get clipped to
+  // (bare + cap), so the outline stays just above ground beneath the canopy
+  // instead of arching over the tree. If bare earth or inner unavailable for
+  // a sample, falls back to whichever exists.
+  const DRAPE_TREE_CAP = 6.0;
+  function sampleDrapeY(wx, wz) {
+    const inner = sampleInnerY(wx, wz);
+    const bare = _bareField ? _sampleField(_bareField, wx, wz) : null;
+    if (inner === null) return bare;
+    if (bare === null) return inner;
+    // Clamp inner Y to (bare + cap). Real cliffs/buildings under 6m stay.
+    const cap = bare + DRAPE_TREE_CAP;
+    return inner > cap ? cap : inner;
   }
 
   // Drape one ring edge across the rendered surface. Inside the inner
@@ -1079,7 +1128,10 @@ function setupParcelSelection(region, innerField) {
     const segLen = Math.hypot(dx, dz);
     const n = Math.max(1, Math.ceil(segLen / SUB_M));
 
-    // Pass 1: sample raw heightfield Y at every sub-step.
+    // Pass 1: sample raw heightfield Y at every sub-step. (Bare-earth
+    // capping was tried but put the tube below the DSM surface beneath
+    // trees → depth-occluded → outline invisible. The cosmetic "waves
+    // over tree canopy" was less bad than the highlight disappearing.)
     const raw = [];
     for (let k = 0; k <= n; k++) {
       const t = k / n;

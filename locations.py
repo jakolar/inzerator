@@ -170,12 +170,21 @@ def _escape_like(q: str) -> str:
 
 
 def _ruian_get(url, timeout=15):
+    # ČÚZK občas zavře první spojení (Errno 61 Connection refused) a druhé
+    # projde. Retry 5× s exponenciálním backoffem (0.5 + 1 + 2 + 4 + 8 =
+    # 15.5 s total). Bez retry kullen každý address search při ČÚZK flake.
     req = Request(url, headers={"User-Agent": "inzerator/1.0"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except (URLError, HTTPError, TimeoutError, OSError) as e:
-        raise RuianUnavailable(str(e)) from e
+    import time as _t
+    last_err = None
+    for attempt in range(5):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except (URLError, HTTPError, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt < 4:
+                _t.sleep(0.5 * (2 ** attempt))
+    raise RuianUnavailable(str(last_err)) from last_err
 
 
 def _address_query(where_clauses: list[str], record_count: int) -> list[dict]:

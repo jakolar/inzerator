@@ -2,7 +2,7 @@
 
 DMR5G only; one GLB per region. Cardinal: scene +Z = world +Y (north).
 """
-import argparse, json, urllib.request
+import argparse, json, urllib.request, urllib.error
 from pathlib import Path
 import numpy as np
 import pygltflib
@@ -26,16 +26,37 @@ def fetch_dmr5g(cx, cy, half, step, cache_dir="cache/dmr5g_v2"):
         f"&format=tiff&pixelType=F32&f=image"
     )
     tmp_path = cache_path.with_suffix('.tif.tmp')
-    with urllib.request.urlopen(url, timeout=120) as r:
-        tmp_path.write_bytes(r.read())
-    tmp_path.replace(cache_path)
-    return cache_path
+    # ČÚZK occasionally drops the first connection with Errno 61 while
+    # adjacent requests succeed — retry up to 5× with exponential backoff
+    # (0.5 + 1 + 2 + 4 = 7.5 s total) before giving up. Matches _ruian_get
+    # policy in locations.py.
+    import time as _t
+    last_err = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                tmp_path.write_bytes(r.read())
+            tmp_path.replace(cache_path)
+            return cache_path
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt < 4:
+                _t.sleep(0.5 * (2 ** attempt))
+    raise last_err
 
 
-def build_panorama(dmr5g_path, cx, cy, half, step):
+def build_panorama(dmr5g_path, cx, cy, half, step, detail_holes=()):
     """Return {vertices, faces, uvs, sjtsk_bbox, wgs_bbox, ground_z}.
 
     Convention: scene +Z = world +Y. world_y(local_z) = cy + local_z.
+
+    `detail_holes` — iterable of (det_cx, det_cy, det_half_m). For each entry
+    we drop panorama quads whose centroid falls inside the L-∞ square
+    [det_cx ± det_half, det_cy ± det_half]. The detail mesh occupies exactly
+    that square at higher resolution, so the panorama under it is both
+    redundant and harmful (causes overlap artefacts where panorama Y >
+    detail Y in low spots). Vertices are kept so panorama Y sampling for the
+    detail's fade band still works.
     """
     with rasterio.open(dmr5g_path) as ds:
         data = ds.read(1)
@@ -70,11 +91,28 @@ def build_panorama(dmr5g_path, cx, cy, half, step):
             world_coords.append((world_x, world_y))
 
     faces = []
+    n_carved = 0
+    # Carve only quads whose full bbox lies STRICTLY inside a child detail
+    # (all 4 vertices inside). Boundary quads stay so the parent extends to
+    # and slightly past the child's outer edge — no gap from grid misalignment
+    # (step doesn't have to divide child half evenly); polygonOffset on the
+    # child handles the small overlap.
     for r in range(n - 1):
         for c in range(n - 1):
+            qxmin = cx + (-half + c * step)
+            qxmax = cx + (-half + (c + 1) * step)
+            qymin = cy + (-half + r * step)
+            qymax = cy + (-half + (r + 1) * step)
+            if any(qxmin > dcx - dhalf and qxmax < dcx + dhalf and
+                   qymin > dcy - dhalf and qymax < dcy + dhalf
+                   for dcx, dcy, dhalf in detail_holes):
+                n_carved += 1
+                continue
             i = r * n + c
             faces.append([i, i + n, i + 1])
             faces.append([i + 1, i + n, i + n + 1])
+    if detail_holes:
+        print(f"  Carved {n_carved} quads ({n_carved * 2} faces) under {len(detail_holes)} detail hole(s)")
 
     sx = np.array([w[0] for w in world_coords])
     sy = np.array([w[1] for w in world_coords])
@@ -221,15 +259,23 @@ def main():
     out_dir = Path(f"tiles_v2_{args.region}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Read any existing details from the manifest so we can carve their footprint
+    # out of the panorama (avoids panorama-over-detail occlusion at low spots).
+    manifest_path = out_dir / "manifest.json"
+    existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"details": []}
+    detail_holes = [
+        (d["center_sjtsk"][0], d["center_sjtsk"][1], d["half"])
+        for d in existing.get("details", [])
+    ]
+
     print(f"Fetching DMR5G for {args.region} ({cx}, {cy}) — {args.half*2/1000:.0f}km square …")
     dmr = fetch_dmr5g(cx, cy, args.half, args.step)
-    tile = build_panorama(dmr, cx, cy, args.half, args.step)
+    tile = build_panorama(dmr, cx, cy, args.half, args.step, detail_holes=detail_holes)
     add_skirt(tile, args.skirt, args.half, args.step)
     glb_path = out_dir / "panorama.glb"
     save_glb(tile, str(glb_path))
 
-    manifest_path = out_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"details": []}
+    manifest = existing
     manifest["region"] = {
         "slug": args.region,
         "center_sjtsk": [cx, cy],

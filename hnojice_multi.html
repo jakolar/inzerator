@@ -216,6 +216,7 @@ dataLoaded.then(() => {
   const panoramaTiles = tiles.filter(t => t.is_panorama);
   let sharedPanTexPromise = null;
   let panBbox = null;   // [xmin, ymin, xmax, ymax] in S-JTSK
+  let panWgsBbox = null;
   if (panoramaTiles.length > 0) {
     panBbox = [
       Math.min(...panoramaTiles.map(t => t.sjtsk_bbox[0])),
@@ -223,7 +224,7 @@ dataLoaded.then(() => {
       Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const panWgsBbox = [
+    panWgsBbox = [
       Math.min(...panoramaTiles.map(t => t.wgs_bbox[0])),
       Math.min(...panoramaTiles.map(t => t.wgs_bbox[1])),
       Math.max(...panoramaTiles.map(t => t.wgs_bbox[2])),
@@ -244,6 +245,7 @@ dataLoaded.then(() => {
   const l4Tiles = tiles.filter(t => t.is_horizon_l4);
   let sharedL4TexPromise = null;
   let l4Bbox = null;
+  let l4WgsBbox = null;
   if (l4Tiles.length > 0) {
     l4Bbox = [
       Math.min(...l4Tiles.map(t => t.sjtsk_bbox[0])),
@@ -251,7 +253,7 @@ dataLoaded.then(() => {
       Math.max(...l4Tiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...l4Tiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const l4WgsBbox = [
+    l4WgsBbox = [
       Math.min(...l4Tiles.map(t => t.wgs_bbox[0])),
       Math.min(...l4Tiles.map(t => t.wgs_bbox[1])),
       Math.max(...l4Tiles.map(t => t.wgs_bbox[2])),
@@ -268,6 +270,7 @@ dataLoaded.then(() => {
   const l5Tiles = tiles.filter(t => t.is_horizon_l5);
   let sharedL5TexPromise = null;
   let l5Bbox = null;
+  let l5WgsBbox = null;
   if (l5Tiles.length > 0) {
     l5Bbox = [
       Math.min(...l5Tiles.map(t => t.sjtsk_bbox[0])),
@@ -275,7 +278,7 @@ dataLoaded.then(() => {
       Math.max(...l5Tiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...l5Tiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const l5WgsBbox = [
+    l5WgsBbox = [
       Math.min(...l5Tiles.map(t => t.wgs_bbox[0])),
       Math.min(...l5Tiles.map(t => t.wgs_bbox[1])),
       Math.max(...l5Tiles.map(t => t.wgs_bbox[2])),
@@ -299,23 +302,26 @@ dataLoaded.then(() => {
         allMeshes.push(mesh);
 
         // Phase 4: horizon L4/L5 tiles use per-ring shared textures with UV remap.
-        const _applySharedTex = (promise, bbox, label) => {
+        // Atlas math runs in WGS84: GLB UVs are normalized in each tile's
+        // wgs_bbox, and the server crops the composite to the atlas WGS bbox,
+        // so offsets/repeats must be in the same WGS84 space.
+        const _applySharedTex = (promise, atlasWgsBbox, label) => {
           const FLIP_V = true;
           promise.then(sharedTex => {
             sharedTex.colorSpace = THREE.SRGBColorSpace;
             sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
             const tex = sharedTex.clone();
             tex.needsUpdate = true;
-            const bWidth  = bbox[2] - bbox[0];
-            const bHeight = bbox[3] - bbox[1];
-            tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / bWidth;
-            tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / bHeight;
+            const bWidth  = atlasWgsBbox[2] - atlasWgsBbox[0];
+            const bHeight = atlasWgsBbox[3] - atlasWgsBbox[1];
+            tex.repeat.x = (tile.wgs_bbox[2] - tile.wgs_bbox[0]) / bWidth;
+            tex.repeat.y = (tile.wgs_bbox[3] - tile.wgs_bbox[1]) / bHeight;
             if (FLIP_V) {
-              tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
-              tex.offset.y = 1 - (tile.sjtsk_bbox[3] - bbox[1]) / bHeight;
+              tex.offset.x = (tile.wgs_bbox[0] - atlasWgsBbox[0]) / bWidth;
+              tex.offset.y = 1 - (tile.wgs_bbox[3] - atlasWgsBbox[1]) / bHeight;
             } else {
-              tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
-              tex.offset.y = (tile.sjtsk_bbox[1] - bbox[1]) / bHeight;
+              tex.offset.x = (tile.wgs_bbox[0] - atlasWgsBbox[0]) / bWidth;
+              tex.offset.y = (tile.wgs_bbox[1] - atlasWgsBbox[1]) / bHeight;
             }
             mesh.material.map = tex;
             mesh.material.needsUpdate = true;
@@ -325,11 +331,11 @@ dataLoaded.then(() => {
         };
 
         if (tile.is_horizon_l4 && sharedL4TexPromise) {
-          _applySharedTex(sharedL4TexPromise, l4Bbox, 'L4 horizon');
+          _applySharedTex(sharedL4TexPromise, l4WgsBbox, 'L4 horizon');
           return;
         }
         if (tile.is_horizon_l5 && sharedL5TexPromise) {
-          _applySharedTex(sharedL5TexPromise, l5Bbox, 'L5 horizon');
+          _applySharedTex(sharedL5TexPromise, l5WgsBbox, 'L5 horizon');
           return;
         }
 
@@ -341,16 +347,16 @@ dataLoaded.then(() => {
             sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
             const tex = sharedTex.clone();
             tex.needsUpdate = true;
-            const panWidth  = panBbox[2] - panBbox[0];
-            const panHeight = panBbox[3] - panBbox[1];
-            tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / panWidth;
-            tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / panHeight;
+            const panWidth  = panWgsBbox[2] - panWgsBbox[0];
+            const panHeight = panWgsBbox[3] - panWgsBbox[1];
+            tex.repeat.x = (tile.wgs_bbox[2] - tile.wgs_bbox[0]) / panWidth;
+            tex.repeat.y = (tile.wgs_bbox[3] - tile.wgs_bbox[1]) / panHeight;
             if (FLIP_V) {
-              tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
-              tex.offset.y = 1 - (tile.sjtsk_bbox[3] - panBbox[1]) / panHeight;
+              tex.offset.x = (tile.wgs_bbox[0] - panWgsBbox[0]) / panWidth;
+              tex.offset.y = 1 - (tile.wgs_bbox[3] - panWgsBbox[1]) / panHeight;
             } else {
-              tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
-              tex.offset.y = (tile.sjtsk_bbox[1] - panBbox[1]) / panHeight;
+              tex.offset.x = (tile.wgs_bbox[0] - panWgsBbox[0]) / panWidth;
+              tex.offset.y = (tile.wgs_bbox[1] - panWgsBbox[1]) / panHeight;
             }
             mesh.material.map = tex;
             mesh.material.needsUpdate = true;
@@ -376,7 +382,8 @@ dataLoaded.then(() => {
         });
       };
   
-      gltfLoader.load(tile.glb_url, (gltf) => {
+      const glbUrl = `${tile.glb_url}?v=lod-stitch-20260513-10`;
+      gltfLoader.load(glbUrl, (gltf) => {
         let m = gltf.scene.children[0];
         if (m && !m.isMesh && m.children[0]) m = m.children[0];
         if (m) setupMesh(m.geometry);

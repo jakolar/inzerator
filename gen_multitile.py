@@ -13,11 +13,117 @@ from pyproj import Transformer
 
 SJTSK_TO_WGS = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
 
-# Inner grid (extract_tile) uses pixel-center sampling with a 1m buffer overlap.
-# Its outermost vertex is at local ±(half + 0.25) in tile-local coords, not ±half.
-# Panorama tiles bordering the inner grid must shift their inner-facing edge
-# vertices inward by this amount so the shared boundary X/Z matches exactly.
+# Inner grid (extract_tile) uses pixel-center sampling with a 1m buffer overlap:
+# sample centres run from -half+0.25 to +half+0.25 in scene X/Z. Panorama tiles
+# bordering the inner grid must shift their inner-facing edge vertices by the
+# same scene-axis bias so the shared boundary X/Z matches exactly.
 PANORAMA_INNER_EDGE_OFFSET = 0.25
+
+
+def bbox_from_vertices(cx, cy, vertices):
+    """Return actual S-JTSK and WGS84 bbox covered by mesh vertices.
+
+    Convention: scene +Z = world -Y (south). world_y = cy - local_z. Matches
+    inner-grid placement via t["offset_z"] = -(cy - gcy).
+    """
+    all_sx = np.array([cx + v[0] for v in vertices])
+    all_sy = np.array([cy - v[2] for v in vertices])
+    all_lon, all_lat = SJTSK_TO_WGS.transform(all_sx, all_sy)
+    return (
+        [float(all_sx.min()), float(all_sy.min()), float(all_sx.max()), float(all_sy.max())],
+        [float(all_lon.min()), float(all_lat.min()), float(all_lon.max()), float(all_lat.max())],
+    )
+
+
+def load_glb_positions(path):
+    """Read POSITION floats from a simple single-mesh binary GLB."""
+    data = Path(path).read_bytes()
+    magic, _version, _length = struct.unpack_from("<III", data, 0)
+    if magic != 0x46546C67:
+        raise ValueError(f"{path} is not a GLB")
+
+    offset = 12
+    gltf = None
+    bin_chunk = None
+    while offset < len(data):
+        chunk_len, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk = data[offset:offset + chunk_len]
+        offset += chunk_len
+        if chunk_type == 0x4E4F534A:  # JSON
+            gltf = json.loads(chunk.decode("utf-8").rstrip("\x00 "))
+        elif chunk_type == 0x004E4942:  # BIN
+            bin_chunk = chunk
+
+    primitive = gltf["meshes"][0]["primitives"][0]
+    accessor = gltf["accessors"][primitive["attributes"]["POSITION"]]
+    view = gltf["bufferViews"][accessor["bufferView"]]
+    byte_offset = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+    return np.frombuffer(
+        bin_chunk,
+        dtype="<f4",
+        count=accessor["count"] * 3,
+        offset=byte_offset,
+    ).reshape(accessor["count"], 3).copy()
+
+
+def stitch_inner_edges_from_glbs(tile, offset_x, offset_z, half, inner_edges, source_tiles):
+    """Match this tile's inner boundary Y values to already-generated ring GLBs.
+
+    DMR5G and SM5 DMP can disagree by tens or hundreds of metres on far-ring
+    boundaries. Sampling the next ring independently leaves visible floating
+    plates; stitching only the shared inner boundary keeps each ring continuous
+    while preserving its own relief away from the seam.
+    """
+    if not inner_edges or not source_tiles:
+        return
+
+    position_cache = {}
+
+    def line_samples(axis, value):
+        other_axis = 2 if axis == 0 else 0
+        samples = {}
+        for meta in source_tiles:
+            path = meta.get("glb_url")
+            if not path or not Path(path).exists():
+                continue
+            if path not in position_cache:
+                position_cache[path] = load_glb_positions(path)
+            pts = position_cache[path]
+            on_line = np.isclose(pts[:, axis], value, atol=0.02)
+            for p in pts[on_line]:
+                key = round(float(p[other_axis]), 3)
+                # Skirt vertices duplicate edge X/Z with lower Y; keep terrain.
+                if key not in samples or float(p[1]) > samples[key]:
+                    samples[key] = float(p[1])
+        if not samples:
+            return None
+        keys = sorted(samples)
+        xs = np.array(keys, dtype=np.float64)
+        ys = np.array([samples[k] for k in keys], dtype=np.float64)
+        return xs, ys
+
+    edge_specs = {
+        "W": (0, offset_x - half, 2, lambda v: abs(v[0] + half) < 1e-6),
+        "E": (0, offset_x + half, 2, lambda v: abs(v[0] - half) < 1e-6),
+        "S": (2, offset_z - half, 0, lambda v: abs(v[2] + half) < 1e-6),
+        "N": (2, offset_z + half, 0, lambda v: abs(v[2] - half) < 1e-6),
+    }
+
+    for edge in inner_edges:
+        axis, line_value, other_axis, is_edge_vertex = edge_specs[edge]
+        samples = line_samples(axis, line_value)
+        if samples is None:
+            continue
+        sample_x, sample_y = samples
+        lo, hi = float(sample_x[0]), float(sample_x[-1])
+        for v in tile["vertices"]:
+            if not is_edge_vertex(v):
+                continue
+            scene_other = (offset_z + v[2]) if other_axis == 2 else (offset_x + v[0])
+            if scene_other < lo - 0.02 or scene_other > hi + 0.02:
+                continue
+            v[1] = float(np.interp(scene_other, sample_x, sample_y))
 
 
 def fetch_dmr5g_tile(cx, cy, half, step):
@@ -45,7 +151,7 @@ def fetch_dmr5g_tile(cx, cy, half, step):
     bbox = f"{cx-half},{cy-half},{cx+half},{cy+half}"
     url = (
         f"https://ags.cuzk.gov.cz/arcgis/rest/services/3D/dmr5g/ImageServer/exportImage"
-        f"?bbox={bbox}&bboxSR=5514&size={n_pixels},{n_pixels}"
+        f"?bbox={bbox}&bboxSR=5514&imageSR=5514&size={n_pixels},{n_pixels}"
         f"&format=tiff&pixelType=F32&f=image"
     )
 
@@ -56,6 +162,15 @@ def fetch_dmr5g_tile(cx, cy, half, step):
             print(f"  [dmr5g] suspiciously small response: {len(data)} bytes")
             return None
         cache_path.write_bytes(data)
+        # SM5 TIFFs in cache/dmpok_tiff_*/ ship without CRS metadata, so
+        # rasterio.merge refuses to mix them with a CRS-tagged source. Strip
+        # the CRS from the freshly fetched DMR5G so the mosaic works. The
+        # bounds + bbox stay valid since both sources share the same pixel grid.
+        try:
+            with rasterio.open(cache_path, 'r+') as ds:
+                ds.crs = None
+        except Exception as e:
+            print(f"  [dmr5g] strip-crs warning: {e}")
         print(f"  [dmr5g] fetched {cache_path} ({len(data)//1024} KB, {n_pixels}px)")
         return cache_path
     except Exception as e:
@@ -278,11 +393,13 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
             frozen_indices=frozen,
         )
 
-    # Per-vertex UV via WGS84
+    # Per-vertex UV via WGS84. Convention: scene +Z = world -Y (south).
     all_sx = np.array([cx + v[0] for v in vertices])
     all_sy = np.array([cy - v[2] for v in vertices])
     all_lon, all_lat = SJTSK_TO_WGS.transform(all_sx, all_sy)
 
+    sx_min, sx_max = float(all_sx.min()), float(all_sx.max())
+    sy_min, sy_max = float(all_sy.min()), float(all_sy.max())
     lon_margin = (all_lon.max() - all_lon.min()) * 0.05
     lat_margin = (all_lat.max() - all_lat.min()) * 0.05
     lon_min = float(all_lon.min() - lon_margin)
@@ -312,7 +429,7 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
             "center_wgs84": [float(center_lon), float(center_lat)],
             "ground_z": ground_z,
             "wgs_bbox": [lon_min, lat_min, lon_max, lat_max],
-            "sjtsk_bbox": [cx - half, cy - half, cx + half, cy + half],
+            "sjtsk_bbox": [sx_min, sy_min, sx_max, sy_max],
         }
     # open3d simplify_quadric_decimation segfaults on this macOS / Python 3.9
     # environment with open3d 0.18.0 regardless of mesh size — confirmed broken.
@@ -332,7 +449,7 @@ def extract_tile(dmp_paths, cx, cy, half=60, step=2, global_ground_z=None, ruian
         "center_wgs84": [float(center_lon), float(center_lat)],
         "ground_z": ground_z,
         "wgs_bbox": [lon_min, lat_min, lon_max, lat_max],
-        "sjtsk_bbox": [cx - half, cy - half, cx + half, cy + half],
+        "sjtsk_bbox": [sx_min, sy_min, sx_max, sy_max],
     }
 
 
@@ -380,7 +497,17 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
     n = round(2 * half / step) + 1  # e.g. 61 for half=1500, step=50
 
     # Build terrain grid vertices: local_x = -half + c*step, local_z = -half + r*step
+    # Keep a grid-space validity mask next to the vertices. Invalid raster samples
+    # are represented as y=0 fallback vertices, but they must never be referenced by
+    # terrain faces; otherwise the horizon rings grow artificial vertical cliffs.
+    grid_valid = np.zeros((n, n), dtype=bool)
     vertices = []
+    # rasterio.merge(bounds, res=step) often returns shape (n-1, n-1) for a tile
+    # whose vertex grid is n×n (e.g. 21km / 200m = 105 pixels but 106 vertices).
+    # Clamping dr/dc to the last valid pixel makes the boundary row/col read the
+    # nearest pixel instead of falling back to y=0, which previously left the
+    # outer-most ring of vertices flat-on-ground and broke corner stitching.
+    data_h, data_w = data.shape
     for r in range(n):
         for c in range(n):
             local_x = -half + c * step
@@ -388,9 +515,10 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             # data row 0 = south (cy-half), row n-1 = north (cy+half);
             # but rasterio merge with S-JTSK (northing increases upward) flips rows,
             # so row 0 in the array = northern edge. Mirror to match local_z convention.
-            dr = (n - 1) - r
-            dc = c
-            if dr < data.shape[0] and dc < data.shape[1] and valid_mask[dr, dc]:
+            dr = min((n - 1) - r, data_h - 1)
+            dc = min(c, data_w - 1)
+            if valid_mask[dr, dc]:
+                grid_valid[r, c] = True
                 raw_y = float(data[dr, dc]) - global_ground_z
                 y = float(max(0.0, min(raw_y, max_height)))
             else:
@@ -400,10 +528,11 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
     # Native-resolution resampling for inner-facing edges.
     # Override Y values of edge vertices with DMP sampled at native 0.5m resolution
     # so they match the point-sampled values seen by the adjacent inner ring.
-    # Skip if any path is from DMR5G dynamic cache (impractical to fetch at 0.5m).
-    dmr5g_sourced = any("dmr5g_dynamic" in str(p) for p in dmp_paths)
-    if inner_facing_edges and not dmr5g_sourced:
-        native_srcs = [rasterio.open(p) for p in dmp_paths]
+    # Skip if NO SM5 path is available (DMR5G is 5 m source, oversampling to 0.5 m
+    # adds no detail). In a hybrid SM5+DMR5G mix, use only the SM5 paths here.
+    sm5_paths = [p for p in dmp_paths if "dmr5g_dynamic" not in str(p)]
+    if inner_facing_edges and sm5_paths:
+        native_srcs = [rasterio.open(p) for p in sm5_paths]
         try:
             native_merged, _native_transform = merge(
                 native_srcs,
@@ -420,11 +549,11 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
         native_h, native_w = native.shape
 
         # Native raster: row 0 = top = max northing (cy+half), rows go downward.
-        # world_x runs left→right (col), northing (cy-local_z in S-JTSK) runs top→bottom (row).
+        # Convention: scene +Z = world -Y (south), so world_y = cy - local_z.
         def world_to_native_px(local_x_v, local_z_v):
             """Convert local tile coords to (row, col) in the native raster."""
             world_x = cx + local_x_v
-            world_northing = cy - local_z_v  # S-JTSK northing
+            world_northing = cy - local_z_v
             col = int((world_x - (cx - half)) / 0.5)
             row = int(((cy + half) - world_northing) / 0.5)
             return (
@@ -434,38 +563,51 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
 
         eps = step * 0.1
         for i, v in enumerate(vertices):
-            local_x_v, _y_v, local_z_v = v
-            edge_dir = None
+            local_x_v, y_v, local_z_v = v
+            on_edge = False
             new_local_x = local_x_v
             new_local_z = local_z_v
             if 'W' in inner_facing_edges and abs(local_x_v - (-half)) < eps:
-                edge_dir = 'W'
-                new_local_x = local_x_v + inner_edge_offset  # shift west edge eastward (toward center)
-            elif 'E' in inner_facing_edges and abs(local_x_v - (+half)) < eps:
-                edge_dir = 'E'
-                new_local_x = local_x_v - inner_edge_offset  # shift east edge westward (toward center)
-            elif 'S' in inner_facing_edges and abs(local_z_v - (-half)) < eps:
-                edge_dir = 'S'
-                new_local_z = local_z_v + inner_edge_offset  # shift south edge northward (toward center)
-            elif 'N' in inner_facing_edges and abs(local_z_v - (+half)) < eps:
-                edge_dir = 'N'
-                new_local_z = local_z_v - inner_edge_offset  # shift north edge southward (toward center)
-            if edge_dir is None:
+                on_edge = True
+                new_local_x = local_x_v + inner_edge_offset
+            if 'E' in inner_facing_edges and abs(local_x_v - (+half)) < eps:
+                on_edge = True
+                new_local_x = local_x_v + inner_edge_offset
+            if 'S' in inner_facing_edges and abs(local_z_v - (-half)) < eps:
+                on_edge = True
+                new_local_z = local_z_v + inner_edge_offset
+            if 'N' in inner_facing_edges and abs(local_z_v - (+half)) < eps:
+                on_edge = True
+                new_local_z = local_z_v + inner_edge_offset
+            if not on_edge:
                 continue
+            # Geometry shift runs unconditionally: if we leave the vertex at
+            # its nominal position when native_valid is False, the edge ends
+            # up partially shifted and the adjacent ring's edge no longer
+            # aligns. Y comes from native DMP when valid, otherwise keep the
+            # coarse-merge Y already in the vertex.
             row, col = world_to_native_px(new_local_x, new_local_z)
             if native_valid[row, col]:
                 raw_y = float(native[row, col]) - global_ground_z
-                # Update local_x/z too so the vertex's geometric position shifts
-                vertices[i] = [new_local_x, float(max(0.0, min(raw_y, max_height))), new_local_z]
+                y_v = float(max(0.0, min(raw_y, max_height)))
+            vertices[i] = [new_local_x, y_v, new_local_z]
 
-    # Terrain faces (two tris per quad)
+    # Terrain faces (two tris per quad). Emit triangles independently so one
+    # missing corner only removes the affected triangle, not more terrain than
+    # needed.
     faces = []
     for r in range(n - 1):
         for c in range(n - 1):
             i = r * n + c
             # quad: (r,c), (r+1,c), (r,c+1), (r+1,c+1)
-            faces.append([i,         i + n,     i + 1])
-            faces.append([i + 1,     i + n,     i + n + 1])
+            v00 = grid_valid[r, c]
+            v10 = grid_valid[r + 1, c]
+            v01 = grid_valid[r, c + 1]
+            v11 = grid_valid[r + 1, c + 1]
+            if v00 and v10 and v01:
+                faces.append([i,         i + n,     i + 1])
+            if v01 and v10 and v11:
+                faces.append([i + 1,     i + n,     i + n + 1])
 
     # Skirt rim — conditionally emit skirt vertices + quad strips per edge.
     # Only the edges in skirt_edges get a skirt; inner-facing edges are left plain
@@ -481,6 +623,8 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             vx, vy, vz = vertices[vi]
             vertices.append([vx, vy - skirt_depth, vz])
         for c in range(n - 1):
+            if not (grid_valid[0, c] and grid_valid[0, c + 1]):
+                continue
             ti = 0 * n + c
             si = top_skirt_start + c
             faces.append([ti,     ti + 1,     si])
@@ -494,6 +638,8 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             vx, vy, vz = vertices[vi]
             vertices.append([vx, vy - skirt_depth, vz])
         for c in range(n - 1):
+            if not (grid_valid[n - 1, c] and grid_valid[n - 1, c + 1]):
+                continue
             ti = (n - 1) * n + c
             si = bot_skirt_start + c
             faces.append([ti + 1, ti,     si + 1])
@@ -507,6 +653,8 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             vx, vy, vz = vertices[vi]
             vertices.append([vx, vy - skirt_depth, vz])
         for r in range(n - 1):
+            if not (grid_valid[r, 0] and grid_valid[r + 1, 0]):
+                continue
             ti = r * n + 0
             si = left_skirt_start + r
             faces.append([ti + n, ti,     si + 1])
@@ -520,14 +668,16 @@ def extract_panorama_tile(dmp_paths, cx, cy, half, step, global_ground_z, max_he
             vx, vy, vz = vertices[vi]
             vertices.append([vx, vy - skirt_depth, vz])
         for r in range(n - 1):
+            if not (grid_valid[r, n - 1] and grid_valid[r + 1, n - 1]):
+                continue
             ti = r * n + (n - 1)
             si = right_skirt_start + r
             faces.append([ti,     ti + n,     si])
             faces.append([si,     ti + n,     si + 1])
 
-    # UVs: uniform [0..1] for terrain grid; skirt verts copy their parent edge UV
+    # UVs: uniform [0..1] for terrain grid; skirt verts copy their parent edge UV.
+    # Convention: scene +Z = world -Y (south). world_y = cy - local_z.
     all_sx = np.array([cx + v[0] for v in vertices])
-    # Note: in S-JTSK, northing = cy - local_z (Z increases southward in local space)
     all_sy = np.array([cy - v[2] for v in vertices])
     all_lon, all_lat = SJTSK_TO_WGS.transform(all_sx, all_sy)
 
@@ -683,7 +833,8 @@ def main():
         """Return the set of compass edges that face open sky for a tile in a 3×3-minus-center ring.
 
         Convention (matches extract_panorama_tile's local_z = -half + r*step):
-          +offset_z = NORTH in real world (pcy = grid_cy - offset_z makes it more north in S-JTSK).
+          +offset_z = scene +Z (south in world via pcy = grid_cy - offset_z; matches the
+            inner-grid convention t["offset_z"] = -(cy - gcy)).
           +offset_x = EAST.
           'S' = local_z=-half edge, 'N' = local_z=+half edge, 'W'/'E' = local_x edges.
         """
@@ -701,6 +852,30 @@ def main():
     def inner_facing_for(offset_x, offset_z, ring_max_offset):
         """Return edges that face the adjacent inner ring (complement of outer_edges_for)."""
         return {'N', 'S', 'E', 'W'} - outer_edges_for(offset_x, offset_z, ring_max_offset)
+
+    def inner_boundary_edges_for(offset_x, offset_z):
+        """Return full edges that should be stitched against an already-generated
+        neighbour. Side tiles (one zero offset): single edge facing the previous
+        ring. Corner tiles (both non-zero): two edges facing the adjacent SIDE
+        tiles in the same ring — e.g. L5 NW corner's S edge ↔ L5 W side's N edge.
+        Corners must be generated AFTER sides so their stitch sources exist.
+        """
+        edges = set()
+        if offset_x == 0 and offset_z > 0:
+            edges.add('S')
+        elif offset_x == 0 and offset_z < 0:
+            edges.add('N')
+        elif offset_z == 0 and offset_x < 0:
+            edges.add('E')
+        elif offset_z == 0 and offset_x > 0:
+            edges.add('W')
+        else:
+            # Corner: pick the two edges facing its side-tile neighbours.
+            if offset_x > 0: edges.add('W')
+            if offset_x < 0: edges.add('E')
+            if offset_z > 0: edges.add('S')
+            if offset_z < 0: edges.add('N')
+        return edges
 
     # --add-panorama: generate 8 outer-ring tiles and append to existing data.json
     if args.add_panorama:
@@ -744,9 +919,20 @@ def main():
         pano_count = 0
         for i, (offset_x, offset_z) in enumerate(PANORAMA_OFFSETS):
             pcx = grid_cx + offset_x
-            pcy = grid_cy - offset_z  # Z-axis inversion
+            pcy = grid_cy - offset_z  # scene +Z = world -Y (matches inner t["offset_z"] = -(cy-gcy))
 
-            dmp_paths = find_tiffs(pcx, pcy, half_m=PANO_HALF)
+            # Use SM5 (DSM with buildings) when it covers the tile fully so the
+            # pano edge Y values match the inner grid (which is also SM5-sourced
+            # and includes building roofs / vegetation). Pure DMR5G is ~5 m
+            # ground-only and creates a 3–5 m vertical step at the inner→pano
+            # boundary near built-up areas. DMR5G fills in only where SM5 has
+            # no coverage (passed AFTER the SM5 list so rasterio.merge keeps
+            # SM5 values where they exist).
+            sm5_paths = find_tiffs(pcx, pcy, half_m=PANO_HALF)
+            dmr_path = fetch_dmr5g_tile(pcx, pcy, PANO_HALF, PANO_STEP)
+            dmp_paths = list(sm5_paths)
+            if dmr_path:
+                dmp_paths.append(str(dmr_path))
             if not dmp_paths:
                 print(f"  Skipping panorama tile at offset ({offset_x}, {offset_z}) — no DMP coverage")
                 continue
@@ -758,7 +944,10 @@ def main():
                 dmp_paths, pcx, pcy,
                 half=PANO_HALF, step=PANO_STEP,
                 global_ground_z=pano_ground_z,
-                max_height=max_height,
+                # The panorama ring is already outside the village detail area;
+                # keep real hill relief instead of clipping it to the inner-grid
+                # building-focused height range.
+                max_height=1500.0,
                 skirt_depth=SKIRT_DEPTH,
                 skirt_edges=skirt_edges,
                 inner_facing_edges=inner_edges,
@@ -770,15 +959,7 @@ def main():
             size = save_tile_glb(tile, offset_x=offset_x, offset_z=offset_z, output_path=str(glb_path))
             print(f"    → {glb_path} ({size // 1024} KB, {len(tile['vertices'])} verts, {len(tile['faces'])} faces)")
 
-            # WGS84 bbox via pyproj (same transformer used elsewhere)
-            sjtsk_bbox = [pcx - PANO_HALF, pcy - PANO_HALF, pcx + PANO_HALF, pcy + PANO_HALF]
-            corners_sx = np.array([sjtsk_bbox[0], sjtsk_bbox[2], sjtsk_bbox[0], sjtsk_bbox[2]])
-            corners_sy = np.array([sjtsk_bbox[1], sjtsk_bbox[1], sjtsk_bbox[3], sjtsk_bbox[3]])
-            corners_lon, corners_lat = SJTSK_TO_WGS.transform(corners_sx, corners_sy)
-            wgs_bbox = [
-                float(corners_lon.min()), float(corners_lat.min()),
-                float(corners_lon.max()), float(corners_lat.max()),
-            ]
+            sjtsk_bbox, wgs_bbox = bbox_from_vertices(pcx, pcy, tile["vertices"])
 
             panorama_meta = {
                 "grid_col": None,
@@ -809,55 +990,84 @@ def main():
         if "tiles" not in existing_data or not isinstance(existing_data["tiles"], list):
             raise SystemExit(f"{data_path} does not contain a 'tiles' array.")
 
+        # Anchor horizon ground_z to the already-generated inner grid. Recomputing
+        # from area TIFs yields a different 5th-percentile when fewer SM5 tiles
+        # are present, which then drifts the inner→L4 boundary vertically.
+        inner_gz_values = [t["ground_z"] for t in existing_data["tiles"]
+                           if t.get("grid_col") is not None and "ground_z" in t]
+        if inner_gz_values:
+            horizon_ground_z = float(np.median(inner_gz_values))
+            print(f"  Horizon ground_z: {horizon_ground_z:.3f}m (from {len(inner_gz_values)} inner tiles, was {global_ground_z:.3f}m computed)")
+        else:
+            horizon_ground_z = global_ground_z
+            print(f"  Horizon ground_z: {horizon_ground_z:.3f}m (no inner tiles found, using computed value)")
+
         # L4 mid-horizon ring: 8 tiles at 9000m × 9000m, 100m step, 80m skirt.
         # 3×3-minus-center pattern with centers at ±9000m offsets.
         # Inner edge: ±4500m (matches L3 panorama outer edge at ±4500m exactly).
         # Outer edge: ±13500m.
+        # Sides FIRST, corners LAST: corner stitching depends on already-existing
+        # side tiles of the same ring (intra-ring shared edges).
         L4_OFFSETS = [
-            (-9000, +9000),  # NW
-            (    0, +9000),  # N
-            (+9000, +9000),  # NE
-            (-9000,     0),  # W
-            (+9000,     0),  # E
-            (-9000, -9000),  # SW
-            (    0, -9000),  # S
-            (+9000, -9000),  # SE
+            (    0, +9000),  # N (side)
+            (-9000,     0),  # W (side)
+            (+9000,     0),  # E (side)
+            (    0, -9000),  # S (side)
+            (-9000, +9000),  # NW (corner)
+            (+9000, +9000),  # NE (corner)
+            (-9000, -9000),  # SW (corner)
+            (+9000, -9000),  # SE (corner)
         ]
         L4_HALF = 4500   # 9000m tile, half = 4500m
         L4_STEP = 100    # 100m mesh step → 91×91 verts ≈ 8.3k per tile
         L4_SKIRT = 80
 
-        # L5 far-horizon ring: 8 tiles at 18000m × 18000m, 200m step, 150m skirt.
-        # Centers at ±22500m offsets so inner edge = 22500 - 9000 = 13500m (exact L4 outer).
+        # L5 far-horizon ring: 8 tiles at 21000m × 21000m, 200m step, 150m skirt.
+        # 3×3-minus-center pattern with centers at ±21000m and half=10500.
+        # Inner edge: 21000 - 10500 = ±10500m (overlaps L4 outer at ±13500 by 3km;
+        # the overlap is invisible and resolves via depth test).
         # Outer edge: ±31500m. Praděd at 28km from Hnojice falls inside.
+        # This replaces an earlier 18×18km layout (centers ±22500, half=9000) that
+        # left 4.5km gaps between side and corner tiles along each axis.
+        # Sides FIRST, corners LAST (intra-ring stitching: see inner_boundary_edges_for).
         L5_OFFSETS = [
-            (-22500, +22500),  # NW
-            (     0, +22500),  # N
-            (+22500, +22500),  # NE
-            (-22500,      0),  # W
-            (+22500,      0),  # E
-            (-22500, -22500),  # SW
-            (     0, -22500),  # S
-            (+22500, -22500),  # SE
+            (     0, +21000),  # N (side)
+            (-21000,      0),  # W (side)
+            (+21000,      0),  # E (side)
+            (     0, -21000),  # S (side)
+            (-21000, +21000),  # NW (corner)
+            (+21000, +21000),  # NE (corner)
+            (-21000, -21000),  # SW (corner)
+            (+21000, -21000),  # SE (corner)
         ]
-        L5_HALF = 9000   # 18000m tile, half = 9000m
-        L5_STEP = 200    # 200m mesh step → 91×91 verts ≈ 8.3k per tile
+        L5_HALF = 10500   # 21000m tile, half = 10500m
+        L5_STEP = 200     # 200m mesh step → 106×106 verts ≈ 11.2k per tile
         L5_SKIRT = 150
 
-        def _generate_horizon_ring(offsets, half, step, skirt, prefix, flag_key, ring_max_offset):
+        def _generate_horizon_ring(offsets, half, step, skirt, prefix, flag_key, ring_max_offset, stitch_source_key):
             count = 0
             for i, (offset_x, offset_z) in enumerate(offsets):
+                # Sources = previous ring + already-generated tiles of THIS ring
+                # (so corners can stitch against their side neighbours).
+                source_tiles = [t for t in existing_data["tiles"]
+                                if t.get(stitch_source_key) or t.get(flag_key)]
                 pcx = grid_cx + offset_x
-                pcy = grid_cy - offset_z  # Z-axis inversion (same as panorama)
+                pcy = grid_cy - offset_z  # scene +Z = world -Y (matches inner t["offset_z"] = -(cy-gcy))
 
                 skirt_edges = outer_edges_for(offset_x, offset_z, ring_max_offset)
-                inner_edges = inner_facing_for(offset_x, offset_z, ring_max_offset)
+                inner_edges = inner_boundary_edges_for(offset_x, offset_z)
 
-                dmp_paths = find_tiffs(pcx, pcy, half_m=half)
-                if not dmp_paths:
-                    dmr_path = fetch_dmr5g_tile(pcx, pcy, half, step)
-                    if dmr_path:
-                        dmp_paths = [dmr_path]
+                # Horizon rings prefer DMR5G over SM5 because DMR5G has uniform
+                # Czechia-wide coverage at the requested bbox, while SM5 cache only
+                # holds detailed tiles around the property (~10km). A partial SM5
+                # hit on a 9-21km horizon tile leaves most pixels invalid, and
+                # grid_valid then drops their faces — creating visible holes /
+                # "levitating tile" artefacts. Fall back to SM5 only if DMR5G fails.
+                dmr_path = fetch_dmr5g_tile(pcx, pcy, half, step)
+                if dmr_path:
+                    dmp_paths = [dmr_path]
+                else:
+                    dmp_paths = find_tiffs(pcx, pcy, half_m=half)
                 if not dmp_paths:
                     print(f"  WARNING: no DMP coverage for {prefix} tile {i} at offset ({offset_x:+d},{offset_z:+d})"
                           f" — generating flat (y=0) terrain, skirt_edges={skirt_edges}")
@@ -934,15 +1144,28 @@ def main():
                     # above ground_z. The inner max_height (~50m) was set
                     # to suppress raster outliers near the property, not to
                     # clip real mountains 28km away.
+                    # No inner_edge_offset for L4/L5: they border the panorama
+                    # ring's OUTER (non-shifted) edges, not the inner grid's
+                    # pixel-centered edges. The +0.25 bias only belongs at the
+                    # inner-grid ↔ L3 panorama boundary.
                     flat_tile = extract_panorama_tile(
                         dmp_paths, pcx, pcy,
                         half=half, step=step,
-                        global_ground_z=global_ground_z,
+                        global_ground_z=horizon_ground_z,
                         max_height=1500.0,
                         skirt_depth=skirt,
                         skirt_edges=skirt_edges,
                         inner_facing_edges=inner_edges,
                     )
+
+                stitch_inner_edges_from_glbs(
+                    flat_tile,
+                    offset_x=offset_x,
+                    offset_z=offset_z,
+                    half=half,
+                    inner_edges=inner_edges,
+                    source_tiles=source_tiles,
+                )
 
                 glb_name = f"{prefix}_{i}.glb"
                 glb_path = Path(tiles_dir) / glb_name
@@ -951,14 +1174,7 @@ def main():
                 print(f"    → {glb_path} ({size // 1024} KB, {len(flat_tile['vertices'])} verts, "
                       f"{len(flat_tile['faces'])} faces)")
 
-                sjtsk_bbox = [pcx - half, pcy - half, pcx + half, pcy + half]
-                corners_sx = np.array([sjtsk_bbox[0], sjtsk_bbox[2], sjtsk_bbox[0], sjtsk_bbox[2]])
-                corners_sy = np.array([sjtsk_bbox[1], sjtsk_bbox[1], sjtsk_bbox[3], sjtsk_bbox[3]])
-                corners_lon, corners_lat = SJTSK_TO_WGS.transform(corners_sx, corners_sy)
-                wgs_bbox = [
-                    float(corners_lon.min()), float(corners_lat.min()),
-                    float(corners_lon.max()), float(corners_lat.max()),
-                ]
+                sjtsk_bbox, wgs_bbox = bbox_from_vertices(pcx, pcy, flat_tile["vertices"])
 
                 meta = {
                     "grid_col": None,
@@ -966,7 +1182,7 @@ def main():
                     "offset_x": offset_x,
                     "offset_z": offset_z,
                     "center_sjtsk": [float(pcx), float(pcy)],
-                    "ground_z": global_ground_z,
+                    "ground_z": horizon_ground_z,
                     "wgs_bbox": wgs_bbox,
                     "sjtsk_bbox": sjtsk_bbox,
                     "glb_url": f"{tiles_dir}/{glb_name}",
@@ -979,12 +1195,14 @@ def main():
         print("Generating L4 mid-horizon ring (8 tiles, 9000m, 100m step) …")
         l4_count = _generate_horizon_ring(L4_OFFSETS, L4_HALF, L4_STEP, L4_SKIRT,
                                           "horizon_l4", "is_horizon_l4",
-                                          ring_max_offset=9000)
+                                          ring_max_offset=9000,
+                                          stitch_source_key="is_panorama")
 
         print("Generating L5 far-horizon ring (8 tiles, 18000m, 200m step) …")
         l5_count = _generate_horizon_ring(L5_OFFSETS, L5_HALF, L5_STEP, L5_SKIRT,
                                           "horizon_l5", "is_horizon_l5",
-                                          ring_max_offset=22500)
+                                          ring_max_offset=21000,
+                                          stitch_source_key="is_horizon_l4")
 
         data_path.write_text(json.dumps(existing_data))
         print(f"Added {l4_count} L4 + {l5_count} L5 horizon tiles to {data_path}")
@@ -1362,10 +1580,10 @@ window._viewerSky = sky;
 // through atmospheric haze (~75% opacity at 28km).
 scene.fog = new THREE.FogExp2(0xb8c8d8, 0.0001);
 
-// near=1.0, far=65000: Phase 4 extends coverage to ±31.5km.  Linear depth
-// buffer was avoided (breaks cadastre overlays). At 24-bit depth and
-// near=1/far=65000 ratio, depth precision at 31km is ~10m — acceptable for
-// the coarse L5 terrain mesh viewed through heavy fog.
+// near=1.0, far=65000: Phase 4 extends coverage to ±31.5km. Linear depth
+// buffer was kept because logarithmicDepthBuffer breaks cadastre + parcel
+// polygonOffset overlays. At 24-bit depth and near=1/far=65000 ratio, depth
+// precision at 31km is coarse but acceptable for L5 terrain through heavy fog.
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1.0, 65000);
 camera.position.set(200, 150, 200);
 
@@ -1401,6 +1619,7 @@ dataLoaded.then(() => {{
   const panoramaTiles = tiles.filter(t => t.is_panorama);
   let sharedPanTexPromise = null;
   let panBbox = null;   // [xmin, ymin, xmax, ymax] in S-JTSK
+  let panWgsBbox = null;
   if (panoramaTiles.length > 0) {{
     panBbox = [
       Math.min(...panoramaTiles.map(t => t.sjtsk_bbox[0])),
@@ -1408,7 +1627,7 @@ dataLoaded.then(() => {{
       Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...panoramaTiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const panWgsBbox = [
+    panWgsBbox = [
       Math.min(...panoramaTiles.map(t => t.wgs_bbox[0])),
       Math.min(...panoramaTiles.map(t => t.wgs_bbox[1])),
       Math.max(...panoramaTiles.map(t => t.wgs_bbox[2])),
@@ -1429,6 +1648,7 @@ dataLoaded.then(() => {{
   const l4Tiles = tiles.filter(t => t.is_horizon_l4);
   let sharedL4TexPromise = null;
   let l4Bbox = null;
+  let l4WgsBbox = null;
   if (l4Tiles.length > 0) {{
     l4Bbox = [
       Math.min(...l4Tiles.map(t => t.sjtsk_bbox[0])),
@@ -1436,7 +1656,7 @@ dataLoaded.then(() => {{
       Math.max(...l4Tiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...l4Tiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const l4WgsBbox = [
+    l4WgsBbox = [
       Math.min(...l4Tiles.map(t => t.wgs_bbox[0])),
       Math.min(...l4Tiles.map(t => t.wgs_bbox[1])),
       Math.max(...l4Tiles.map(t => t.wgs_bbox[2])),
@@ -1453,6 +1673,7 @@ dataLoaded.then(() => {{
   const l5Tiles = tiles.filter(t => t.is_horizon_l5);
   let sharedL5TexPromise = null;
   let l5Bbox = null;
+  let l5WgsBbox = null;
   if (l5Tiles.length > 0) {{
     l5Bbox = [
       Math.min(...l5Tiles.map(t => t.sjtsk_bbox[0])),
@@ -1460,7 +1681,7 @@ dataLoaded.then(() => {{
       Math.max(...l5Tiles.map(t => t.sjtsk_bbox[2])),
       Math.max(...l5Tiles.map(t => t.sjtsk_bbox[3])),
     ];
-    const l5WgsBbox = [
+    l5WgsBbox = [
       Math.min(...l5Tiles.map(t => t.wgs_bbox[0])),
       Math.min(...l5Tiles.map(t => t.wgs_bbox[1])),
       Math.max(...l5Tiles.map(t => t.wgs_bbox[2])),
@@ -1484,23 +1705,23 @@ for (const tile of tiles) {{
       allMeshes.push(mesh);
 
       // Phase 4: horizon L4/L5 tiles use per-ring shared textures with UV remap.
-      const _applySharedTex = (promise, bbox, label) => {{
+      const _applySharedTex = (promise, atlasWgsBbox, label) => {{
         const FLIP_V = true;
         promise.then(sharedTex => {{
           sharedTex.colorSpace = THREE.SRGBColorSpace;
           sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
           const tex = sharedTex.clone();
           tex.needsUpdate = true;
-          const bWidth  = bbox[2] - bbox[0];
-          const bHeight = bbox[3] - bbox[1];
-          tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / bWidth;
-          tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / bHeight;
+          const bWidth  = atlasWgsBbox[2] - atlasWgsBbox[0];
+          const bHeight = atlasWgsBbox[3] - atlasWgsBbox[1];
+          tex.repeat.x = (tile.wgs_bbox[2] - tile.wgs_bbox[0]) / bWidth;
+          tex.repeat.y = (tile.wgs_bbox[3] - tile.wgs_bbox[1]) / bHeight;
           if (FLIP_V) {{
-            tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
-            tex.offset.y = 1 - (tile.sjtsk_bbox[3] - bbox[1]) / bHeight;
+            tex.offset.x = (tile.wgs_bbox[0] - atlasWgsBbox[0]) / bWidth;
+            tex.offset.y = 1 - (tile.wgs_bbox[3] - atlasWgsBbox[1]) / bHeight;
           }} else {{
-            tex.offset.x = (tile.sjtsk_bbox[0] - bbox[0]) / bWidth;
-            tex.offset.y = (tile.sjtsk_bbox[1] - bbox[1]) / bHeight;
+            tex.offset.x = (tile.wgs_bbox[0] - atlasWgsBbox[0]) / bWidth;
+            tex.offset.y = (tile.wgs_bbox[1] - atlasWgsBbox[1]) / bHeight;
           }}
           mesh.material.map = tex;
           mesh.material.needsUpdate = true;
@@ -1510,11 +1731,11 @@ for (const tile of tiles) {{
       }};
 
       if (tile.is_horizon_l4 && sharedL4TexPromise) {{
-        _applySharedTex(sharedL4TexPromise, l4Bbox, 'L4 horizon');
+        _applySharedTex(sharedL4TexPromise, l4WgsBbox, 'L4 horizon');
         return;
       }}
       if (tile.is_horizon_l5 && sharedL5TexPromise) {{
-        _applySharedTex(sharedL5TexPromise, l5Bbox, 'L5 horizon');
+        _applySharedTex(sharedL5TexPromise, l5WgsBbox, 'L5 horizon');
         return;
       }}
 
@@ -1526,16 +1747,16 @@ for (const tile of tiles) {{
           sharedTex.wrapS = sharedTex.wrapT = THREE.ClampToEdgeWrapping;
           const tex = sharedTex.clone();
           tex.needsUpdate = true;
-          const panWidth  = panBbox[2] - panBbox[0];
-          const panHeight = panBbox[3] - panBbox[1];
-          tex.repeat.x = (tile.sjtsk_bbox[2] - tile.sjtsk_bbox[0]) / panWidth;
-          tex.repeat.y = (tile.sjtsk_bbox[3] - tile.sjtsk_bbox[1]) / panHeight;
+          const panWidth  = panWgsBbox[2] - panWgsBbox[0];
+          const panHeight = panWgsBbox[3] - panWgsBbox[1];
+          tex.repeat.x = (tile.wgs_bbox[2] - tile.wgs_bbox[0]) / panWidth;
+          tex.repeat.y = (tile.wgs_bbox[3] - tile.wgs_bbox[1]) / panHeight;
           if (FLIP_V) {{
-            tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
-            tex.offset.y = 1 - (tile.sjtsk_bbox[3] - panBbox[1]) / panHeight;
+            tex.offset.x = (tile.wgs_bbox[0] - panWgsBbox[0]) / panWidth;
+            tex.offset.y = 1 - (tile.wgs_bbox[3] - panWgsBbox[1]) / panHeight;
           }} else {{
-            tex.offset.x = (tile.sjtsk_bbox[0] - panBbox[0]) / panWidth;
-            tex.offset.y = (tile.sjtsk_bbox[1] - panBbox[1]) / panHeight;
+            tex.offset.x = (tile.wgs_bbox[0] - panWgsBbox[0]) / panWidth;
+            tex.offset.y = (tile.wgs_bbox[1] - panWgsBbox[1]) / panHeight;
           }}
           mesh.material.map = tex;
           mesh.material.needsUpdate = true;
@@ -1561,7 +1782,8 @@ for (const tile of tiles) {{
       }});
     }};
 
-    gltfLoader.load(tile.glb_url, (gltf) => {{
+    const glbUrl = `${{tile.glb_url}}?v=lod-stitch-20260513-10`;
+    gltfLoader.load(glbUrl, (gltf) => {{
       let m = gltf.scene.children[0];
       if (m && !m.isMesh && m.children[0]) m = m.children[0];
       if (m) setupMesh(m.geometry);

@@ -64,6 +64,9 @@
           ? `<a class="btn" href="/v2.html?region=${loc.slug}">Otevřít</a>
              <button class="btn btn-secondary" data-action="force-recompress" data-slug="${loc.slug}" title="Re-Draco s aktuálním quant presetem (outer/closeup=12, inner=14)">Recompress</button>`
           : ''}
+        ${loc.has_heightfield
+          ? `<a class="btn btn-secondary" href="/heightfield/?slug=${loc.slug}" title="Heightfield viewer (LERC + WebP, ~10 MB)">HF</a>`
+          : ''}
       </div>
     `).join('');
     el.querySelectorAll('[data-action="retry-from-disk"]').forEach(btn => {

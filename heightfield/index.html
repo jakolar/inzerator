@@ -1,0 +1,1663 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Heightfield viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; }
+  #info { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,.6);
+          padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.5;
+          z-index: 10; max-width: 360px; }
+  #info b { color: #6cf; }
+  #stats { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,.6);
+           padding: 10px 12px; border-radius: 6px; font-size: 12px; z-index: 10; }
+  canvas { display: block; }
+  /* Centred loading overlay shown until first frame renders. CSS-only
+     spinner so it works before any JS module loads. */
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column;
+             align-items: center; justify-content: center;
+             background: rgba(20,22,28,.92); color: #ddd; z-index: 100;
+             font-family: system-ui, sans-serif; transition: opacity .4s; }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+  #loading .spin { width: 44px; height: 44px; border-radius: 50%;
+                   border: 4px solid rgba(108,204,255,.18);
+                   border-top-color: #6cf;
+                   animation: spin 1s linear infinite; margin-bottom: 16px; }
+  #loading .title { font-weight: 600; margin-bottom: 4px; color: #6cf; }
+  #loading .stage { font-size: 13px; color: #aaa; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="loading">
+  <div class="spin"></div>
+  <div class="title" id="load-title">Načítám…</div>
+  <div class="stage" id="load-stage">manifest</div>
+</div>
+<div id="info">
+  <b id="loc-title">Heightfield</b><br>
+  <span id="data">načítám…</span><br>
+  <label style="display:block;margin-top:6px;cursor:pointer;">
+    <input id="cad-toggle" type="checkbox"> 🗺 Zobrazit katastr
+  </label>
+  <span id="cad-status" style="font-size:11px;color:#9c9;"></span><br>
+  <label style="display:block;cursor:pointer;">
+    <input id="wire-toggle" type="checkbox"> 🔲 Wireframe (bez ortho)
+  </label>
+  <label style="display:block;cursor:pointer;">
+    <input id="shade-toggle" type="checkbox"> 🎨 Flat shaded (by elevation)
+  </label>
+  <label style="display:block;cursor:pointer;">
+    <input id="bare-toggle" type="checkbox"> 🌳 Skrýt vegetaci & domy (DMR5G)
+  </label>
+  <label style="display:block;cursor:pointer;">
+    <input id="shadow-toggle" type="checkbox"> 🌑 Sluneční svit a stíny
+  </label>
+  <div id="sun-controls" style="display:none;font-size:11px;margin:2px 0 0 18px;color:#bbb;">
+    <label style="display:block;">Hodina <span id="sun-hour-val">14:00</span>
+      <input id="sun-hour" type="range" min="4" max="22" value="14" step="0.25"
+             style="width:140px;vertical-align:middle;">
+    </label>
+    <label style="display:block;">Den v roce <span id="sun-doy-val">172 (21.6.)</span>
+      <input id="sun-doy" type="range" min="1" max="365" value="172" step="1"
+             style="width:140px;vertical-align:middle;">
+    </label>
+    <div id="sun-readout" style="color:#888;margin-top:2px;">az 215° / el 45°</div>
+  </div>
+  <label style="display:block;cursor:pointer;">
+    <input id="osm-toggle" type="checkbox"> 🗺 OSM místo ortho
+  </label>
+  <label style="display:block;cursor:pointer;">
+    <input id="parcels-toggle" type="checkbox"> 🟦 Označit parcely
+    <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
+  </label>
+  <button id="parcels-clear" style="display:none;margin-left:18px;font-size:11px;padding:1px 6px;cursor:pointer;">Zrušit výběr</button>
+  <div id="ortho-quality" style="margin-top:6px;display:none;font-size:12px;">
+    Ortho kvalita:
+    <span style="display:inline-flex;gap:2px;margin-left:4px;">
+      <button class="oq" data-tier="low"   style="padding:2px 6px;font-size:11px;cursor:pointer;">Low</button>
+      <button class="oq" data-tier="mid"   style="padding:2px 6px;font-size:11px;cursor:pointer;">Mid</button>
+      <button class="oq" data-tier="high"  style="padding:2px 6px;font-size:11px;cursor:pointer;">High</button>
+      <button class="oq" data-tier="ultra" style="padding:2px 6px;font-size:11px;cursor:pointer;">Ultra</button>
+    </span>
+    <span id="ortho-quality-status" style="font-size:10px;color:#888;margin-left:4px;"></span>
+  </div>
+  Drag = orbit · Scroll = zoom · Right-drag = pan
+</div>
+<div id="stats"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+// LERC: Esri's elevation codec, decoded in browser via ~200 KB WASM. Used
+// when ring.heightmap_format === 'lerc' in manifest (gen with --format lerc).
+// Namespace import (the package has no default export — load/decode are
+// named exports). `await Lerc.load()` initialises the WASM blob once.
+import * as Lerc from 'https://cdn.jsdelivr.net/npm/lerc@4/+esm';
+
+// Surface uncaught module-level errors in the loading overlay so the page
+// never looks "stuck at spinner". Top-level await rejects bubble here.
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('loading');
+  if (!el || el.classList.contains('hidden')) return;
+  el.innerHTML = `<div style="color:#f88;max-width:520px;text-align:center;
+    padding:20px;line-height:1.5;font-family:system-ui;">
+    <div style="font-size:24px;margin-bottom:12px;">⚠</div>
+    <div><b>JS chyba při načítání</b></div>
+    <div style="margin-top:8px;font-size:12px;color:#ccc;
+                font-family:monospace;word-break:break-word;">${e.message}</div>
+    <div style="margin-top:6px;font-size:11px;color:#888;">${e.filename}:${e.lineno}</div>
+    </div>`;
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const msg = e.reason?.message || String(e.reason);
+  const el = document.getElementById('loading');
+  if (!el || el.classList.contains('hidden')) return;
+  el.innerHTML = `<div style="color:#f88;max-width:520px;text-align:center;
+    padding:20px;line-height:1.5;font-family:system-ui;">
+    <div style="font-size:24px;margin-bottom:12px;">⚠</div>
+    <div><b>Async chyba</b></div>
+    <div style="margin-top:8px;font-size:12px;color:#ccc;
+                font-family:monospace;word-break:break-word;">${msg}</div></div>`;
+});
+
+// ── Resolve location via ?slug= parameter ──
+// Viewer lives at /heightfield/?slug=hrensko and fetches per-location data
+// from /tiles_v2_<slug>/heightfield/. Relative asset paths in the manifest
+// (heightmap_file, ortho_file, …) resolve against the slug's heightfield/
+// directory, so we rebuild URLs by prefixing assetBase.
+const urlParams = new URLSearchParams(location.search);
+const slug = urlParams.get('slug');
+if (!slug) {
+  document.body.innerHTML =
+    '<div style="color:#fff;padding:24px;font-family:sans-serif">' +
+    '<h2>Missing <code>?slug=</code> parameter</h2>' +
+    '<p>Example: <a href="?slug=hrensko">?slug=hrensko</a></p></div>';
+  throw new Error('no slug');
+}
+const assetBase = `/tiles_v2_${slug}/heightfield/`;
+const asset = (p) => assetBase + p;
+document.getElementById('loc-title').textContent = `Heightfield · ${slug}`;
+document.title = `Heightfield · ${slug}`;
+const loadStage = document.getElementById('load-stage');
+const loadTitle = document.getElementById('load-title');
+loadTitle.textContent = `Načítám ${slug}…`;
+const setStage = (msg) => { if (loadStage) loadStage.textContent = msg; };
+const hideLoader = () => {
+  const el = document.getElementById('loading');
+  if (el) el.classList.add('hidden');
+  setTimeout(() => { if (el) el.remove(); }, 500);
+};
+// Cache-bust manifest so re-encode (new tiers, formats) is picked up on
+// refresh without Cmd+Shift+R / DevTools hard reload.
+const manifest = await fetch(asset('manifest.json') + '?t=' + Date.now())
+  .then(r => { if (!r.ok) throw new Error(`manifest ${r.status} at ${r.url}`); return r.json(); });
+console.info('[manifest]', manifest.rings.map(r => ({
+  slug: r.slug, format: r.heightmap_format, tiers: Object.keys(r.ortho_tiers || {}),
+})));
+const { cx, cy, rings, y_min: globalYmin, y_max: globalYmax } = manifest;
+const yMid = (globalYmin + globalYmax) / 2;
+
+// Debug bypass: ?nobare=1 skips loading the bare-earth heightmap (and the
+// toggle), useful when DMR5G fetch failed or the second texture is
+// suspected of breaking the load.
+const URL_PARAMS = new URLSearchParams(location.search);
+const SKIP_BARE = URL_PARAMS.get('nobare') === '1';
+// Override KTX2 ortho UV flip from URL while we diagnose orientation.
+// ?ktx2flip=0  → no extra flip
+// ?ktx2flip=1  → flip Y (vertical mirror)
+// ?ktx2flip=2  → flip X (horizontal mirror)
+// ?ktx2flip=3  → flip both (180° rotation)
+const _KTX2_FLIP = parseInt(URL_PARAMS.get('ktx2flip') ?? '0', 10);
+// Bypass postprocess (no parcel glow). For comparing ortho colours
+// against the pre-bloom direct-render baseline.
+const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
+
+console.log('manifest:', manifest);
+
+// ── Loading progress tracker ──
+// Per-asset byte counters (downloaded + total expected). LERC files don't
+// carry size in the manifest, so we discover bytes via Content-Length on
+// first response and accumulate as fetches complete. Ortho sizes are known
+// up-front from manifest.ortho_tiers[mid].webp_kb.
+const loadStats = {
+  bytesDone: 0,
+  bytesTotal: 0,   // grows as assets register; initial estimate from manifest ortho sizes
+  filesDone: 0,
+  filesTotal: 0,
+};
+function bumpProgress(bytes) {
+  loadStats.bytesDone += bytes;
+  loadStats.filesDone += 1;
+  renderProgress();
+}
+function renderProgress() {
+  const mb = (b) => (b / 1048576).toFixed(1);
+  const pct = loadStats.bytesTotal
+    ? Math.min(100, Math.round(100 * loadStats.bytesDone / loadStats.bytesTotal))
+    : 0;
+  setStage(
+    `${loadStats.filesDone}/${loadStats.filesTotal} souborů · ` +
+    `${mb(loadStats.bytesDone)} / ${mb(loadStats.bytesTotal)} MB · ${pct}%`
+  );
+}
+// Pre-register expected assets so the totals aren't a moving target.
+// Per ring: heightmap LERC + bare LERC + 1 ortho (mid tier default).
+// LERC sizes aren't in the manifest, so we use a per-cell heuristic
+// (~0.8 bytes/cell empirically for 10cm tolerance) — fetch then corrects
+// the total to the real byte count as each LERC arrives.
+for (const r of manifest.rings) {
+  loadStats.filesTotal += 3;
+  const lercEstimate = r.heightmap_size * r.heightmap_size * 0.8;
+  loadStats.bytesTotal += 2 * lercEstimate;          // heightmap + bare
+  const t = r.ortho_tiers?.[r.ortho_default || 'mid'];
+  if (t) {
+    // Prefer WebP size when the browser will pick WebP (detected later);
+    // for the initial estimate we assume yes (modern browser).
+    loadStats.bytesTotal += (t.webp_kb || t.kb || 0) * 1024;
+  }
+}
+renderProgress();
+
+// ── Scene setup ──
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+// On Retina (devicePixelRatio=2) the fragment shader runs 4× more pixels
+// per frame than native res. Cap at 1.5 to claw back ~30 % per-frame
+// cost; text/labels on ortho stay readable and the parcel tubes only
+// look marginally softer. `?hires=1` URL param restores full DPR for
+// crisp screenshots.
+const _HIRES = new URLSearchParams(location.search).get('hires') === '1';
+renderer.setPixelRatio(_HIRES ? devicePixelRatio : Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// 1×1 white texture used as default uShadowMap so the shadow toggle stays
+// visually inert until the precomputed shadow map is baked. Without this,
+// the sampler defaults to null and we'd briefly read garbage.
+{
+  const px = new Uint8Array([255]);
+  const tex = new THREE.DataTexture(px, 1, 1, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.needsUpdate = true;
+  window._heightfieldDefaultShadowTex = tex;
+}
+
+const scene = new THREE.Scene();
+// HDR sky with real clouds (kloofendal_48d_partly_cloudy_puresky from
+// Polyhaven, ~5.5 MB, CC0). Loaded async — placeholder solid sky shows
+// while it streams. Equirectangular mapping = full 360° dome wrapped on
+// the inside of an infinite sphere when used as scene.background.
+const SKY_HAZE = 0xb8c8d8;       // horizon haze colour, matches HDR's lower band
+scene.background = new THREE.Color(SKY_HAZE);
+new RGBELoader().load('/sky_cloudy.hdr', (tex) => {
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = tex;
+}, undefined, (err) => {
+  console.warn('sky HDR load failed, keeping solid background:', err);
+});
+
+// Exp2 fog masks the abrupt boundary between outermost ring edge and
+// open sky. Density tuned so the 3 km closeup ring at its corner
+// (distance ~2.1 km) stays at ~70% opacity, while anything at >10 km
+// fades fully to the haze colour. 0xb8c8d8 matches the HDR's horizon hue.
+scene.fog = new THREE.FogExp2(SKY_HAZE, 0.00012);
+
+// Sun direction in scene coords. Y = up, +Z = south, +X = east in our
+// SJTSK-aligned PlaneGeometry layout. South-elevated midday sun gives the
+// most legible relief on Czech terrain (north-facing slopes shaded, south
+// slopes lit — matches photo intuition).
+const SUN_EL = 45, SUN_AZ = 215;   // 45° elevation, SSW (geographic bearing)
+const sunPolar = THREE.MathUtils.degToRad(90 - SUN_EL);
+// Compass azimuth (0°=N, clockwise) → Three.js spherical theta. In our
+// PlaneGeometry layout +Z = south, +X = east, so theta=0 points to +Z
+// (=south, compass 180°). To rotate from compass to theta we map
+// theta = 180° - bearing. Without this conversion, az=215° landed the sun
+// in the NNW quadrant and flipped the hillshade — north slopes lit, south
+// shaded — opposite of photo intuition.
+const sunAz = THREE.MathUtils.degToRad(180 - SUN_AZ);
+// Standard spherical → cartesian, then normalised. The uniform must point
+// FROM surface TOWARD sun for the Lambert dot product to give correct sign.
+window._heightfieldSunDir = new THREE.Vector3(
+  Math.sin(sunPolar) * Math.sin(sunAz),
+  Math.cos(sunPolar),
+  Math.sin(sunPolar) * Math.cos(sunAz),
+).normalize();
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 20000);
+// Frame on the largest ring (first in array — outer→inner convention),
+// height-mid camera target. Default rings can change (e.g. dropping outer
+// for a 2-ring 3km/1km setup), so don't hardcode the slug.
+const widestSide = rings[0].side_m;
+camera.position.set(widestSide * 0.3, widestSide * 0.5, widestSide * 0.5);
+camera.lookAt(0, 0, 0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.update();
+controls.enableDamping = true;
+// Damping = inertia after the user lets go of the mouse. 0.1 ≈ glides for
+// ~½ sec on a typical pan/orbit gesture — long enough to feel smooth,
+// short enough that double-clicks don't get swallowed by an ongoing glide.
+controls.dampingFactor = 0.1;
+
+// ── Load all ring textures in parallel ──
+const texLoader = new THREE.TextureLoader();
+texLoader.setCrossOrigin('anonymous');   // explicit; needed for cross-port fetch
+// KTX2 (ETC1S → BC1/ETC2/ASTC at runtime). detectSupport is async-required
+// before first load; we kick it off here and gate first ortho fetch on it.
+// Transcoder WASM (~250 KB) loads on first .ktx2 file, not at page load.
+const ktx2Loader = new KTX2Loader()
+  .setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/libs/basis/')
+  .detectSupport(renderer);
+// loadTex wraps THREE.TextureLoader's onLoad into a Promise. We also fetch
+// the URL with a HEAD-equivalent pre-check via the resource timing API so
+// loadStats can count actual transferred bytes after the texture finishes.
+const loadTex = (path) => new Promise((res, rej) => {
+  // Route .ktx2 through KTX2Loader (transcodes to BC1/ETC2/ASTC for the
+  // active GPU). Everything else (jpg, webp, png) goes through the
+  // standard image loader so its own decode pipeline runs.
+  const loader = path.endsWith('.ktx2') ? ktx2Loader : texLoader;
+  loader.load(
+    path,
+    (tex) => {
+      const entry = performance.getEntriesByName(path).pop();
+      const bytes = entry?.encodedBodySize || entry?.transferSize || 0;
+      bumpProgress(bytes);
+      res(tex);
+    },
+    undefined, rej,
+  );
+});
+
+// WebP support detection (one-shot). Resolves before any ortho fetch is
+// scheduled, so picker calls never race the check.
+const webpSupport = new Promise(resolve => {
+  const probe = new Image();
+  probe.onload = () => resolve(probe.width > 0 && probe.height > 0);
+  probe.onerror = () => resolve(false);
+  // 1×1 lossy WebP probe — works on all modern engines, fails on legacy.
+  probe.src = 'data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA';
+});
+let _canWebP = false;
+webpSupport.then(v => { _canWebP = v; console.log('WebP support:', v); });
+// Picker: prefer KTX2 (4–6× less VRAM via GPU-side compression), then
+// WebP, then JPEG. `tierEntry` is r.ortho_tiers[name], with .file (jpg),
+// optional .webp_file, optional .ktx2_file. Returns an absolute URL.
+const pickTierUrl = (tierEntry) => {
+  if (tierEntry.ktx2_file) return asset(tierEntry.ktx2_file);
+  if (_canWebP && tierEntry.webp_file) return asset(tierEntry.webp_file);
+  return asset(tierEntry.file);
+};
+// Legacy entry point: `r.ortho_file` is a flat JPEG copy of the default tier.
+// If tiers are present, route to the picker on the default tier instead.
+const pickOrthoUrl = (r) => {
+  if (r.ortho_tiers && r.ortho_default) {
+    const d = r.ortho_tiers[r.ortho_default];
+    if (d) return pickTierUrl(d);
+  }
+  return asset(r.ortho_file);
+};
+
+const ringMeshes = [];
+const ringData = {};   // slug → { heightData, n, y_min, y_max, side_m }
+
+// Initialize LERC WASM (once, ~200 KB cached). If no ring uses LERC the
+// shim still loads but stays idle. Calling load() multiple times is a no-op.
+let lercReady = false;
+async function ensureLerc() {
+  if (lercReady) return;
+  await Lerc.load();
+  lercReady = true;
+}
+
+// Unified heightmap loader → Float32 DataTexture + CPU Float32Array.
+//   PNG (16-bit RG-encoded): decode in JS → Float32
+//   LERC: WASM decode → Float32 directly
+// Both paths produce identical GPU + CPU representations so the shader is
+// single-path (`texture2D(uHeight, uv).r` = absolute Y metres).
+async function loadHeightmapData(url, fmt, n, y_min, y_max) {
+  if (fmt === 'lerc') {
+    await ensureLerc();
+    const buf = await fetch(url).then(r => r.arrayBuffer());
+    // LERC actual size — correct the running total so estimate-vs-real
+    // drift doesn't show as >100 %. We pre-estimated 0.8 B/cell; the diff
+    // gets folded into bytesTotal before counting the file as done.
+    const fname = url.split('/').pop();
+    const ring = manifest.rings.find(r => fname.startsWith(r.slug));
+    const estimate = ring ? ring.heightmap_size * ring.heightmap_size * 0.8 : 0;
+    loadStats.bytesTotal += buf.byteLength - estimate;
+    bumpProgress(buf.byteLength);
+    const result = Lerc.decode(new Uint8Array(buf));
+    return { data: new Float32Array(result.pixels[0]), n: result.width };
+  }
+  // PNG path: existing 16-bit RG decode.
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = n;
+  const ctx = canvas.getContext('2d');
+  await new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => { ctx.drawImage(img, 0, 0); res(); };
+    img.onerror = rej;
+    img.src = url;
+  });
+  const rgba = ctx.getImageData(0, 0, n, n).data;
+  const data = new Float32Array(n * n);
+  for (let j = 0, k = 0; j < rgba.length; j += 4, k++) {
+    const h16 = (rgba[j] * 256 + rgba[j + 1]) / 65535;
+    data[k] = y_min + h16 * (y_max - y_min);
+  }
+  return { data, n };
+}
+
+function makeHeightTexture(data, n) {
+  const tex = new THREE.DataTexture(data, n, n, THREE.RedFormat, THREE.FloatType);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Shared 1×1 unit PlaneGeometry — every ring uses the SAME vertex/index
+// buffer and gets its world size via `mesh.scale`. Saves ~⅔ of GPU upload
+// vs. per-ring PlaneGeometry.
+//
+// Subdivision is matched to the densest ring (inner heightmap is 2000²)
+// so even the outer ring's coarser 5 m heightmap gets over-sampled rather
+// than under-sampled — visually no difference, GPU memory drops from
+// ~350 MB to ~120 MB. Raise GEO_SUBDIVS only if a single ring's heightmap
+// goes above 2049 px on a side. Lower it (e.g. 1024) for iPad-class GPUs
+// where memory pressure matters more than mesh-vs-heightmap parity.
+const GEO_SUBDIVS = 2048;
+const sharedGeo = new THREE.PlaneGeometry(1, 1, GEO_SUBDIVS, GEO_SUBDIVS);
+sharedGeo.rotateX(-Math.PI / 2);
+
+// Surface the load failure in the UI rather than hanging at "načítám…".
+function fatalLoadError(msg) {
+  document.getElementById('data').innerHTML =
+    `<span style="color:#f88;">⚠ ${msg}</span><br>` +
+    `Zkontroluj <code>manifest.json</code> a per-ring PNG/JPG soubory.`;
+  // Replace loading overlay with the error so the user sees something
+  // actionable instead of an indefinite spinner.
+  const el = document.getElementById('loading');
+  if (el) {
+    el.innerHTML = `<div style="color:#f88;max-width:480px;text-align:center;
+      padding:20px;line-height:1.5;">
+      <div style="font-size:24px;margin-bottom:12px;">⚠</div>
+      <div><b>Načítání selhalo</b></div>
+      <div style="margin-top:8px;font-size:13px;color:#ccc;">${msg}</div></div>`;
+  }
+  throw new Error(msg);
+}
+
+// Build outer→inner so smaller rings render LAST (higher renderOrder).
+// Each smaller ring "carves a hole" in the larger one via a clipBox
+// shader uniform, identical to inzerator's approach. Without that, the
+// outer ring's coarser heightmap shows through under the inner ring at
+// LOD seams (z-fight + sub-pixel cracks).
+setStage(`načítám textury (${rings.length} ringů)…`);
+// Lazy bare-earth (DMR5G) state. Populated during ring setup so we can
+// fetch the bare LERC files later without re-deriving paths from manifest.
+const bareLoadInfo = new Array(rings.length).fill(null);
+const bareLoadedTex = {};   // slug → THREE.DataTexture
+let bareLoadInFlight = null;
+for (let i = 0; i < rings.length; i++) {
+  const r = rings[i];
+  const hmFmt = r.heightmap_format || 'png';
+  console.info(`[ring ${r.slug}] loading (heightmap=${hmFmt})…`);
+  let heightTex, orthoTex, bareTex, heightData;
+  try {
+    // Heightmap + ortho. Bare-earth (DMR5G) heightmap is deferred —
+    // most users never enable the 🌳 toggle, so paying ~16 MB/ring (Float32
+    // at 2000² = 16 MB) up front is waste. We record the info needed to
+    // fetch it later (see bareLoadInfo + ensureBareLoaded below).
+    const heightP = loadHeightmapData(asset(r.heightmap_file), hmFmt,
+      r.heightmap_size, r.y_min, r.y_max);
+    await webpSupport;
+    const orthoP = loadTex(pickOrthoUrl(r));
+    const [heightRes, ortho] = await Promise.all([heightP, orthoP]);
+    heightTex = makeHeightTexture(heightRes.data, heightRes.n);
+    heightData = heightRes.data;     // shared with CPU sampleHeight below
+    orthoTex = ortho;
+    bareTex = null;   // populated on first bare-toggle click
+    if (r.bare_file && !SKIP_BARE) {
+      bareLoadInfo[i] = {
+        url: asset(r.bare_file),
+        fmt: hmFmt,
+        size: r.heightmap_size,
+        y_min: r.y_min,
+        y_max: r.y_max,
+      };
+    }
+  } catch (e) {
+    fatalLoadError(`Ring '${r.slug}' textures failed: ${e?.message || e}`);
+  }
+
+  // Ortho colorSpace: SRGBColorSpace so three.js decodes the sRGB-encoded
+  // JPEG/KTX2 to linear when sampled — required for the composer pipeline
+  // (RenderPass → linear target → OutputPass converts back to sRGB on
+  // canvas write). With NoColorSpace the sRGB-encoded photo data went
+  // through OutputPass as if it were linear, producing visibly over-bright
+  // orthos.
+  orthoTex.colorSpace = THREE.SRGBColorSpace;
+  orthoTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  orthoTex.flipY = false;
+
+  // Smaller (next) ring's footprint for clipBox carve-out.
+  const smaller = rings[i + 1];
+  const clipBox = smaller ? new THREE.Vector4(
+    -smaller.half, -smaller.half, smaller.half, smaller.half,
+  ) : null;
+
+  // Clone fog uniforms per material (fogColor/Density/Near/Far). Required
+  // by `fog: true` below — three.js' refreshFogUniforms reads .value off
+  // each. Plain UniformsUtils.merge would also clone our textures, so we
+  // clone fog separately and spread our texture uniforms as references.
+  const fogUniforms = THREE.UniformsUtils.clone(THREE.UniformsLib.fog);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      ...fogUniforms,
+      uHeight:    { value: heightTex },
+      uHeightBare:{ value: bareTex || heightTex },   // fallback = SM5 so blend is no-op when bare missing
+      uBareMode:  { value: 0.0 },      // 0 = DSM (with buildings/trees), 1 = bare earth (DMR5G)
+      uOrtho:     { value: orthoTex },
+      // Compressed textures (KTX2 → BC1/ETC2/ASTC) cannot be flipped at
+      // upload time the way regular images can (WebGL ignores
+      // UNPACK_FLIP_Y_WEBGL for compressed paths). So a KTX2 encoded in
+      // image-native order (row 0 = top) ends up vertically mirrored
+      // relative to a JPG loaded with flipY=false. Compensate by flipping
+      // the ortho UV in the fragment shader when the active texture is
+      // KTX2; flag is set per-texture on assignment.
+      uOrthoFlipY:{ value: orthoTex.isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0 },
+      uOrthoFlipX:{ value: orthoTex.isCompressedTexture ? ((_KTX2_FLIP >> 1) & 1) : 0.0 },
+      uCadastre:  { value: null },     // populated when cadastre toggle on
+      uCadEnabled:{ value: 0.0 },
+      uShadeMode: { value: 0.0 },      // 0 = ortho, 1 = flat shade by elevation
+      uShadeYMin: { value: globalYmin },   // ramp uses global Y range for cross-ring consistency
+      uShadeYMax: { value: globalYmax },
+      uHeightMin: { value: r.y_min },
+      uHeightMax: { value: r.y_max },
+      uYBase:     { value: yMid },     // shared baseline so rings line up
+      uClipBox:   { value: clipBox || new THREE.Vector4(0,0,0,0) },
+      uClipEnabled: { value: clipBox ? 1.0 : 0.0 },
+      // Hillshade: runtime sun lighting derived from heightmap derivatives.
+      // uHmTexel = 1/heightmap_size, uHmStep = step in meters per texel.
+      // Together they let the shader convert sampled height deltas into
+      // a 3D normal in scene coords, then Lambert against uSunDir.
+      uHmTexel:   { value: 1.0 / r.heightmap_size },
+      uHmStep:    { value: r.step },
+      uRingHalf:  { value: r.half },       // ring extent in metres, for shadow ray clipping
+      uSunDir:    { value: window._heightfieldSunDir },  // shared across all rings (set below)
+      uHillshade: { value: 0.0 },        // 0 = off (plain ortho), 1 = on
+      uShadows:   { value: 0.0 },        // 0 = lambert only, 1 = + cast shadows
+      // Precomputed shadow texture (baked GPU pass — see bakeShadowMaps).
+      // Default: 1×1 white = "fully lit" so toggling shadows before bake
+      // completes doesn't blacken everything. Replaced by render-target
+      // texture once bake finishes.
+      uShadowMap: { value: window._heightfieldDefaultShadowTex },
+      uAmbient:   { value: 0.55 },        // base lighting on shadow side
+      uDiffuse:   { value: 0.45 },        // sun-facing slope brightness boost
+    },
+    vertexShader: `
+      #include <fog_pars_vertex>
+      uniform sampler2D uHeight;
+      uniform sampler2D uHeightBare;
+      uniform float uBareMode;
+      uniform float uYBase;
+      varying vec2 vUv;
+      varying vec3 vWorldPos;
+      varying float vAbsY;
+      void main() {
+        // PlaneGeometry uv: v=0 at scene_z=+half (south), v=1 at scene_z=-half
+        // (north). Heightmap row 0 = north (rasterio bounds yield ymax-first
+        // row). Flip v so sampler reads correct row.
+        vec2 hmUv = vec2(uv.x, 1.0 - uv.y);
+        // DSM (SM5) carries surface elevation (terrain + buildings + trees).
+        // bare (DMR5G) carries ground-only. Both are Float32 DataTextures
+        // (decoded in JS from PNG-RG or LERC) so .r = absolute Y in metres.
+        float dsmY  = texture2D(uHeight,     hmUv).r;
+        float bareY = texture2D(uHeightBare, hmUv).r;
+        float absY  = mix(dsmY, bareY, uBareMode);
+        vec3 pos = position;
+        pos.y = absY - uYBase;
+        vUv = vec2(uv.x, 1.0 - uv.y);
+        vAbsY = absY;
+        vWorldPos = (modelMatrix * vec4(pos, 1.0)).xyz;
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }
+    `,
+    fragmentShader: `
+      #include <fog_pars_fragment>
+      uniform sampler2D uOrtho;
+      uniform sampler2D uCadastre;
+      uniform sampler2D uHeight;
+      uniform sampler2D uHeightBare;
+      uniform float uBareMode;
+      uniform float uCadEnabled;
+      uniform float uShadeMode;
+      uniform float uShadeYMin;
+      uniform float uShadeYMax;
+      uniform vec4 uClipBox;
+      uniform float uClipEnabled;
+      uniform float uHmTexel;
+      uniform float uHmStep;
+      uniform float uRingHalf;
+      uniform vec3 uSunDir;
+      uniform float uHillshade;
+      uniform float uShadows;
+      uniform sampler2D uShadowMap;
+      uniform float uOrthoFlipY;
+      uniform float uOrthoFlipX;
+      uniform float uAmbient;
+      uniform float uDiffuse;
+      uniform float uYBase;
+      varying vec2 vUv;
+      varying vec3 vWorldPos;
+      varying float vAbsY;
+
+      // Reconstruct surface normal from heightmap by sampling 4 neighbours.
+      // vUv is already in heightmap UV space (Y-flipped in vertex shader).
+      // dxMeters = world-space distance between neighbour taps (2 × step).
+      // Normal points up, with X/Z components proportional to local slope.
+      vec3 sampleNormal() {
+        float t = uHmTexel;
+        vec2 uvL = vUv + vec2(-t, 0.0);
+        vec2 uvR = vUv + vec2( t, 0.0);
+        vec2 uvU = vUv + vec2(0.0, -t);
+        vec2 uvD = vUv + vec2(0.0,  t);
+        // Mix DSM ↔ bare to match the vertex shader's height pick.
+        float hL = mix(texture2D(uHeight, uvL).r, texture2D(uHeightBare, uvL).r, uBareMode);
+        float hR = mix(texture2D(uHeight, uvR).r, texture2D(uHeightBare, uvR).r, uBareMode);
+        float hU = mix(texture2D(uHeight, uvU).r, texture2D(uHeightBare, uvU).r, uBareMode);
+        float hD = mix(texture2D(uHeight, uvD).r, texture2D(uHeightBare, uvD).r, uBareMode);
+        float dxMeters = 2.0 * uHmStep;
+        // Note vUv.y is flipped relative to scene Z: increase in v = decrease
+        // in z. The minus reflects that so the normal's Z component points
+        // the right way for a sun coming from positive Z (south).
+        return normalize(vec3(hL - hR, dxMeters, -(hU - hD)));
+      }
+
+      // Sample heightmap at world XZ — converts scene coords to ring UV,
+      // returns absolute elevation (mixed DSM/bare per uBareMode). Returns
+      // -1e9 when outside ring (caller treats as "no occluder data").
+      float sampleHeightAtWorld(vec2 worldXZ) {
+        // Ring is centred on (0,0,0), extends ±uRingHalf in X and Z.
+        if (abs(worldXZ.x) > uRingHalf || abs(worldXZ.y) > uRingHalf) {
+          return -1.0e9;
+        }
+        vec2 huv;
+        huv.x = (worldXZ.x / (2.0 * uRingHalf)) + 0.5;
+        // World Z maps to UV Y the same way the vertex shader flips it.
+        huv.y = (worldXZ.y / (2.0 * uRingHalf)) + 0.5;
+        float h;
+        if (uBareMode > 0.5) {
+          h = texture2D(uHeightBare, huv).r;
+        } else {
+          h = texture2D(uHeight, huv).r;
+        }
+        return h;
+      }
+
+      // Sample precomputed shadow map. uShadowMap is generated once via a
+      // GPU render-to-texture pass (bakeShadowMaps in JS) that runs the
+      // 20-tap raymarch per heightmap pixel. Runtime cost drops from
+      // ~20 texture fetches/fragment to 1. Bilinear filter softens edges.
+      float castShadow() {
+        return texture2D(uShadowMap, vUv).r;
+      }
+
+      // Viridis colormap approximation (Matplotlib's perceptually-uniform
+      // ramp). Input t in [0,1]; output RGB. 5-point piecewise polynomial
+      // fit is good enough for terrain visualization.
+      vec3 viridis(float t) {
+        t = clamp(t, 0.0, 1.0);
+        vec3 c0 = vec3(0.267, 0.005, 0.329);     // dark purple — low
+        vec3 c1 = vec3(0.282, 0.140, 0.457);
+        vec3 c2 = vec3(0.254, 0.265, 0.530);
+        vec3 c3 = vec3(0.207, 0.372, 0.553);
+        vec3 c4 = vec3(0.164, 0.471, 0.558);
+        vec3 c5 = vec3(0.128, 0.567, 0.551);
+        vec3 c6 = vec3(0.135, 0.659, 0.518);
+        vec3 c7 = vec3(0.267, 0.749, 0.441);
+        vec3 c8 = vec3(0.478, 0.821, 0.318);
+        vec3 c9 = vec3(0.741, 0.873, 0.150);
+        vec3 c10 = vec3(0.993, 0.906, 0.144);    // bright yellow — high
+        float idx = t * 10.0;
+        int i = int(floor(idx));
+        float f = fract(idx);
+        if (i == 0) return mix(c0, c1, f);
+        if (i == 1) return mix(c1, c2, f);
+        if (i == 2) return mix(c2, c3, f);
+        if (i == 3) return mix(c3, c4, f);
+        if (i == 4) return mix(c4, c5, f);
+        if (i == 5) return mix(c5, c6, f);
+        if (i == 6) return mix(c6, c7, f);
+        if (i == 7) return mix(c7, c8, f);
+        if (i == 8) return mix(c8, c9, f);
+        return mix(c9, c10, f);
+      }
+
+      void main() {
+        if (uClipEnabled > 0.5 &&
+            vWorldPos.x > uClipBox.x && vWorldPos.x < uClipBox.z &&
+            vWorldPos.z > uClipBox.y && vWorldPos.z < uClipBox.w) discard;
+        vec3 col;
+        if (uShadeMode > 0.5) {
+          // Flat-shaded by elevation. Map absolute Y to [0,1] over the
+          // global Y range so all rings share the same colour calibration.
+          float t = (vAbsY - uShadeYMin) / max(uShadeYMax - uShadeYMin, 1.0);
+          col = viridis(t);
+        } else {
+          vec2 orthoUv = vUv;
+          if (uOrthoFlipY > 0.5) orthoUv.y = 1.0 - orthoUv.y;
+          if (uOrthoFlipX > 0.5) orthoUv.x = 1.0 - orthoUv.x;
+          col = texture2D(uOrtho, orthoUv).rgb;
+          if (uCadEnabled > 0.5) {
+            // White-line cadastre overlay: alpha from WMS is the parcel-line
+            // mask (transparent everywhere else); we substitute pure white
+            // for the RGB so lines/numbers stay readable on both dark forest
+            // and bright field backgrounds. ČÚZK's default line colour is a
+            // dark blue/red that vanishes against shaded slopes.
+            // R-channel of an alpha-only R8 texture (see loadCadastreAlphaTex
+            // — we extract PNG alpha into a single-channel DataTexture to
+            // save 4× GPU memory). Semantics unchanged: full mask = white.
+            float cadA = texture2D(uCadastre, vUv).r;
+            col = mix(col, vec3(1.0), cadA);
+          }
+          // Hillshade — runtime sun lighting from heightmap derivatives.
+          // Optionally combined with ray-marched cast shadows (heavier,
+          // ~20 texture taps/pixel, but adds real occlusion from cliffs
+          // and buildings). Both gated on uHillshade so flat-shaded mode
+          // (viridis) stays untouched.
+          if (uHillshade > 0.5) {
+            vec3 n = sampleNormal();
+            float lambert = max(dot(n, uSunDir), 0.0);
+            // Skip the ray-march when lambert is already 0 (pixel faces
+            // away from sun) — cast shadow can't darken what diffuse term
+            // already kills.
+            float shadow = (uShadows > 0.5 && lambert > 0.0) ? castShadow() : 1.0;
+            col *= uAmbient + uDiffuse * lambert * shadow;
+          }
+        }
+        gl_FragColor = vec4(col, 1.0);
+        #include <fog_fragment>
+      }
+    `,
+    fog: true,
+    side: THREE.DoubleSide,
+    // Sub-pixel z-fight bias between LOD rings. factor=0 keeps the offset
+    // constant per triangle (factor=1 would multiply by depth slope and
+    // skew on near-vertical surfaces — see inzerator's v2.html comment on
+    // the same pattern). 32 units per LOD level is enough to bury 24-bit
+    // depth-buffer noise at typical viewing distances without distorting
+    // depth on real cliff geometry. Inner gets the largest negative bias
+    // → renders "on top" of closeup which is on top of outer.
+    polygonOffset: true,
+    polygonOffsetFactor: 0,
+    polygonOffsetUnits: -(i + 1) * 32,
+  });
+
+  const mesh = new THREE.Mesh(sharedGeo, mat);
+  // Scale the unit plane to this ring's world size. Y stays 1 (vertex
+  // shader sets the actual elevation via uHeight sample).
+  mesh.scale.set(r.side_m, 1, r.side_m);
+  mesh.renderOrder = 1 + i;
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+  ringMeshes.push(mesh);
+
+  // CPU heightfield reuses the Float32 array decoded above for both
+  // GPU texture and CPU sampling — no second pass needed regardless of
+  // whether the source was PNG-RG or LERC.
+  ringData[r.slug] = {
+    heightData, n: r.heightmap_size,
+    y_min: r.y_min, y_max: r.y_max, side_m: r.side_m, half: r.half,
+  };
+  console.info(`[ring ${r.slug}] ready (${heightData.length} cells)`);
+  setStage(`ring ${r.slug} hotov (${i + 1}/${rings.length})`);
+}
+setStage('hotovo');
+hideLoader();
+
+// ── CPU heightmap sample ──
+// Returns absolute elevation (m AMSL) at scene-local (lx, lz). Iterates
+// inner→outer (rings is stored outer→inner) so the finest available LOD
+// wins for any query point. Used by:
+//   - parcel outline drape (re-add when parcels come back)
+//   - building footprint corner sampling (next feature)
+//   - tooltip / measurement (when re-enabled)
+//   - DevTools probe via `window._sampleAt(x, z)`
+// Returns null if point is outside even the outermost ring.
+function sampleAt(lx, lz) {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    const d = ringData[r.slug];
+    if (Math.abs(lx) > d.half || Math.abs(lz) > d.half) continue;
+    const u = (lx + d.side_m / 2) / d.side_m;
+    const v = (lz + d.side_m / 2) / d.side_m;
+    const col = Math.max(0, Math.min(d.n - 1, (u * (d.n - 1)) | 0));
+    const row = Math.max(0, Math.min(d.n - 1, (v * (d.n - 1)) | 0));
+    return d.heightData[row * d.n + col];
+  }
+  return null;
+}
+window._sampleAt = sampleAt;   // debug probe — try `_sampleAt(0, 0)` in console
+
+// ── Wireframe + flat-shaded toggles ──
+// Wireframe shows triangle edges only. Flat-shaded colours each fragment
+// by elevation (viridis ramp) — useful to inspect terrain shape without
+// ortho texture clutter. The two modes are orthogonal and combinable.
+const wireToggle = document.getElementById('wire-toggle');
+wireToggle.addEventListener('change', () => {
+  for (const mesh of ringMeshes) {
+    mesh.material.wireframe = wireToggle.checked;
+    mesh.material.needsUpdate = true;
+  }
+});
+const shadeToggle = document.getElementById('shade-toggle');
+shadeToggle.addEventListener('change', () => {
+  for (const mesh of ringMeshes) {
+    mesh.material.uniforms.uShadeMode.value = shadeToggle.checked ? 1.0 : 0.0;
+  }
+});
+const bareToggle = document.getElementById('bare-toggle');
+const bareStatus = document.createElement('span');
+bareStatus.style.cssText = 'font-size:11px;color:#9c9;margin-left:4px;';
+bareToggle.parentElement.appendChild(bareStatus);
+
+async function ensureBareLoaded() {
+  if (Object.keys(bareLoadedTex).length === rings.length) return;
+  if (bareLoadInFlight) return bareLoadInFlight;
+  bareLoadInFlight = Promise.all(rings.map(async (r, i) => {
+    if (bareLoadedTex[r.slug]) return;
+    const info = bareLoadInfo[i];
+    if (!info) return;   // no bare file for this ring
+    const res = await loadHeightmapData(info.url, info.fmt, info.size, info.y_min, info.y_max);
+    const tex = makeHeightTexture(res.data, res.n);
+    bareLoadedTex[r.slug] = tex;
+    ringMeshes[i].material.uniforms.uHeightBare.value = tex;
+  })).finally(() => { bareLoadInFlight = null; });
+  return bareLoadInFlight;
+}
+
+bareToggle.addEventListener('change', async () => {
+  if (bareToggle.checked) {
+    bareToggle.disabled = true;
+    bareStatus.textContent = 'načítám DMR5G…';
+    try { await ensureBareLoaded(); }
+    catch (e) {
+      bareStatus.textContent = `chyba: ${e.message}`;
+      bareToggle.checked = false;
+      bareToggle.disabled = false;
+      return;
+    }
+    bareStatus.textContent = '';
+    bareToggle.disabled = false;
+  }
+  const v = bareToggle.checked ? 1.0 : 0.0;
+  for (const mesh of ringMeshes) {
+    mesh.material.uniforms.uBareMode.value = v;
+  }
+  // If shadows are on, the bake's input changed — re-render shadow maps
+  // for the new surface (DSM vs DMR5G silhouettes differ wherever there
+  // are buildings or trees).
+  if (shadowToggle.checked) {
+    shadowToggle.disabled = true;
+    shadowStatus.textContent = 'překresluji stíny…';
+    shadowMapsBakedForBare = null;
+    await ensureShadowMaps();
+    shadowStatus.textContent = '';
+    shadowToggle.disabled = false;
+  } else {
+    shadowMapsBakedForBare = null;
+  }
+});
+// ── Precomputed cast-shadow texture ──
+// One GPU render pass per ring at heightmap resolution writes the
+// raymarched shadow factor into a R8 texture. Main shader then samples
+// it (1 tap with bilinear filter). Drops per-frame cost from ~20
+// shadow-march taps × full-screen pixels → 1 tap. Sun direction is
+// constant so bake is one-shot; bare-mode change triggers re-bake.
+const shadowMaps = {};   // slug → THREE.WebGLRenderTarget
+let shadowMapsBakedForBare = null;
+let shadowBakeInFlight = null;
+
+let _bakePipeline = null;
+function getBakePipeline() {
+  if (_bakePipeline) return _bakePipeline;
+  const scene = new THREE.Scene();
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const geo = new THREE.PlaneGeometry(2, 2);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uHeight:     { value: null },
+      uHeightBare: { value: null },
+      uBareMode:   { value: 0.0 },
+      uSunDir:     { value: window._heightfieldSunDir },
+      uRingHalf:   { value: 1.0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      uniform sampler2D uHeight;
+      uniform sampler2D uHeightBare;
+      uniform float uBareMode;
+      uniform vec3 uSunDir;
+      uniform float uRingHalf;
+      varying vec2 vUv;
+      float sampleH(vec2 uv) {
+        return mix(texture2D(uHeight, uv).r,
+                   texture2D(uHeightBare, uv).r, uBareMode);
+      }
+      float sampleHeightAtWorld(vec2 worldXZ) {
+        if (abs(worldXZ.x) > uRingHalf || abs(worldXZ.y) > uRingHalf) {
+          return -1.0e9;
+        }
+        vec2 huv;
+        huv.x = (worldXZ.x / (2.0 * uRingHalf)) + 0.5;
+        huv.y = (worldXZ.y / (2.0 * uRingHalf)) + 0.5;
+        return sampleH(huv);
+      }
+      void main() {
+        float surfY = sampleH(vUv);
+        vec2 originXZ;
+        originXZ.x = (vUv.x - 0.5) * 2.0 * uRingHalf;
+        originXZ.y = (vUv.y - 0.5) * 2.0 * uRingHalf;
+        float t = 1.0;
+        for (int i = 0; i < 20; i++) {
+          vec3 step3 = uSunDir * t;
+          vec2 sampleXZ = originXZ + step3.xz;
+          float sampleSurfY = sampleHeightAtWorld(sampleXZ);
+          if (sampleSurfY < -1.0e8) break;
+          float rayY = surfY + step3.y + 0.3;
+          if (sampleSurfY > rayY) { gl_FragColor = vec4(0.0); return; }
+          t *= 1.5;
+        }
+        gl_FragColor = vec4(1.0);
+      }
+    `,
+  });
+  scene.add(new THREE.Mesh(geo, mat));
+  _bakePipeline = { scene, cam, mat };
+  return _bakePipeline;
+}
+
+function bakeShadowMaps() {
+  const { scene: bakeScene, cam: bakeCam, mat: bakeMat } = getBakePipeline();
+  const bareMode = ringMeshes[0]?.material.uniforms.uBareMode.value ?? 0.0;
+
+  for (let i = 0; i < rings.length; i++) {
+    const r = rings[i];
+    const ringMat = ringMeshes[i].material;
+    // Render at ¼ heightmap resolution. 20-tap raymarch × full heightmap
+    // is overkill for an overlay where bilinear sampling already softens
+    // edges — we deliberately trade per-pixel precision for cheap re-bakes,
+    // which is what makes the sun-azimuth slider interactive (16× fewer
+    // GPU ops vs. full-res keeps re-bake well under one frame budget).
+    const W = Math.max(256, r.heightmap_size >> 2);
+    let target = shadowMaps[r.slug];
+    if (!target) {
+      target = new THREE.WebGLRenderTarget(W, W, {
+        format: THREE.RedFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        wrapS: THREE.ClampToEdgeWrapping,
+        wrapT: THREE.ClampToEdgeWrapping,
+        depthBuffer: false,
+        stencilBuffer: false,
+      });
+      shadowMaps[r.slug] = target;
+    }
+    bakeMat.uniforms.uHeight.value     = ringMat.uniforms.uHeight.value;
+    bakeMat.uniforms.uHeightBare.value = ringMat.uniforms.uHeightBare.value;
+    bakeMat.uniforms.uBareMode.value   = bareMode;
+    bakeMat.uniforms.uRingHalf.value   = r.half;
+    renderer.setRenderTarget(target);
+    renderer.clear();
+    renderer.render(bakeScene, bakeCam);
+    ringMat.uniforms.uShadowMap.value = target.texture;
+  }
+  renderer.setRenderTarget(null);
+  shadowMapsBakedForBare = bareMode;
+}
+
+async function ensureShadowMaps() {
+  const currentBare = ringMeshes[0]?.material.uniforms.uBareMode.value ?? 0.0;
+  if (Object.keys(shadowMaps).length === rings.length
+      && shadowMapsBakedForBare === currentBare) return;
+  if (shadowBakeInFlight) { await shadowBakeInFlight; return; }
+  shadowBakeInFlight = new Promise(resolve => {
+    // Defer one frame so the UI paints the checkbox state and the
+    // "computing…" status before the GPU blocks on the bake pass.
+    requestAnimationFrame(() => {
+      bakeShadowMaps();
+      resolve();
+    });
+  });
+  await shadowBakeInFlight;
+  shadowBakeInFlight = null;
+}
+
+const shadowToggle = document.getElementById('shadow-toggle');
+const shadowStatus = document.createElement('span');
+shadowStatus.style.cssText = 'font-size:11px;color:#9c9;margin-left:4px;';
+shadowToggle.parentElement.appendChild(shadowStatus);
+const sunControls = document.getElementById('sun-controls');
+shadowToggle.addEventListener('change', async () => {
+  if (shadowToggle.checked) {
+    shadowToggle.disabled = true;
+    shadowStatus.textContent = 'počítám stíny…';
+    await ensureShadowMaps();
+    shadowStatus.textContent = '';
+    shadowToggle.disabled = false;
+    sunControls.style.display = '';
+  } else {
+    sunControls.style.display = 'none';
+  }
+  const on = shadowToggle.checked ? 1.0 : 0.0;
+  for (const mesh of ringMeshes) {
+    mesh.material.uniforms.uHillshade.value = on;
+    mesh.material.uniforms.uShadows.value = on;
+  }
+});
+
+// Sun position from time-of-day + day-of-year + location (lat/lon).
+// Standard astronomical formulas (declination + hour angle → elevation +
+// compass azimuth). Accuracy is plenty for visualization — solar noon
+// is correct to ~minute, position to ~0.5°. Location lat/lon is fetched
+// once from the server (pyproj-backed Křovák inverse); a default of
+// 50°N, 15°E (rough Czech centre) seeds the UI while fetch is in flight.
+let _sunLat = 50.0, _sunLon = 15.0;
+fetch(`/api/sjtsk-to-wgs?cx=${cx}&cy=${cy}`)
+  .then(r => r.json())
+  .then(d => { _sunLat = d.lat; _sunLon = d.lon; recomputeSunDir(); })
+  .catch(() => {});
+
+const sunHourSlider = document.getElementById('sun-hour');
+const sunHourVal = document.getElementById('sun-hour-val');
+const sunDoySlider = document.getElementById('sun-doy');
+const sunDoyVal = document.getElementById('sun-doy-val');
+const sunReadout = document.getElementById('sun-readout');
+let sunRebakeQueued = false;
+
+function doyToDate(doy) {
+  // Use a non-leap year for the conversion. doy=1 = Jan 1.
+  const d = new Date(2025, 0, doy);
+  return `${d.getDate()}.${d.getMonth() + 1}.`;
+}
+
+function solarPosition(hour, doy, lat, lon) {
+  // Solar declination (Spencer 1971 simple form is good enough).
+  const decl = THREE.MathUtils.degToRad(
+    23.45 * Math.sin(THREE.MathUtils.degToRad(360 * (284 + doy) / 365))
+  );
+  // Treat slider hour as local solar time (longitude-corrected for any
+  // CZ user is within ±15 min of CET — well below visualization
+  // precision). Hour angle: 0 at solar noon, +15°/h after noon.
+  const H = THREE.MathUtils.degToRad((hour - 12) * 15);
+  const φ = THREE.MathUtils.degToRad(lat);
+  const sinEl = Math.sin(φ) * Math.sin(decl)
+              + Math.cos(φ) * Math.cos(decl) * Math.cos(H);
+  const el = Math.asin(Math.max(-1, Math.min(1, sinEl)));
+  // Azimuth from north, clockwise (compass convention).
+  const y = -Math.sin(H) * Math.cos(decl);
+  const x = Math.sin(decl) * Math.cos(φ) - Math.cos(decl) * Math.sin(φ) * Math.cos(H);
+  const az = Math.atan2(y, x);
+  return {
+    el: THREE.MathUtils.radToDeg(el),
+    az: (THREE.MathUtils.radToDeg(az) + 360) % 360,
+  };
+}
+
+function recomputeSunDir() {
+  const hour = parseFloat(sunHourSlider.value);
+  const doy = parseInt(sunDoySlider.value, 10);
+  const hh = Math.floor(hour);
+  const mm = Math.round((hour - hh) * 60);
+  sunHourVal.textContent = `${hh}:${mm.toString().padStart(2, '0')}`;
+  sunDoyVal.textContent = `${doy} (${doyToDate(doy)})`;
+  const { el, az } = solarPosition(hour, doy, _sunLat, _sunLon);
+  const below = el < 0;
+  sunReadout.textContent = below
+    ? `az ${az.toFixed(0)}° / el ${el.toFixed(0)}° (pod obzorem)`
+    : `az ${az.toFixed(0)}° / el ${el.toFixed(0)}°`;
+  // Sub-horizon sun gets a negative y-component; lambert in the shader
+  // is max(dot(n, uSunDir), 0) so the diffuse term naturally drops to
+  // zero and only ambient remains → twilight / night look without
+  // special-casing.
+  const polar = THREE.MathUtils.degToRad(90 - el);
+  const theta = THREE.MathUtils.degToRad(180 - az);
+  window._heightfieldSunDir.set(
+    Math.sin(polar) * Math.sin(theta),
+    Math.cos(polar),
+    Math.sin(polar) * Math.cos(theta),
+  ).normalize();
+}
+recomputeSunDir();   // sync sliders → initial uniform on startup
+
+function queueRebake() {
+  if (sunRebakeQueued) return;
+  sunRebakeQueued = true;
+  requestAnimationFrame(() => {
+    sunRebakeQueued = false;
+    if (Object.keys(shadowMaps).length) {
+      shadowMapsBakedForBare = null;
+      bakeShadowMaps();
+    }
+  });
+}
+sunHourSlider.addEventListener('input', () => { recomputeSunDir(); queueRebake(); });
+sunDoySlider.addEventListener('input',  () => { recomputeSunDir(); queueRebake(); });
+
+// (Bare-earth → shadow re-bake handled directly in the main bareToggle
+// listener above so it sequences with the bare-load await.)
+
+// ── OSM raster overlay (replaces ortho with neutral basemap) ──
+// Fetches OSM tiles reprojected to S-JTSK via /proxy/osm. Useful with
+// shadows: neutral basemap shows the relief, ortho photo competes with
+// hillshade visually. Initial ortho texture per ring is captured at
+// startup so toggling back restores exactly what was on screen (incl.
+// any tier that was active via the orthoTier system).
+const osmTextures = {};         // slug → THREE.Texture
+const initialOrthoTex = {};     // slug → THREE.Texture (snapshot at first toggle)
+const osmToggle = document.getElementById('osm-toggle');
+osmToggle.addEventListener('change', async () => {
+  if (osmToggle.checked) {
+    osmToggle.disabled = true;
+    for (let i = 0; i < rings.length; i++) {
+      const r = rings[i];
+      if (!initialOrthoTex[r.slug]) {
+        initialOrthoTex[r.slug] = ringMeshes[i].material.uniforms.uOrtho.value;
+      }
+      if (!osmTextures[r.slug]) {
+        const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
+        const url = `/proxy/osm?BBOX=${bbox}&size=4096`;
+        const tex = await loadTex(url);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        tex.flipY = false;
+        osmTextures[r.slug] = tex;
+      }
+      const mat = ringMeshes[i].material;
+      mat.uniforms.uOrtho.value = osmTextures[r.slug];
+      mat.uniforms.uOrthoFlipY.value = osmTextures[r.slug].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
+    }
+    osmToggle.disabled = false;
+  } else {
+    for (let i = 0; i < rings.length; i++) {
+      const r = rings[i];
+      if (initialOrthoTex[r.slug]) {
+        const mat = ringMeshes[i].material;
+        mat.uniforms.uOrtho.value = initialOrthoTex[r.slug];
+        mat.uniforms.uOrthoFlipY.value = initialOrthoTex[r.slug].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
+      }
+    }
+  }
+});
+
+// ── Parcel selection (for screenshots) ──
+// Click on terrain in selection mode → toggle parcel highlight. Outlines
+// are drawn as ground-draped tubes; bright white + no tone mapping so
+// they pop against any ortho/OSM/shaded background. Uses /api/parcels
+// (same backend as v2.html), cached after first toggle. Click hits the
+// nearest *containing* parcel; ties broken by smallest area so nested
+// parcels select the inner one.
+const parcelsToggle = document.getElementById('parcels-toggle');
+const parcelsCount = document.getElementById('parcels-count');
+const parcelsClear = document.getElementById('parcels-clear');
+const outlineGroup = new THREE.Group();
+outlineGroup.renderOrder = 99;
+scene.add(outlineGroup);
+let parcels = null;     // [{ id, label, area_m2, ring_local: [[x,z,absY], ...] }, ...]
+const parcelsById = new Map();
+const selectedParcels = new Set();
+const raycaster = new THREE.Raycaster();
+const ndcMouse = new THREE.Vector2();
+
+async function ensureParcels() {
+  if (parcels) return parcels;
+  parcelsCount.textContent = ' (načítám…)';
+  // Use the largest ring's extent as fetch radius — covers everything
+  // user can click on. half is already in metres.
+  const radius = Math.max(...rings.map(r => r.half));
+  const url = `/api/parcels?gcx=${cx}&gcy=${cy}&radius=${radius}`;
+  const r = await fetch(url);
+  if (!r.ok) {
+    parcelsCount.textContent = ` (chyba ${r.status})`;
+    return null;
+  }
+  parcels = await r.json();
+  for (const p of parcels) if (p.id) parcelsById.set(p.id, p);
+  parcelsCount.textContent = ` (${parcels.length} parcel)`;
+  return parcels;
+}
+
+function pointInRing(px, pz, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], zi = ring[i][1];
+    const xj = ring[j][0], zj = ring[j][1];
+    const intersect = ((zi > pz) !== (zj > pz)) &&
+      (px < (xj - xi) * (pz - zi) / (zj - zi + 1e-9) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pickParcelAt(sx, sz) {
+  if (!parcels) return null;
+  let pick = null, pickArea = Infinity;
+  for (const p of parcels) {
+    if (!p.ring_local || p.ring_local.length < 3) continue;
+    if (pointInRing(sx, sz, p.ring_local) && p.area_m2 < pickArea) {
+      pick = p;
+      pickArea = p.area_m2;
+    }
+  }
+  return pick;
+}
+
+// Drape a parcel ring onto the heightfield. Subdivides each edge every
+// SUB_M metres + samples sampleAt() so the tube hugs the terrain. LIFT
+// pushes the tube slightly above the surface so polygon-offset isn't
+// strictly needed — at typical view distance the bias is invisible but
+// keeps z-fighting at bay.
+
+// Two ring vertices are "the same edge endpoint" when their XZ match to
+// the centimetre. RUIAN's parcel API returns shared boundary vertices
+// with identical XZ but ring-internal Y can disagree by mm — we quantise
+// XZ only (Y is taken from the heightfield drape anyway).
+function _parcelEdgeKey(a, b) {
+  const qx = (v) => `${Math.round(v[0] * 100)}:${Math.round(v[1] * 100)}`;
+  const ka = qx(a), kb = qx(b);
+  return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+}
+
+function redrawOutlines() {
+  while (outlineGroup.children.length) {
+    const m = outlineGroup.children.pop();
+    m.geometry.dispose();
+  }
+  if (!_parcelTubeMat) {
+    _parcelTubeMat = new THREE.MeshBasicMaterial({
+      // HDR-bright white. With no tone mapping, RGB(3,3,3) clips to 1.0
+      // per channel after gamma so the tube reads as pure white. Looks
+      // crisp on dark forest, light fields, and OSM alike.
+      color: new THREE.Color(3.0, 3.0, 3.0),
+      toneMapped: false,
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: 0,
+      polygonOffsetUnits: -128,
+    });
+  }
+  // Pass 1: count edge occurrences across all selected parcels.
+  // Adjacent parcels share their common boundary; that edge appears
+  // twice in the union and we skip it so the silhouette draws as one
+  // continuous perimeter instead of layered tubes along every parcel
+  // boundary inside the group.
+  const edgeCount = new Map();
+  const selectedEntries = [];
+  for (const id of selectedParcels) {
+    const p = parcelsById.get(id);
+    if (!p || !p.ring_local || p.ring_local.length < 3) continue;
+    selectedEntries.push(p);
+    const ring = p.ring_local;
+    for (let i = 0; i < ring.length; i++) {
+      const k = _parcelEdgeKey(ring[i], ring[(i + 1) % ring.length]);
+      edgeCount.set(k, (edgeCount.get(k) || 0) + 1);
+    }
+  }
+  // Pass 2: walk each selected ring and draw only edges that occur
+  // exactly once. Drape-subdivision happens per-edge so the tube hugs
+  // the terrain even when the parcel polygon has long straight sides
+  // across uneven ground.
+  for (const p of selectedEntries) {
+    const ring = p.ring_local;
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i];
+      const b = ring[(i + 1) % ring.length];
+      if (edgeCount.get(_parcelEdgeKey(a, b)) !== 1) continue;
+      const pts = drapeEdge(a, b);
+      if (pts.length < 2) continue;
+      const path = new THREE.CurvePath();
+      for (let j = 0; j < pts.length - 1; j++) {
+        path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
+      }
+      const geo = new THREE.TubeGeometry(path, pts.length, 0.6, 12, false);
+      const tube = new THREE.Mesh(geo, _parcelTubeMat);
+      tube.renderOrder = 99;
+      // Enable bloom layer (keeps default layer 0 too) so the tube
+      // renders in both passes — the bloom-only pass picks it up for
+      // the halo, the final pass draws the crisp inner core.
+      tube.layers.enable(BLOOM_LAYER);
+      outlineGroup.add(tube);
+    }
+  }
+  parcelsClear.style.display = selectedParcels.size ? '' : 'none';
+}
+let _parcelTubeMat = null;
+
+// Drape one edge (between two consecutive ring vertices) onto the
+// heightfield. Split off from drapeRing so the edge-dedup loop above
+// can emit per-edge tubes without having to subdivide entire rings.
+function drapeEdge(a, b) {
+  const SUB_M = 1.5;
+  const LIFT = 0.4;
+  const pts = [];
+  const dx = b[0] - a[0];
+  const dz = b[1] - a[1];
+  const dist = Math.hypot(dx, dz);
+  const steps = Math.max(1, Math.ceil(dist / SUB_M));
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    const x = a[0] + dx * t;
+    const z = a[1] + dz * t;
+    const absY = sampleAt(x, z);
+    const ySource = absY !== null ? absY : (a[2] + (b[2] - a[2]) * t);
+    pts.push(new THREE.Vector3(x, ySource - yMid + LIFT, z));
+  }
+  return pts;
+}
+
+// CPU ringMesh geometries are flat planes (vertex shader does the height
+// displacement, raycaster doesn't know about that). A naive ray×mesh hit
+// would give the XZ where the *flat* plane intersects the ray, which at
+// steep view angles can be tens of metres off from where the user
+// actually clicked on the terrain. We fix this with a few iterations:
+// hit flat plane at y=0, sample terrain at that XZ, intersect the ray
+// with the plane at the sampled Y, repeat until it converges.
+function rayPickTerrainXZ(ray) {
+  let yTarget = 0;
+  let hitX = 0, hitZ = 0;
+  for (let i = 0; i < 6; i++) {
+    const denom = ray.direction.y;
+    if (Math.abs(denom) < 1e-6) return null;
+    const t = (yTarget - ray.origin.y) / denom;
+    if (t < 0) return null;
+    hitX = ray.origin.x + ray.direction.x * t;
+    hitZ = ray.origin.z + ray.direction.z * t;
+    const absY = sampleAt(hitX, hitZ);
+    if (absY === null) return { x: hitX, z: hitZ };
+    const newY = absY - yMid;
+    if (Math.abs(newY - yTarget) < 0.1) return { x: hitX, z: hitZ };
+    yTarget = newY;
+  }
+  return { x: hitX, z: hitZ };
+}
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (!parcelsToggle.checked || !parcels) return;
+  if (e.button !== 0) return;
+  // Skip clicks that look like drag-start (OrbitControls): we only act
+  // on pointerup if the cursor barely moved. 4 px threshold matches what
+  // OrbitControls uses internally to distinguish click vs. drag.
+  const downX = e.clientX, downY = e.clientY;
+  const onUp = (eUp) => {
+    renderer.domElement.removeEventListener('pointerup', onUp);
+    if (Math.hypot(eUp.clientX - downX, eUp.clientY - downY) > 4) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    ndcMouse.x =  ((eUp.clientX - rect.left) / rect.width)  * 2 - 1;
+    ndcMouse.y = -((eUp.clientY - rect.top)  / rect.height) * 2 + 1;
+    raycaster.setFromCamera(ndcMouse, camera);
+    const hit = rayPickTerrainXZ(raycaster.ray);
+    if (!hit) return;
+    const p = pickParcelAt(hit.x, hit.z);
+    if (!p || !p.id) return;
+    if (selectedParcels.has(p.id)) selectedParcels.delete(p.id);
+    else selectedParcels.add(p.id);
+    redrawOutlines();
+  };
+  renderer.domElement.addEventListener('pointerup', onUp);
+});
+
+parcelsToggle.addEventListener('change', async () => {
+  if (parcelsToggle.checked) {
+    parcelsToggle.disabled = true;
+    await ensureParcels();
+    parcelsToggle.disabled = false;
+  } else {
+    // Hide outlines but keep selectedParcels so re-enabling restores them.
+    outlineGroup.visible = false;
+    return;
+  }
+  outlineGroup.visible = true;
+  redrawOutlines();
+});
+
+parcelsClear.addEventListener('click', () => {
+  selectedParcels.clear();
+  redrawOutlines();
+});
+
+// ── Ortho quality tier switcher ──
+// If the manifest carries `ortho_tiers` (gen with --ortho-tiers low,mid,high)
+// the UI exposes 3 buttons. Each press fetches the matching ortho for every
+// ring (cached after first load), swaps the uOrtho uniform. Tier currently
+// in use marked with active styling.
+const orthoTierUI = document.getElementById('ortho-quality');
+const orthoTierStatus = document.getElementById('ortho-quality-status');
+// Per-ring × tier texture cache. Key = `${slug}|${tier}` → THREE.Texture.
+// The default-tier texture (loaded during initial ring setup) is already
+// in this cache so the first click on its button is instant.
+const orthoTierCache = {};
+let currentTier = null;
+const anyTiers = rings.some(r => r.ortho_tiers);
+if (anyTiers) {
+  orthoTierUI.style.display = '';
+  // Seed cache with the default tiers already loaded during ring setup.
+  for (let i = 0; i < rings.length; i++) {
+    const r = rings[i];
+    const defaultTier = r.ortho_default || 'mid';
+    currentTier = currentTier || defaultTier;
+    orthoTierCache[`${r.slug}|${defaultTier}`] = ringMeshes[i].material.uniforms.uOrtho.value;
+  }
+  syncTierButtons();
+  orthoTierStatus.textContent = `(${currentTier})`;
+}
+function syncTierButtons() {
+  for (const btn of orthoTierUI.querySelectorAll('.oq')) {
+    const t = btn.dataset.tier;
+    // Hide buttons for tiers no ring carries (e.g. `ultra` only generated
+    // for select locations). Keeps the bar uncluttered per-location.
+    const supported = rings.some(r => r.ortho_tiers && r.ortho_tiers[t]);
+    btn.style.display = supported ? '' : 'none';
+    const active = t === currentTier;
+    btn.style.background = active ? '#1a6a8e' : '';
+    btn.style.color = active ? '#fff' : '';
+    btn.style.fontWeight = active ? 'bold' : 'normal';
+  }
+}
+async function switchOrthoTier(tier) {
+  if (tier === currentTier) return;
+  orthoTierStatus.textContent = `načítám ${tier}…`;
+  // Fetch missing textures in parallel.
+  await Promise.all(rings.map(async (r, i) => {
+    const tiers = r.ortho_tiers;
+    if (!tiers || !tiers[tier]) return;     // ring lacks this tier; keep current
+    const key = `${r.slug}|${tier}`;
+    if (!orthoTierCache[key]) {
+      const tex = await loadTex(pickTierUrl(tiers[tier]));
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      tex.flipY = false;
+      orthoTierCache[key] = tex;
+    }
+    const mat = ringMeshes[i].material;
+    mat.uniforms.uOrtho.value = orthoTierCache[key];
+    mat.uniforms.uOrthoFlipY.value = orthoTierCache[key].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
+  }));
+  currentTier = tier;
+  syncTierButtons();
+  orthoTierStatus.textContent = `(${tier})`;
+}
+orthoTierUI.addEventListener('click', (e) => {
+  if (e.target.dataset?.tier) switchOrthoTier(e.target.dataset.tier);
+});
+
+// ── Cadastre overlay toggle ──
+// Each ring fetches its own SJTSK-aligned cadastre PNG from inzerator's
+// /proxy/cadastre. Same UV space as our SJTSK-aligned heightmap+ortho, so
+// no reprojection. Cached after first load.
+const cadTextures = {};   // slug → THREE.DataTexture (R8 alpha-only)
+const cadToggle = document.getElementById('cad-toggle');
+const cadStatus = document.getElementById('cad-status');
+
+async function loadCadastreAlphaTex(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`cadastre fetch ${resp.status}`);
+  const blob = await resp.blob();
+  const bitmap = await createImageBitmap(blob);
+  const W = bitmap.width, H = bitmap.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: false });
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const imgData = ctx.getImageData(0, 0, W, H).data;
+  // Pack alpha-only into a tightly typed array. RGBA stride 4 → byte stride 1
+  // is the entire memory win: same 8192² grid drops from 256 MB (RGBA on
+  // GPU) to 64 MB (R8). With mipmaps and anisotropy it still beats the
+  // original by ~4×.
+  const alpha = new Uint8Array(W * H);
+  for (let i = 0, j = 3; i < alpha.length; i++, j += 4) alpha[i] = imgData[j];
+  const tex = new THREE.DataTexture(alpha, W, H,
+    THREE.RedFormat, THREE.UnsignedByteType);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+async function ensureCadastre() {
+  if (Object.keys(cadTextures).length === rings.length) return;
+  cadStatus.textContent = 'načítám katastr…';
+  for (const r of rings) {
+    if (cadTextures[r.slug]) continue;
+    // Prefer the pre-fetched cadastre PNG baked into the ring manifest;
+    // fall back to a live fetch from the inzerator proxy if the gen
+    // script ran without --no-cadastre but the inzerator server was down
+    // at gen time. Live fetch may CORS-fail across browsers/setups.
+    let url;
+    if (r.cadastre_file) {
+      url = asset(r.cadastre_file);
+    } else {
+      const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
+      url = `/proxy/cadastre?BBOX=${bbox}&layer=KN&size=4096`;
+    }
+    try {
+      // Cadastre PNG is line art on transparent background — shader only
+      // samples the alpha channel (see fragment shader's `cadA` mix).
+      // Keeping the full RGBA on GPU wastes 4× the memory (e.g. 8192² →
+      // 256 MB per ring) for data we never read. Decode the PNG in a
+      // canvas, extract alpha, upload as a single-channel R8 DataTexture.
+      const tex = await loadCadastreAlphaTex(url);
+      cadTextures[r.slug] = tex;
+    } catch (e) {
+      cadStatus.textContent = `chyba: ${e.message}`;
+      console.error(`[cad ${r.slug}]`, e);
+      return;
+    }
+  }
+  cadStatus.textContent = 'načteno (pre-fetched)';
+}
+
+cadToggle.addEventListener('change', async () => {
+  if (cadToggle.checked) {
+    await ensureCadastre();
+    for (let i = 0; i < ringMeshes.length; i++) {
+      const mesh = ringMeshes[i];
+      const r = rings[i];
+      mesh.material.uniforms.uCadastre.value = cadTextures[r.slug];
+      mesh.material.uniforms.uCadEnabled.value = 1.0;
+    }
+  } else {
+    for (const mesh of ringMeshes) {
+      mesh.material.uniforms.uCadEnabled.value = 0.0;
+    }
+    cadStatus.textContent = '';
+  }
+});
+
+// ── HUD ──
+const sizes = rings.map(r => `${r.slug}: ${(r.side_m/1000).toFixed(0)} km @ ${r.step} m`).join('<br>  ');
+document.getElementById('data').innerHTML = `
+  ${slug} · LOD pyramid<br>
+  ${sizes}<br>
+  Y range ${globalYmin.toFixed(1)} – ${globalYmax.toFixed(1)} m
+`;
+
+// FPS counter
+const stats = document.getElementById('stats');
+let lastT = performance.now(), frames = 0;
+// ── Selective bloom for selected-parcel tubes ──
+// Two-composer recipe from three.js' selective-bloom example: a first
+// pass renders ONLY the bloom layer (parcel tubes) — sky + terrain are
+// excluded via `camera.layers.set(BLOOM_LAYER)` and `scene.background =
+// null`. The blurred result is fed into a final pass that composites it
+// additively on top of a normal scene render. Without this, the HDR sky
+// (env-map background pixels exceed 1.0) gets caught by the bloom pass
+// and the whole frame washes white.
+const BLOOM_LAYER = 1;
+const bloomComposer = new EffectComposer(renderer);
+bloomComposer.renderToScreen = false;
+bloomComposer.setPixelRatio(renderer.getPixelRatio());
+bloomComposer.setSize(innerWidth, innerHeight);
+bloomComposer.addPass(new RenderPass(scene, camera));
+bloomComposer.addPass(new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  /* strength */  1.4,
+  /* radius   */  0.55,
+  /* threshold */ 0.0,
+));
+
+const combineShader = new THREE.ShaderMaterial({
+  uniforms: {
+    baseTexture:  { value: null },
+    bloomTexture: { value: bloomComposer.renderTarget2.texture },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: `
+    uniform sampler2D baseTexture;
+    uniform sampler2D bloomTexture;
+    varying vec2 vUv;
+    void main() {
+      gl_FragColor = texture2D(baseTexture, vUv) + texture2D(bloomTexture, vUv);
+    }
+  `,
+});
+const finalComposer = new EffectComposer(renderer);
+finalComposer.setPixelRatio(renderer.getPixelRatio());
+finalComposer.setSize(innerWidth, innerHeight);
+finalComposer.addPass(new RenderPass(scene, camera));
+finalComposer.addPass(new ShaderPass(combineShader, 'baseTexture'));
+finalComposer.addPass(new OutputPass());
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  if (_NO_BLOOM) {
+    renderer.render(scene, camera);
+  } else {
+    // Phase 1 — bloom pass on parcel tubes only. Hide background (HDR sky
+    // would otherwise bloom across the entire frame) and restrict camera
+    // to the bloom layer so nothing else renders.
+    const oldBg = scene.background;
+    scene.background = null;
+    camera.layers.set(BLOOM_LAYER);
+    bloomComposer.render();
+    // Phase 2 — full scene + composite bloom additively.
+    scene.background = oldBg;
+    camera.layers.set(0);
+    finalComposer.render();
+  }
+  frames++;
+  const now = performance.now();
+  if (now - lastT > 500) {
+    stats.textContent = `${(frames * 1000 / (now - lastT)).toFixed(0)} fps`;
+    frames = 0;
+    lastT = now;
+  }
+}
+animate();
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  bloomComposer.setSize(innerWidth, innerHeight);
+  finalComposer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>

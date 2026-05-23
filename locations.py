@@ -16,7 +16,7 @@ from urllib.error import URLError, HTTPError
 TILES_DIR_PREFIX = "tiles_v2_"
 JOB_LOG_DIR = Path("cache/jobs")
 STEP_TIMEOUT_SECS = 60 * 60   # 60 min: cold ČÚZK DMR5G cache can take 10–30 min
-STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner", "compress")
+STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner", "compress", "heightfield")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: list[str] = []
@@ -72,6 +72,8 @@ def expected_glb(slug: str, step: str) -> Path:
         return base / ".sm5_ok"
     if step == "compress":
         return base / ".compress_ok"
+    if step == "heightfield":
+        return base / "heightfield" / "manifest.json"
     return base / "details" / f"{step}.glb"
 
 
@@ -114,6 +116,10 @@ def list_locations() -> list[dict]:
         slug = path.name[len(TILES_DIR_PREFIX):]
         if not slug:
             continue
+        # Heightfield viewer availability: sub-manifest must exist. We don't
+        # validate every LERC/WebP file — generator is atomic enough that a
+        # half-written heightfield/ dir is rare in practice.
+        hf_manifest = path / "heightfield" / "manifest.json"
         out.append({
             "slug": slug,
             "label": _read_label(slug),
@@ -122,6 +128,7 @@ def list_locations() -> list[dict]:
             "has_outer":    expected_glb(slug, "outer").exists(),
             "has_closeup":  expected_glb(slug, "closeup").exists(),
             "has_inner":    expected_glb(slug, "inner").exists(),
+            "has_heightfield": hf_manifest.exists(),
         })
     return out
 
@@ -822,10 +829,20 @@ def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
     not subprocess steps."""
     if step in ("sm5", "compress"):
         raise ValueError(f"{step!r} is in-process, no subprocess command")
+    # Defensive: callers (enqueue_job, HTTP handlers) already validate slugs,
+    # but path traversal via `--slug ../whatever` would let a child read or
+    # write `tiles_v2_../whatever/*`. Refuse anything that doesn't pass the
+    # canonical slug regex so this remains true regardless of caller.
+    if not is_valid_slug(slug):
+        raise ValueError(f"invalid slug: {slug!r}")
     base = ["python3"]
     center = f"--center-sjtsk={cx},{cy}"
     if step == "panorama":
         return base + ["gen_panorama.py", "--region", slug, center]
+    if step == "heightfield":
+        # gen_heightfield reads centre + ring layout from tiles_v2_<slug>/manifest.json
+        # (produced by the panorama step), so we don't need to pass --center-sjtsk.
+        return base + ["gen_heightfield.py", "--slug", slug]
     p = _LOD_PRESET[step]
     return base + [
         "gen_detail.py",

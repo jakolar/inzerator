@@ -27,6 +27,11 @@ import locations
 # avoids Connection Refused when 9 HD tiles each spawn 6 workers (54 in flight).
 _CUZK_SEM = threading.Semaphore(6)
 
+# OSM tile.openstreetmap.org has a strict TOS — modest concurrency and bulk
+# download discouraged. Global cap across server keeps us neighbourly even when
+# multiple regions are fetched concurrently.
+_OSM_SEM = threading.Semaphore(2)
+
 # In-memory LRU cache for fetched ČÚZK subtiles — once fetched, never refetch.
 # Bounded to ~2000 entries (≈500 MB if every tile full PNG; real avg much less).
 _CUZK_CACHE = {}
@@ -1618,6 +1623,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._proxy_ortofoto()
         elif self.path.startswith("/proxy/cadastre?"):
             self._proxy_cadastre()
+        elif self.path.startswith("/proxy/osm?"):
+            self._proxy_osm()
+        elif self.path.startswith("/api/sjtsk-to-wgs?"):
+            self._api_sjtsk_to_wgs()
         elif self.path.startswith("/api/buildings?"):
             self._api_buildings()
         elif self.path.startswith("/api/parcel-at-point?"):
@@ -2553,26 +2562,70 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             size = 4096
         style = query.get("style", ["normal"])[0]
         bg = query.get("bg", ["transparent"])[0]
-        # Request WMS at the full output size — no upsampling on our side.
-        wms_size = size
-
-        wms_url = (
-            f"https://services.cuzk.cz/wms/wms.asp?"
-            f"SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
-            f"&LAYERS={layer}&SRS=EPSG:5514&BBOX={bbox_str}"
-            f"&WIDTH={wms_size}&HEIGHT={wms_size}&FORMAT=image/png&TRANSPARENT=TRUE&STYLES="
-        )
+        # ČÚZK WMS caps each request at 4096² ("Size of requested map is
+        # larger then MaxClientSize"). For larger outputs we fetch a k×k grid
+        # of sub-tiles at 4096² each and stitch. k = ceil(size/4096) gives
+        # 1 for ≤4096, 2 for 4097-8192, 3 for 8193-12288, etc. Sub-tile size
+        # rounds down so the stitched result lands at-or-below the requested
+        # size; we resize up slightly to hit `size` exactly.
+        from PIL import Image
+        from io import BytesIO
+        WMS_MAX = 4096
+        k = max(1, (size + WMS_MAX - 1) // WMS_MAX)
+        sub_size = (size + k - 1) // k     # px per sub-tile
+        try:
+            xmin, ymin, xmax, ymax = (float(v) for v in bbox_str.split(","))
+        except (ValueError, TypeError):
+            self.send_error(400, "Invalid BBOX")
+            return
+        bbox_w = (xmax - xmin) / k
+        bbox_h = (ymax - ymin) / k
 
         try:
-            req = urllib.request.Request(wms_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                img_data = resp.read()
-
-            from PIL import Image
-            from io import BytesIO
-
-            img = Image.open(BytesIO(img_data)).convert("RGBA")
-            arr = np.array(img)
+            stitched = Image.new("RGBA", (k * sub_size, k * sub_size), (0, 0, 0, 0))
+            # Tile (col, row) is at WMS BBOX (xmin+col*w, ymax-(row+1)*h,
+            # xmin+(col+1)*w, ymax-row*h). Row 0 = north band.
+            for row in range(k):
+                sub_ymax = ymax - row * bbox_h
+                sub_ymin = sub_ymax - bbox_h
+                for col in range(k):
+                    sub_xmin = xmin + col * bbox_w
+                    sub_xmax = sub_xmin + bbox_w
+                    sub_bbox = f"{sub_xmin},{sub_ymin},{sub_xmax},{sub_ymax}"
+                    sub_url = (
+                        f"https://services.cuzk.cz/wms/wms.asp?"
+                        f"SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+                        f"&LAYERS={layer}&SRS=EPSG:5514&BBOX={sub_bbox}"
+                        f"&WIDTH={sub_size}&HEIGHT={sub_size}"
+                        f"&FORMAT=image/png&TRANSPARENT=TRUE&STYLES="
+                    )
+                    sub_req = urllib.request.Request(
+                        sub_url, headers={"User-Agent": "Mozilla/5.0"})
+                    # Per-tile retry: ČÚZK occasionally drops the first
+                    # connection (Errno 61). 3 attempts × short backoff
+                    # absorbs the common case without making 4-tile fetches
+                    # slow when ČÚZK is healthy.
+                    sub_bytes = None
+                    last_err = None
+                    for tile_attempt in range(3):
+                        try:
+                            with urllib.request.urlopen(sub_req, timeout=30) as resp:
+                                sub_bytes = resp.read()
+                            break
+                        except (urllib.error.URLError, ConnectionError,
+                                TimeoutError, OSError) as e:
+                            last_err = e
+                            if tile_attempt < 2:
+                                import time as _t
+                                _t.sleep(1 + tile_attempt)
+                    if sub_bytes is None:
+                        raise RuntimeError(
+                            f"tile ({col},{row}): {last_err}")
+                    sub_img = Image.open(BytesIO(sub_bytes)).convert("RGBA")
+                    stitched.paste(sub_img, (col * sub_size, row * sub_size))
+            if stitched.size != (size, size):
+                stitched = stitched.resize((size, size), Image.LANCZOS)
+            arr = np.array(stitched)
 
             if bg == "white":
                 # Keep WMS output as-is (white background opaque). Used when
@@ -2629,6 +2682,217 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data_bytes)
         except Exception as e:
             self.send_error(502, f"Cadastre WMS error: {e}")
+
+    def _proxy_osm(self):
+        """Fetch OSM raster reprojected from EPSG:3857 to EPSG:5514.
+
+        Query params:
+          BBOX — S-JTSK envelope, "xmin,ymin,xmax,ymax" (required)
+          size — output PNG side in px (default 2048, max 4096)
+
+        OpenStreetMap tile servers serve Web Mercator (EPSG:3857). Our
+        heightfield ortho/cadastre live in S-JTSK (EPSG:5514). At 5 km
+        extents the angular difference is enough (~5° rotation) that
+        nearest-neighbour stamping would offset features by hundreds of
+        metres. We do proper per-pixel reprojection with pyproj + numpy
+        bilinear so OSM features line up with the cadastre / hillshade.
+
+        Cached on disk under cache/osm/ (BBOX+size key). Cache key is
+        truncated to 0.1 m which is far below source resolution.
+        """
+        import math
+        import numpy as np
+        from PIL import Image
+        from io import BytesIO
+        from pyproj import Transformer
+
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+        bbox_str = query.get("BBOX", [""])[0]
+        if not bbox_str:
+            self.send_error(400, "Missing BBOX")
+            return
+        try:
+            xmin, ymin, xmax, ymax = (float(v) for v in bbox_str.split(","))
+        except (ValueError, TypeError):
+            self.send_error(400, "Invalid BBOX")
+            return
+        try:
+            size = min(4096, max(256, int(query.get("size", ["2048"])[0])))
+        except ValueError:
+            size = 2048
+
+        cache_dir = Path("cache/osm")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / (
+            f"{xmin:.1f}_{ymin:.1f}_{xmax:.1f}_{ymax:.1f}_{size}.png")
+        if cache_path.is_file():
+            data = cache_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=604800")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        to_wgs = Transformer.from_crs("EPSG:5514", "EPSG:4326", always_xy=True)
+        cx_grid = [xmin, xmin, xmax, xmax]
+        cy_grid = [ymin, ymax, ymin, ymax]
+        lons, lats = to_wgs.transform(cx_grid, cy_grid)
+        lon_min, lon_max = min(lons), max(lons)
+        lat_min, lat_max = min(lats), max(lats)
+        lat_mid = (lat_min + lat_max) / 2
+
+        # Pick zoom: source px/m should match target px/m. Mercator pixel size
+        # at zoom z: 2π·R·cos(lat) / (256·2^z), R=6378137. Each +1 quadruples
+        # tile count → cap z and let bilinear handle the rest. z=18 is OSM's
+        # highest street-level zoom with full label/icon detail (building
+        # entrances, house numbers); going beyond just upscales.
+        extent_m = max(xmax - xmin, ymax - ymin)
+        target_res = extent_m / size
+        R = 6378137.0
+        Z_MAX = 18
+        z = 10
+        while z < Z_MAX:
+            px_m = (2 * math.pi * R * math.cos(math.radians(lat_mid))) / (256 * (1 << (z + 1)))
+            if px_m <= target_res:
+                break
+            z += 1
+        z = max(10, min(Z_MAX, z))
+
+        def lonlat_to_tile(lon, lat, zoom):
+            n = 1 << zoom
+            x = (lon + 180.0) / 360.0 * n
+            lat_rad = math.radians(lat)
+            y = (1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n
+            return x, y
+
+        # Determine integer tile range. SW lower-left, NE upper-right.
+        tx_sw, ty_sw = lonlat_to_tile(lon_min, lat_min, z)
+        tx_ne, ty_ne = lonlat_to_tile(lon_max, lat_max, z)
+        tx_min = int(math.floor(tx_sw))
+        tx_max = int(math.floor(tx_ne))
+        ty_min = int(math.floor(ty_ne))   # ty grows southward
+        ty_max = int(math.floor(ty_sw))
+        nx = tx_max - tx_min + 1
+        ny = ty_max - ty_min + 1
+        if nx * ny > 600:
+            # Safety guard. At z=18 a 5 km outer ring lands ≤ 33×33 ≈ 1089
+            # tiles, so we wouldn't pick z=18 for outer (loop breaks earlier
+            # when source resolution already meets target). 600 covers
+            # closeup/inner at full z=18; anything past that = misuse.
+            self.send_error(400, f"OSM tile range too large ({nx}×{ny}, z={z})")
+            return
+
+        canvas = Image.new("RGB", (nx * 256, ny * 256), (240, 240, 230))
+        ua = "inzerator-heightfield/1.0 (https://github.com/alacremex/inzerator)"
+
+        def fetch_one(ix, iy):
+            tx = tx_min + ix
+            ty = ty_min + iy
+            url = f"https://tile.openstreetmap.org/{z}/{tx}/{ty}.png"
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            last_err = None
+            for attempt in range(3):
+                with _OSM_SEM:
+                    try:
+                        with urllib.request.urlopen(req, timeout=20) as resp:
+                            return ix, iy, resp.read()
+                    except (urllib.error.URLError, ConnectionError,
+                            TimeoutError, OSError) as e:
+                        last_err = e
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(1 + attempt)
+            raise RuntimeError(f"tile {z}/{tx}/{ty}: {last_err}")
+
+        # tile.openstreetmap.org's usage policy allows modest concurrency;
+        # 4 worker threads cut wall time ~3× on outer rings (~80 tiles), but
+        # the global _OSM_SEM(2) further caps in-flight requests across all
+        # concurrent server handlers to stay under OSM TOS.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        try:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(fetch_one, ix, iy)
+                           for iy in range(ny) for ix in range(nx)]
+                for f in as_completed(futures):
+                    ix, iy, tile_bytes = f.result()
+                    tile = Image.open(BytesIO(tile_bytes)).convert("RGB")
+                    canvas.paste(tile, (ix * 256, iy * 256))
+        except Exception as e:
+            self.send_error(502, f"OSM tile fetch failed: {e}")
+            return
+
+        # Build target grid in S-JTSK (Y inverted: image row 0 = north).
+        xs = np.linspace(xmin, xmax, size, dtype=np.float64)
+        ys = np.linspace(ymax, ymin, size, dtype=np.float64)
+        X, Y = np.meshgrid(xs, ys)
+        lons_out, lats_out = to_wgs.transform(X.ravel(), Y.ravel())
+        lons_out = lons_out.reshape(size, size)
+        lats_out = lats_out.reshape(size, size)
+
+        # Mercator fractional tile coords → canvas pixel coords.
+        n_tiles = 1 << z
+        px_x = (lons_out + 180.0) / 360.0 * n_tiles
+        lat_rad = np.radians(lats_out)
+        px_y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * n_tiles
+        cpx = (px_x - tx_min) * 256
+        cpy = (px_y - ty_min) * 256
+
+        src = np.array(canvas, dtype=np.float32)
+        H, W, _ = src.shape
+        x0 = np.clip(np.floor(cpx).astype(np.int32), 0, W - 2)
+        y0 = np.clip(np.floor(cpy).astype(np.int32), 0, H - 2)
+        fx = (cpx - x0).astype(np.float32)[..., None]
+        fy = (cpy - y0).astype(np.float32)[..., None]
+        p00 = src[y0,   x0]
+        p01 = src[y0,   x0 + 1]
+        p10 = src[y0 + 1, x0]
+        p11 = src[y0 + 1, x0 + 1]
+        out = (p00 * (1 - fx) * (1 - fy) + p01 * fx * (1 - fy)
+               + p10 * (1 - fx) * fy     + p11 * fx * fy)
+        out_img = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
+
+        buf = BytesIO()
+        out_img.save(buf, "PNG", optimize=True)
+        data_bytes = buf.getvalue()
+        # Atomic write — concurrent requests on the same BBOX won't observe
+        # a half-written file (PIL would explode on the partial PNG).
+        try:
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            tmp_path.write_bytes(data_bytes)
+            os.replace(tmp_path, cache_path)
+        except OSError as e:
+            print(f"[osm] cache write failed: {e}")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.end_headers()
+        self.wfile.write(data_bytes)
+
+    def _api_sjtsk_to_wgs(self):
+        """Convert EPSG:5514 (Křovák) → EPSG:4326 (lat/lon). Used by the
+        heightfield viewer to compute sun position from time-of-day at the
+        ring centre. pyproj does the heavy lifting; we just reach through.
+        """
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+        try:
+            cx = float(query.get("cx", ["0"])[0])
+            cy = float(query.get("cy", ["0"])[0])
+        except ValueError:
+            self.send_error(400, "Bad cx/cy")
+            return
+        try:
+            import locations as _loc
+            lat, lon = _loc._sjtsk_to_wgs(cx, cy)
+        except Exception as e:
+            self.send_error(500, f"projection error: {e}")
+            return
+        self._send_json(200, {"lat": lat, "lon": lon})
 
     # ------------------------------------------------------------------
     # Helpers shared by GET and POST handlers

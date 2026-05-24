@@ -1662,28 +1662,44 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         data = _BUILDINGS_CACHE.get(cache_key)
         if data is None:
             ruian_url = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/3/query"
+            # Page through results — RÚIAN soft-caps each response below
+            # maxRecordCount; without pagination a 3 km closeup ring in a
+            # dense village silently truncates at the first page. Same loop
+            # shape as _fetch_parcels_area; orderBy keeps pages deterministic.
+            page_size = 5000
+            offset = 0
+            raw_features = []
             try:
-                raw = json.loads(_ruian_get(
-                    f"{ruian_url}?" + urllib.parse.urlencode({
-                        "geometry": json.dumps({
-                            "xmin": gcx - radius, "ymin": gcy - radius,
-                            "xmax": gcx + radius, "ymax": gcy + radius,
-                            "spatialReference": {"wkid": 5514},
+                while True:
+                    raw = json.loads(_ruian_get(
+                        f"{ruian_url}?" + urllib.parse.urlencode({
+                            "geometry": json.dumps({
+                                "xmin": gcx - radius, "ymin": gcy - radius,
+                                "xmax": gcx + radius, "ymax": gcy + radius,
+                                "spatialReference": {"wkid": 5514},
+                            }),
+                            "geometryType": "esriGeometryEnvelope",
+                            "spatialRel": "esriSpatialRelIntersects",
+                            "outFields": "kod,cisladomovni,zpusobvyuzitikod,zastavenaplocha",
+                            "outSR": "5514", "f": "json", "returnGeometry": "true",
+                            "orderByFields": "objectid",
+                            "resultOffset": str(offset),
+                            "resultRecordCount": str(page_size),
                         }),
-                        "geometryType": "esriGeometryEnvelope",
-                        "spatialRel": "esriSpatialRelIntersects",
-                        "outFields": "kod,cisladomovni,zpusobvyuzitikod,zastavenaplocha",
-                        "outSR": "5514", "f": "json", "returnGeometry": "true",
-                        "resultRecordCount": "500",
-                    }),
-                    timeout=60,
-                ))
+                        timeout=60,
+                    ))
+                    feats = raw.get("features", [])
+                    raw_features.extend(feats)
+                    more = raw.get("exceededTransferLimit") or len(feats) >= page_size
+                    if not more:
+                        break
+                    offset += len(feats)
             except Exception as e:
                 self.send_error(502, f"RÚIAN query failed: {e}")
                 return
 
             buildings = []
-            for f in raw.get("features", []):
+            for f in raw_features:
                 rings = f["geometry"]["rings"][0]
                 a = f["attributes"]
                 # Convert S-JTSK to local coords (same system as GLB meshes)

@@ -40,10 +40,23 @@ Image.MAX_IMAGE_PIXELS = None
 # the viewer's clipBox carve order (larger → smaller) just works.
 # 3 km total area: most "regional context" use cases fit fine; the larger
 # 5 km outer ring was dropped to save ~40% of total bytes per region.
+# Per-ring max_z_error (m): LERC's hard upper bound on vertex Y error.
+# Rule of thumb ≈ step / 7-10 — keeps quantize steps below the angular size
+# of one source cell at typical viewer distance, so terracing on flat areas
+# stays imperceptible. Inner ring needs tighter tolerance because the viewer
+# stands inside it; closeup is mid-distance background. Per-ring values
+# instead of one global default cut LERC output ~20-25% with no visible loss.
 DEFAULT_RINGS = [
-    {"slug": "closeup", "half": 1500, "step": 1.5, "ortho_size": 4096},
-    {"slug": "inner",   "half":  500, "step": 0.5, "ortho_size": 4096},
+    {"slug": "closeup", "half": 1500, "step": 1.5, "ortho_size": 4096, "max_z_error": 0.15},
+    {"slug": "inner",   "half":  500, "step": 0.5, "ortho_size": 4096, "max_z_error": 0.10},
 ]
+
+
+def default_max_z_error_for_step(step: float) -> float:
+    """Sensible LERC tolerance for a ring with given grid step (m).
+    Used as fallback when a custom --rings JSON entry omits max_z_error.
+    """
+    return round(max(0.05, step / 7.0), 3)
 
 # Ortho quality tiers — gen emits one JPEG per tier per ring so the viewer
 # can switch quality at runtime. `ortho_size` on a ring sets the HIGH-tier
@@ -315,16 +328,13 @@ def despike_sm5(sm5_data, bare_data, dmr_ceiling=50.0):
     return sm5_float.astype(sm5_data.dtype)
 
 
-def _encode_heightmap_file(data, y_min, y_max, out_path):
-    """Dispatch encoder by file extension (.lerc vs .png)."""
+def _encode_heightmap_file(data, y_min, y_max, out_path, max_z_error=0.10):
+    """Dispatch encoder by file extension. `max_z_error` is the LERC tolerance
+    in metres (ignored for PNG path, which uses fixed 16-bit precision)."""
     if str(out_path).endswith('.lerc'):
-        _encode_lerc(data, out_path, _LERC_MAX_Z_ERROR)
+        _encode_lerc(data, out_path, max_z_error)
     else:
         _encode_heightmap(data, y_min, y_max, out_path)
-
-
-# Module-level error tolerance set by main() based on --max-z-error flag.
-_LERC_MAX_Z_ERROR = 0.10
 
 
 def fetch_cadastre(cx, cy, half, size, out_path):
@@ -348,6 +358,52 @@ def fetch_cadastre(cx, cy, half, size, out_path):
                 time.sleep(1 + attempt * 2)
     print(f"  ⚠ cadastre fetch failed: {last_err}")
     return False
+
+
+def fetch_vector_cadastre(cx, cy, half, parcels_path, buildings_path):
+    """Fetch RÚIAN parcel + building polygons via the inzerator server's
+    /api/parcels and /api/buildings endpoints, save as JSON next to the
+    raster cadastre. The vector path lets the viewer drop the 64 MB R8
+    cadastre raster (per ring) for ~1 MB of vector lines — 50× GPU saving.
+
+    Parcels come with per-vertex DSM-sampled Y; buildings are 2D only
+    (viewer drapes them via the ring's heightmap at load time). Both use
+    a local frame relative to (cx, cy): lx = sx - cx, lz = -(sy - cy).
+
+    /api/parcels has its own retry+backoff on the server side, so we
+    only retry on transport failures.
+    """
+    base = INZERATOR_PROXY.rstrip("/")
+    # Server clamps radius to 2000 m, which covers our largest ring (1500 m).
+    radius = min(2000.0, float(half))
+    urls = {
+        "parcels":   f"{base}/api/parcels?gcx={cx}&gcy={cy}&radius={radius}",
+        "buildings": f"{base}/api/buildings?gcx={cx}&gcy={cy}&radius={radius}",
+    }
+    out_paths = {"parcels": parcels_path, "buildings": buildings_path}
+    counts = {}
+    for kind, url in urls.items():
+        last_err = None
+        ok = False
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=180) as r:
+                    body = r.read()
+                # Parse to sanity-check + count features for the log.
+                data = json.loads(body)
+                out_paths[kind].write_bytes(body)
+                counts[kind] = len(data)
+                ok = True
+                break
+            except (urllib.error.URLError, ConnectionError,
+                    TimeoutError, OSError, ValueError) as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(1 + attempt * 2)
+        if not ok:
+            print(f"  ⚠ vector {kind} fetch failed: {last_err}")
+            return None
+    return counts
 
 
 def decode_bare_from_disk(path):
@@ -444,6 +500,45 @@ def write_json_atomic(path, payload):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))
     os.replace(tmp, path)
+
+
+def encode_cadastre_ktx2(src_png, out_ktx2):
+    """Encode a cadastre alpha PNG to KTX2 (ETC1S) via basisu.
+
+    Pipeline: PNG RGBA → extract alpha → downsample to 4096² → save as
+    grayscale JPG (basisu chokes on PNG-with-alpha as a single-channel
+    source — it reads alpha as a second slice and refuses single-output
+    mode). Encode JPG → KTX2 ETC1S.
+
+    GPU footprint: 4096² × 0.5 byte/pixel (ETC1S transcoded to BC1/EAC)
+    = 8 MB per ring vs. 64 MB for the raw 8192² R8 path = 8× saving.
+    Disk: ~0.8 MB per ring vs. ~1-2 MB for the PNG.
+    """
+    import tempfile
+    with Image.open(src_png) as pim:
+        if pim.mode == "RGBA":
+            arr = np.array(pim)[..., 3]   # alpha channel
+        elif pim.mode == "LA":
+            arr = np.array(pim)[..., 1]
+        else:
+            arr = np.array(pim.convert("L"))
+        # Downsample to 4096² via LANCZOS — keeps thin lines crisp better
+        # than nearest-neighbour at 2× shrink ratio. Cadastre PNG is square
+        # by construction (SJTSK-aligned).
+        gray = Image.fromarray(arr).resize((4096, 4096), Image.LANCZOS)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+        tmp_jpg = tf.name
+    try:
+        # quality=95 is well above ETC1S re-quantisation noise floor — bumping
+        # higher just inflates the temp JPG without affecting KTX2 output.
+        gray.save(tmp_jpg, quality=95)
+        subprocess.run([
+            "basisu", "-ktx2", "-q", "220", "-comp_level", "4",
+            tmp_jpg, "-output_file", str(out_ktx2),
+        ], check=True, capture_output=True, text=True)
+    finally:
+        try: os.unlink(tmp_jpg)
+        except OSError: pass
 
 
 def encode_ortho_ktx2(src_path, out_path):
@@ -549,9 +644,12 @@ def main():
     p.add_argument("--format", default="lerc", choices=["png", "lerc"],
                    help="heightmap format: lerc (default, WASM-decoded, "
                         "-50%% vs PNG) or png (legacy fallback).")
-    p.add_argument("--max-z-error", type=float, default=0.10,
-                   help="(LERC only) max vertical error in metres. 0=lossless, "
-                        "0.10=10cm (below ČÚZK source RMS), 0.30=ČÚZK error tier")
+    p.add_argument("--max-z-error", type=float, default=None,
+                   help="(LERC only) GLOBAL override for max vertical error "
+                        "in metres across all rings. By default each ring "
+                        "uses its own value (closeup=0.15, inner=0.10). "
+                        "Set this to force a single tolerance, e.g. 0.05 "
+                        "for archival-grade or 0.30 for size-minimised.")
     p.add_argument("--ortho-tiers", default="low,mid,high",
                    help="comma-separated list of ortho quality tiers to emit. "
                         "low=1024² q75 4:2:0, mid=2048² q80 4:2:0, "
@@ -578,15 +676,17 @@ def main():
             f"--ortho-default {args.ortho_default!r} not in --ortho-tiers {tiers}")
 
     # CACHE_DIR is a module-level singleton read by discover_sm5/discover_ortho.
-    global CACHE_DIR, _LERC_MAX_Z_ERROR
+    global CACHE_DIR
     CACHE_DIR = resolve_cache_dir(args.cache_dir)
-    _LERC_MAX_Z_ERROR = args.max_z_error
     print(f"Using cache: {CACHE_DIR}")
     if args.format == 'lerc':
         if not HAS_LERC:
             raise SystemExit("--format lerc requested but lerc package missing. "
                              "Run: pip3 install --user lerc")
-        print(f"LERC mode, max z-error: {args.max_z_error} m")
+        if args.max_z_error is not None:
+            print(f"LERC mode, max z-error: {args.max_z_error} m (global override)")
+        else:
+            print(f"LERC mode, per-ring max z-error")
 
     rings = DEFAULT_RINGS
     if args.rings:
@@ -595,6 +695,11 @@ def main():
             for k in ("slug", "half", "step", "ortho_size"):
                 if k not in r:
                     raise SystemExit(f"--rings entry missing '{k}': {r}")
+            # max_z_error is optional in custom rings JSON; fall back to a
+            # value derived from grid step so the output isn't accidentally
+            # archival-grade (smallest possible error → largest possible file).
+            if "max_z_error" not in r:
+                r["max_z_error"] = default_max_z_error_for_step(r["step"])
         print(f"Using custom rings from {args.rings}: "
               f"{[r['slug'] for r in rings]}")
 
@@ -609,7 +714,15 @@ def main():
         half = ring["half"]
         step = ring["step"]
         size = ring["ortho_size"]
-        print(f"\n=== Ring '{slug}': {2*half}×{2*half} m, step {step} m, ortho {size}² ===")
+        # CLI override wins over per-ring value; per-ring wins over derived.
+        if args.max_z_error is not None:
+            ring_mze = args.max_z_error
+        elif "max_z_error" in ring:
+            ring_mze = ring["max_z_error"]
+        else:
+            ring_mze = default_max_z_error_for_step(step)
+        print(f"\n=== Ring '{slug}': {2*half}×{2*half} m, step {step} m, "
+              f"ortho {size}², LERC ±{ring_mze} m ===")
 
         ext = 'lerc' if args.format == 'lerc' else 'png'
         hm_path = out_dir / f"{slug}_heightmap.{ext}"
@@ -646,11 +759,11 @@ def main():
         y_min = float(min(sm5_data.min(), bare_data.min()))
         y_max = float(max(sm5_data.max(), bare_data.max()))
 
-        _encode_heightmap_file(sm5_data, y_min, y_max, hm_path)
+        _encode_heightmap_file(sm5_data, y_min, y_max, hm_path, ring_mze)
         print(f"  heightmap:    {hm_path.stat().st_size/1024:>7.1f} KB, "
               f"{sm5_data.shape[0]}×{sm5_data.shape[1]} px, "
               f"Y {y_min:.1f}–{y_max:.1f} m")
-        _encode_heightmap_file(bare_data, y_min, y_max, bare_path)
+        _encode_heightmap_file(bare_data, y_min, y_max, bare_path, ring_mze)
         print(f"  bare:         {bare_path.stat().st_size/1024:>7.1f} KB")
         n = sm5_data.shape[0]
 
@@ -710,6 +823,11 @@ def main():
         oh_path.write_bytes(default_src.read_bytes())
 
         cad_ok = False
+        cad_ktx2_path = out_dir / f"{slug}_cadastre.ktx2"
+        cad_ktx2_ok = False
+        parcels_path = out_dir / f"{slug}_parcels.json"
+        buildings_path = out_dir / f"{slug}_buildings.json"
+        vec_counts = None
         if not args.no_cadastre:
             print(f"  fetching cadastre via {INZERATOR_PROXY} …")
             cad_ok = fetch_cadastre(args.cx, args.cy, half,
@@ -717,6 +835,28 @@ def main():
             if cad_ok:
                 print(f"  cadastre.png:  {cad_path.stat().st_size/1024:.1f} KB, "
                       f"{args.cadastre_size}×{args.cadastre_size}")
+                # KTX2 compressed mirror of the cadastre — viewer prefers it
+                # over the PNG (8× GPU saving via ETC1S transcoding).
+                try:
+                    encode_cadastre_ktx2(cad_path, cad_ktx2_path)
+                    cad_ktx2_ok = True
+                    print(f"  cadastre.ktx2: {cad_ktx2_path.stat().st_size/1024:.1f} KB, 4096×4096 ETC1S")
+                except FileNotFoundError:
+                    print(f"  (cadastre KTX2 skipped: basisu not installed)")
+                except subprocess.CalledProcessError as e:
+                    err = (e.stderr or "").strip()[:200] or repr(e)
+                    print(f"  (cadastre KTX2 skipped: rc={e.returncode}, stderr={err})")
+            # Vector cadastre (parcels + buildings) — same data source as the
+            # raster path, but lets the viewer skip the 64 MB R8 upload.
+            # Generated alongside the PNG so existing slugs keep the raster
+            # fallback if the viewer is older.
+            vec_counts = fetch_vector_cadastre(args.cx, args.cy, half,
+                                                parcels_path, buildings_path)
+            if vec_counts:
+                pkb = round(parcels_path.stat().st_size / 1024, 1)
+                bkb = round(buildings_path.stat().st_size / 1024, 1)
+                print(f"  parcels.json: {pkb:>6.1f} KB ({vec_counts['parcels']} parcel(s))")
+                print(f"  buildings:    {bkb:>6.1f} KB ({vec_counts['buildings']} building(s))")
 
         ring_meta = {
             "slug": slug,
@@ -735,10 +875,17 @@ def main():
             "ortho_tiers": ortho_files,             # full tier table
         }
         if args.format == 'lerc':
-            ring_meta["max_z_error"] = args.max_z_error
+            ring_meta["max_z_error"] = ring_mze
         if cad_ok:
             ring_meta["cadastre_file"] = cad_path.name
             ring_meta["cadastre_size"] = args.cadastre_size
+        if cad_ktx2_ok:
+            ring_meta["cadastre_ktx2_file"] = cad_ktx2_path.name
+        if vec_counts:
+            ring_meta["parcels_file"] = parcels_path.name
+            ring_meta["buildings_file"] = buildings_path.name
+            ring_meta["parcel_count"] = vec_counts["parcels"]
+            ring_meta["building_count"] = vec_counts["buildings"]
         manifest["rings"].append(ring_meta)
         total_bytes += (hm_path.stat().st_size
                         + bare_path.stat().st_size

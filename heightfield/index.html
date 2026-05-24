@@ -10,7 +10,11 @@
           z-index: 10; max-width: 360px; }
   #info b { color: #6cf; }
   #stats { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,.6);
-           padding: 10px 12px; border-radius: 6px; font-size: 12px; z-index: 10; }
+           padding: 10px 12px; border-radius: 6px; font-size: 12px; z-index: 10;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           line-height: 1.4; min-width: 140px; }
+  #stats .lbl { color: #889; }
+  #stats .val { color: #cfd; }
   canvas { display: block; }
   /* Centred loading overlay shown until first frame renders. CSS-only
      spinner so it works before any JS module loads. */
@@ -103,6 +107,9 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 // LERC: Esri's elevation codec, decoded in browser via ~200 KB WASM. Used
 // when ring.heightmap_format === 'lerc' in manifest (gen with --format lerc).
 // Namespace import (the package has no default export — load/decode are
@@ -183,6 +190,11 @@ const SKIP_BARE = URL_PARAMS.get('nobare') === '1';
 // ?ktx2flip=2  → flip X (horizontal mirror)
 // ?ktx2flip=3  → flip both (180° rotation)
 const _KTX2_FLIP = parseInt(URL_PARAMS.get('ktx2flip') ?? '0', 10);
+// Cadastre KTX2 orientation: empirically identical to source PNG and to
+// ortho KTX2 (verified by `basisu -unpack` + spatial-density check —
+// top/bot and left/right alpha ratios match within 0.05). Default 0 =
+// no flip, same as ortho. Override with ?cadflip=1/2/3 only for debug.
+const _CAD_FLIP = parseInt(URL_PARAMS.get('cadflip') ?? '0', 10);
 // Bypass postprocess (no parcel glow). For comparing ortho colours
 // against the pre-bloom direct-render baseline.
 const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
@@ -312,6 +324,35 @@ controls.enableDamping = true;
 // ~½ sec on a typical pan/orbit gesture — long enough to feel smooth,
 // short enough that double-clicks don't get swallowed by an ongoing glide.
 controls.dampingFactor = 0.1;
+
+// Adaptive DPR: drop to 1.0 during user interaction, restore the configured
+// pixel ratio when idle. Heavy fragment shader (hillshade + cast shadow +
+// composer) means a 1.5×1.5 = 2.25× per-pixel cost — halving area during
+// drag gives a 50-60 % FPS boost on Retina without affecting the still
+// frames the user actually reads. Damping inertia frames count as idle
+// (controls 'end' fires when damping settles, not on mouseup).
+const _DPR_IDLE = _HIRES ? devicePixelRatio : Math.min(devicePixelRatio, 1.5);
+const _DPR_DRAG = 1.0;
+let _idleDprT = null;
+function setDpr(dpr) {
+  if (Math.abs(renderer.getPixelRatio() - dpr) < 0.01) return;
+  renderer.setPixelRatio(dpr);
+  // Composers cache pixel ratio at create time but `setSize` re-applies it
+  // via the renderer.
+  bloomComposer?.setPixelRatio(dpr);
+  finalComposer?.setPixelRatio(dpr);
+  bloomComposer?.setSize(innerWidth, innerHeight);
+  finalComposer?.setSize(innerWidth, innerHeight);
+}
+controls.addEventListener('start', () => {
+  if (_idleDprT) { clearTimeout(_idleDprT); _idleDprT = null; }
+  setDpr(_DPR_DRAG);
+});
+controls.addEventListener('end', () => {
+  // Tiny grace period so quick orbit jiggles don't trigger a re-render at
+  // full DPR right before another drag starts.
+  _idleDprT = setTimeout(() => { setDpr(_DPR_IDLE); _idleDprT = null; }, 150);
+});
 
 // ── Load all ring textures in parallel ──
 const texLoader = new THREE.TextureLoader();
@@ -546,6 +587,8 @@ for (let i = 0; i < rings.length; i++) {
       uOrthoFlipX:{ value: orthoTex.isCompressedTexture ? ((_KTX2_FLIP >> 1) & 1) : 0.0 },
       uCadastre:  { value: null },     // populated when cadastre toggle on
       uCadEnabled:{ value: 0.0 },
+      uCadFlipY:  { value: 0.0 },      // 1.0 when uCadastre is KTX2 (compressed → flip V)
+      uCadFlipX:  { value: 0.0 },      // optional horizontal mirror (debug ?cadflip=2/3)
       uShadeMode: { value: 0.0 },      // 0 = ortho, 1 = flat shade by elevation
       uShadeYMin: { value: globalYmin },   // ramp uses global Y range for cross-ring consistency
       uShadeYMax: { value: globalYmax },
@@ -610,6 +653,8 @@ for (let i = 0; i < rings.length; i++) {
       uniform sampler2D uHeightBare;
       uniform float uBareMode;
       uniform float uCadEnabled;
+      uniform float uCadFlipY;
+      uniform float uCadFlipX;
       uniform float uShadeMode;
       uniform float uShadeYMin;
       uniform float uShadeYMax;
@@ -737,7 +782,11 @@ for (let i = 0; i < rings.length; i++) {
             // R-channel of an alpha-only R8 texture (see loadCadastreAlphaTex
             // — we extract PNG alpha into a single-channel DataTexture to
             // save 4× GPU memory). Semantics unchanged: full mask = white.
-            float cadA = texture2D(uCadastre, vUv).r;
+            vec2 cadUv = vec2(
+              mix(vUv.x, 1.0 - vUv.x, uCadFlipX),
+              mix(vUv.y, 1.0 - vUv.y, uCadFlipY)
+            );
+            float cadA = texture2D(uCadastre, cadUv).r;
             col = mix(col, vec3(1.0), cadA);
           }
           // Hillshade — runtime sun lighting from heightmap derivatives.
@@ -783,13 +832,21 @@ for (let i = 0; i < rings.length; i++) {
   ringMeshes.push(mesh);
 
   // CPU heightfield reuses the Float32 array decoded above for both
-  // GPU texture and CPU sampling — no second pass needed regardless of
-  // whether the source was PNG-RG or LERC.
+  // Drop the heap-side Float32Array: GPU has its copy via DataTexture, and
+  // the CPU sampler (parcel-selection raycast + outline drape) is opt-in
+  // via the 🏠 toggle. ringData[].heightData starts null and is rehydrated
+  // by ensureHeightDataLoaded() the first time the user enables parcels.
+  // ~16 MB per ring saved in JS heap when parcels are never enabled
+  // (the typical "just browsing terrain" session).
   ringData[r.slug] = {
-    heightData, n: r.heightmap_size,
+    heightData: null,
+    heightLoadInfo: { url: asset(r.heightmap_file), fmt: hmFmt, size: r.heightmap_size,
+                       y_min: r.y_min, y_max: r.y_max },
+    heightLoadPromise: null,
+    n: r.heightmap_size,
     y_min: r.y_min, y_max: r.y_max, side_m: r.side_m, half: r.half,
   };
-  console.info(`[ring ${r.slug}] ready (${heightData.length} cells)`);
+  console.info(`[ring ${r.slug}] ready (${heightData.length} cells, CPU copy dropped — lazy via parcels toggle)`);
   setStage(`ring ${r.slug} hotov (${i + 1}/${rings.length})`);
 }
 setStage('hotovo');
@@ -809,15 +866,61 @@ function sampleAt(lx, lz) {
     const r = rings[i];
     const d = ringData[r.slug];
     if (Math.abs(lx) > d.half || Math.abs(lz) > d.half) continue;
+    if (!d.heightData) return null;   // lazy-loading not yet complete
     const u = (lx + d.side_m / 2) / d.side_m;
     const v = (lz + d.side_m / 2) / d.side_m;
     const col = Math.max(0, Math.min(d.n - 1, (u * (d.n - 1)) | 0));
     const row = Math.max(0, Math.min(d.n - 1, (v * (d.n - 1)) | 0));
-    return d.heightData[row * d.n + col];
+    const intVal = d.heightData[row * d.n + col];
+    return d.y_min + intVal * d.y_scale;
   }
   return null;
 }
 window._sampleAt = sampleAt;   // debug probe — try `_sampleAt(0, 0)` in console
+
+// Rehydrate per-ring CPU heightmap arrays on demand. The startup pipeline
+// drops these to save ~32 MB of JS heap when parcels aren't used; the
+// parcels toggle awaits this before enabling clicks so raycast refinement
+// gets correct displaced-terrain XZ.
+//
+// Storage is Uint16 quantized over the ring's y_min..y_max range
+// (65536 levels). For typical Czech terrain (range 200-600 m) the per-
+// level resolution is 0.003-0.009 m — orders of magnitude finer than the
+// ±0.5 m needed for parcel raycast. Halves heap vs Float32 (16 MB → 8 MB
+// per ring) at the cost of one multiply-add per sampleAt() call.
+async function ensureHeightDataLoaded() {
+  const promises = [];
+  for (const r of rings) {
+    const d = ringData[r.slug];
+    if (d.heightData) continue;
+    if (!d.heightLoadPromise) {
+      d.heightLoadPromise = (async () => {
+        const info = d.heightLoadInfo;
+        const t0 = performance.now();
+        const res = await loadHeightmapData(info.url, info.fmt, info.size, info.y_min, info.y_max);
+        const f32 = res.data;
+        // Quantize to Uint16 spanning [y_min, y_max]. We keep y_min/y_scale
+        // on the ringData entry so sampleAt can decode without per-ring
+        // lookup overhead.
+        const y_min = info.y_min;
+        const y_scale = (info.y_max - info.y_min) / 65535;
+        const inv = 1 / y_scale;
+        const u16 = new Uint16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const v = Math.round((f32[i] - y_min) * inv);
+          u16[i] = v < 0 ? 0 : (v > 65535 ? 65535 : v);
+        }
+        d.heightData = u16;
+        d.y_scale = y_scale;
+        // f32 is now eligible for GC.
+        console.info(`[ring ${r.slug}] heightData re-loaded in ${(performance.now()-t0).toFixed(0)} ms ` +
+          `(Uint16, ${(u16.byteLength/1048576).toFixed(1)} MB, ±${(y_scale/2*1000).toFixed(1)} mm precision)`);
+      })();
+    }
+    promises.push(d.heightLoadPromise);
+  }
+  await Promise.all(promises);
+}
 
 // ── Wireframe + flat-shaded toggles ──
 // Wireframe shows triangle edges only. Flat-shaded colours each fragment
@@ -1261,24 +1364,28 @@ function redrawOutlines() {
     const m = outlineGroup.children.pop();
     m.geometry.dispose();
   }
-  if (!_parcelTubeMat) {
-    _parcelTubeMat = new THREE.MeshBasicMaterial({
-      // HDR-bright white. With no tone mapping, RGB(3,3,3) clips to 1.0
-      // per channel after gamma so the tube reads as pure white. Looks
-      // crisp on dark forest, light fields, and OSM alike.
-      color: new THREE.Color(3.0, 3.0, 3.0),
+  if (!_parcelLineMat) {
+    // Pixel-space line width (worldUnits: false) keeps the outline equally
+    // legible whether the camera is 50 m or 2 km away — earlier TubeGeometry
+    // path was world-space (radius 0.15 m) and dropped below sub-pixel at
+    // typical regional view distances. HDR colour 1.6 still drives the
+    // bloom halo; depthWrite=false kills self-z-fight twinkle.
+    _parcelLineMat = new LineMaterial({
+      color: new THREE.Color(1.15, 1.15, 1.15),
+      linewidth: 0.6,         // pixels
+      worldUnits: false,
       toneMapped: false,
       depthTest: true,
+      depthWrite: false,
       polygonOffset: true,
-      polygonOffsetFactor: 0,
-      polygonOffsetUnits: -128,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -512,
     });
+    _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
   }
-  // Pass 1: count edge occurrences across all selected parcels.
-  // Adjacent parcels share their common boundary; that edge appears
-  // twice in the union and we skip it so the silhouette draws as one
-  // continuous perimeter instead of layered tubes along every parcel
-  // boundary inside the group.
+  // Pass 1: count edge occurrences across all selected parcels. Adjacent
+  // parcels share their common boundary; the inner edges occur twice and
+  // we skip them so the silhouette draws as one continuous perimeter.
   const edgeCount = new Map();
   const selectedEntries = [];
   for (const id of selectedParcels) {
@@ -1291,10 +1398,10 @@ function redrawOutlines() {
       edgeCount.set(k, (edgeCount.get(k) || 0) + 1);
     }
   }
-  // Pass 2: walk each selected ring and draw only edges that occur
-  // exactly once. Drape-subdivision happens per-edge so the tube hugs
-  // the terrain even when the parcel polygon has long straight sides
-  // across uneven ground.
+  // Pass 2: collect ALL perimeter sub-segments into one flat positions
+  // array. Single LineSegments2 instance keeps draw-call count at O(1)
+  // regardless of how many parcels are selected.
+  const positions = [];
   for (const p of selectedEntries) {
     const ring = p.ring_local;
     for (let i = 0; i < ring.length; i++) {
@@ -1302,31 +1409,37 @@ function redrawOutlines() {
       const b = ring[(i + 1) % ring.length];
       if (edgeCount.get(_parcelEdgeKey(a, b)) !== 1) continue;
       const pts = drapeEdge(a, b);
-      if (pts.length < 2) continue;
-      const path = new THREE.CurvePath();
       for (let j = 0; j < pts.length - 1; j++) {
-        path.add(new THREE.LineCurve3(pts[j], pts[j + 1]));
+        const A = pts[j], B = pts[j + 1];
+        positions.push(A.x, A.y, A.z, B.x, B.y, B.z);
       }
-      const geo = new THREE.TubeGeometry(path, pts.length, 0.6, 12, false);
-      const tube = new THREE.Mesh(geo, _parcelTubeMat);
-      tube.renderOrder = 99;
-      // Enable bloom layer (keeps default layer 0 too) so the tube
-      // renders in both passes — the bloom-only pass picks it up for
-      // the halo, the final pass draws the crisp inner core.
-      tube.layers.enable(BLOOM_LAYER);
-      outlineGroup.add(tube);
     }
+  }
+  if (positions.length > 0) {
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(positions);
+    const line = new LineSegments2(geo, _parcelLineMat);
+    line.renderOrder = 99;
+    // Bloom layer keeps default layer 0 too so the line renders in both
+    // passes — bloom-only pass picks it up for the halo, final pass draws
+    // the crisp inner core.
+    line.layers.enable(BLOOM_LAYER);
+    outlineGroup.add(line);
   }
   parcelsClear.style.display = selectedParcels.size ? '' : 'none';
 }
-let _parcelTubeMat = null;
+let _parcelLineMat = null;
 
 // Drape one edge (between two consecutive ring vertices) onto the
 // heightfield. Split off from drapeRing so the edge-dedup loop above
 // can emit per-edge tubes without having to subdivide entire rings.
 function drapeEdge(a, b) {
   const SUB_M = 1.5;
-  const LIFT = 0.4;
+  // Increased from 0.4 to 0.8 to eliminate z-fight twinkle when the camera
+  // moves: terrain Y is shader-displaced from heightmap each frame, tube
+  // Y is CPU-sampled once at click. Sub-metre LIFT plus depthWrite=false
+  // (see _parcelTubeMat) lets the outline sit cleanly above terrain.
+  const LIFT = 0.8;
   const pts = [];
   const dx = b[0] - a[0];
   const dz = b[1] - a[1];
@@ -1376,12 +1489,21 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
   // on pointerup if the cursor barely moved. 4 px threshold matches what
   // OrbitControls uses internally to distinguish click vs. drag.
   const downX = e.clientX, downY = e.clientY;
-  const onUp = (eUp) => {
+  const onUp = async (eUp) => {
     renderer.domElement.removeEventListener('pointerup', onUp);
     if (Math.hypot(eUp.clientX - downX, eUp.clientY - downY) > 4) return;
+    // Pointer event coords need to be captured before any await — the
+    // event object is recycled by the browser after handler returns.
+    const upX = eUp.clientX, upY = eUp.clientY;
+    // Safety net: parcels toggle should have already triggered heightData
+    // load, but if it hasn't (e.g. concurrent click during enable), wait
+    // before raycast so refinement uses real terrain Y.
+    if (rings.some(r => !ringData[r.slug].heightData)) {
+      await ensureHeightDataLoaded();
+    }
     const rect = renderer.domElement.getBoundingClientRect();
-    ndcMouse.x =  ((eUp.clientX - rect.left) / rect.width)  * 2 - 1;
-    ndcMouse.y = -((eUp.clientY - rect.top)  / rect.height) * 2 + 1;
+    ndcMouse.x =  ((upX - rect.left) / rect.width)  * 2 - 1;
+    ndcMouse.y = -((upY - rect.top)  / rect.height) * 2 + 1;
     raycaster.setFromCamera(ndcMouse, camera);
     const hit = rayPickTerrainXZ(raycaster.ray);
     if (!hit) return;
@@ -1397,7 +1519,10 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 parcelsToggle.addEventListener('change', async () => {
   if (parcelsToggle.checked) {
     parcelsToggle.disabled = true;
-    await ensureParcels();
+    // CPU heightmap is lazy: dropped at startup, re-loaded here so click
+    // raycast can refine against displaced terrain. Runs in parallel with
+    // the RUIAN parcel fetch.
+    await Promise.all([ensureParcels(), ensureHeightDataLoaded()]);
     parcelsToggle.disabled = false;
   } else {
     // Hide outlines but keep selectedParcels so re-enabling restores them.
@@ -1473,6 +1598,21 @@ async function switchOrthoTier(tier) {
   currentTier = tier;
   syncTierButtons();
   orthoTierStatus.textContent = `(${tier})`;
+  // Dispose tiers we're not actively using. high tier alone is 16 MB GPU
+  // per ring (ETC1S) or 50 MB raw RGB if KTX2 missing — keeping low/mid
+  // around for "what-if-I-toggle-back" wastes ~15-30 MB total. Re-loading
+  // is fast (disk cache + KTX2 transcode ~50 ms) so the trade-off favors
+  // memory.
+  let freed = 0;
+  for (const [key, tex] of Object.entries(orthoTierCache)) {
+    const keyTier = key.split('|')[1];
+    if (keyTier !== currentTier) {
+      tex.dispose();
+      delete orthoTierCache[key];
+      freed++;
+    }
+  }
+  if (freed) console.info(`[ortho] disposed ${freed} stale tier texture(s)`);
 }
 orthoTierUI.addEventListener('click', (e) => {
   if (e.target.dataset?.tier) switchOrthoTier(e.target.dataset.tier);
@@ -1486,11 +1626,23 @@ const cadTextures = {};   // slug → THREE.DataTexture (R8 alpha-only)
 const cadToggle = document.getElementById('cad-toggle');
 const cadStatus = document.getElementById('cad-status');
 
+// Browsers cap createImageBitmap resize. 4096² is a safe target across
+// Chrome/Safari/Firefox. Cadastre lines at 4k still render crisp at typical
+// view distance: 1 px = 0.37 m, much finer than the actual ~10-50 cm parcel
+// line width in real-world units.
+const CAD_TARGET = 4096;
+
 async function loadCadastreAlphaTex(url) {
+  const t0 = performance.now();
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`cadastre fetch ${resp.status}`);
   const blob = await resp.blob();
-  const bitmap = await createImageBitmap(blob);
+  // Downsample at decode time: browser does the resize natively (avoids
+  // shipping the full 8192² bitmap to JS heap). Same width across H/V keeps
+  // the source square; cadastre PNGs are square SJTSK tiles by construction.
+  let bitmap = await createImageBitmap(blob, {
+    resizeWidth: CAD_TARGET, resizeHeight: CAD_TARGET, resizeQuality: 'medium'
+  });
   const W = bitmap.width, H = bitmap.height;
   const canvas = document.createElement('canvas');
   canvas.width = W; canvas.height = H;
@@ -1499,9 +1651,9 @@ async function loadCadastreAlphaTex(url) {
   bitmap.close();
   const imgData = ctx.getImageData(0, 0, W, H).data;
   // Pack alpha-only into a tightly typed array. RGBA stride 4 → byte stride 1
-  // is the entire memory win: same 8192² grid drops from 256 MB (RGBA on
-  // GPU) to 64 MB (R8). With mipmaps and anisotropy it still beats the
-  // original by ~4×.
+  // is the per-pixel memory win; the createImageBitmap resize above is the
+  // resolution win. Combined: 8192² RGBA (256 MB) → 4096² R8 (16 MB) per
+  // ring = 16× reduction.
   const alpha = new Uint8Array(W * H);
   for (let i = 0, j = 3; i < alpha.length; i++, j += 4) alpha[i] = imgData[j];
   const tex = new THREE.DataTexture(alpha, W, H,
@@ -1513,6 +1665,25 @@ async function loadCadastreAlphaTex(url) {
   tex.colorSpace = THREE.NoColorSpace;
   tex.flipY = false;
   tex.needsUpdate = true;
+  console.info(`[cad] loaded ${W}×${H} R8 in ${(performance.now()-t0).toFixed(0)} ms ` +
+    `(${(W*H/1048576).toFixed(1)} MB GPU)`);
+  return tex;
+}
+
+// Load cadastre as KTX2 (ETC1S transcoded to BC1/EAC on the GPU). Reuses the
+// global ktx2Loader (same one used for ortho). Output is a grayscale image
+// where shader reads .r as opacity. Saves 8× GPU vs. PNG R8.
+async function loadCadastreKtx2Tex(url) {
+  const t0 = performance.now();
+  const tex = await ktx2Loader.loadAsync(url);
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.needsUpdate = true;
+  console.info(`[cad] loaded KTX2 ${tex.image.width}×${tex.image.height} in ` +
+    `${(performance.now()-t0).toFixed(0)} ms ` +
+    `(~${(tex.image.width * tex.image.height * 0.5 / 1048576).toFixed(1)} MB GPU, ETC1S)`);
   return tex;
 }
 
@@ -1521,24 +1692,19 @@ async function ensureCadastre() {
   cadStatus.textContent = 'načítám katastr…';
   for (const r of rings) {
     if (cadTextures[r.slug]) continue;
-    // Prefer the pre-fetched cadastre PNG baked into the ring manifest;
-    // fall back to a live fetch from the inzerator proxy if the gen
-    // script ran without --no-cadastre but the inzerator server was down
-    // at gen time. Live fetch may CORS-fail across browsers/setups.
-    let url;
-    if (r.cadastre_file) {
-      url = asset(r.cadastre_file);
-    } else {
-      const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
-      url = `/proxy/cadastre?BBOX=${bbox}&layer=KN&size=4096`;
-    }
     try {
-      // Cadastre PNG is line art on transparent background — shader only
-      // samples the alpha channel (see fragment shader's `cadA` mix).
-      // Keeping the full RGBA on GPU wastes 4× the memory (e.g. 8192² →
-      // 256 MB per ring) for data we never read. Decode the PNG in a
-      // canvas, extract alpha, upload as a single-channel R8 DataTexture.
-      const tex = await loadCadastreAlphaTex(url);
+      // Preferred path: ETC1S-compressed KTX2 (8 MB GPU per ring).
+      // Fallback: R8 alpha-only DataTexture from 4k-downsampled PNG (16 MB).
+      // Live proxy fetch as last resort for slugs missing pre-fetched files.
+      let tex;
+      if (r.cadastre_ktx2_file) {
+        tex = await loadCadastreKtx2Tex(asset(r.cadastre_ktx2_file));
+      } else if (r.cadastre_file) {
+        tex = await loadCadastreAlphaTex(asset(r.cadastre_file));
+      } else {
+        const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
+        tex = await loadCadastreAlphaTex(`/proxy/cadastre?BBOX=${bbox}&layer=KN&size=4096`);
+      }
       cadTextures[r.slug] = tex;
     } catch (e) {
       cadStatus.textContent = `chyba: ${e.message}`;
@@ -1546,24 +1712,199 @@ async function ensureCadastre() {
       return;
     }
   }
-  cadStatus.textContent = 'načteno (pre-fetched)';
+  cadStatus.textContent = 'načteno';
+}
+
+// ── Vector cadastre (LineSegments2) ──
+// New rings carry parcels_file + buildings_file in the manifest. The vector
+// path replaces the 64 MB R8 raster cadastre with ~1-3 MB of GPU line geometry
+// (LineSegments2 instanced quads). Crisp at any zoom, pickable, ~40× less GPU.
+// We always prefer vector when available; rings without it fall back to raster.
+// Vector cadastre is gated behind ?vector=1 — vector LineSegments2 turned
+// out heavier per-frame than KTX2-compressed raster on dense villages
+// (~70k segments per closeup ring). Kept for future experiments.
+const _VECTOR_FLAG = new URLSearchParams(location.search).get('vector') === '1';
+const VECTOR_AVAILABLE = _VECTOR_FLAG &&
+  rings.every(r => r.parcels_file && r.buildings_file);
+if (_VECTOR_FLAG) {
+  console.info(`[cad] vector mode (?vector=1): ${VECTOR_AVAILABLE}`,
+    rings.map(r => ({slug: r.slug, parcels: !!r.parcels_file, buildings: !!r.buildings_file})));
+}
+const cadVectorGroup = new THREE.Group();
+cadVectorGroup.visible = false;
+scene.add(cadVectorGroup);
+const cadVectorRingNodes = {};   // slug → { lines: LineSegments2[], material: LineMaterial }
+let cadVectorPromise = null;
+let parcelsBySlug = {};          // slug → array of { id, label, ring_local, ... }
+
+// LineMaterial uses pixel-space line widths (resolution uniform must be kept
+// in sync with the renderer canvas size or lines get DPI-scaled wrong).
+function makeCadLineMaterial(color, widthPx) {
+  // No transparency: alpha-blend on ~140k fragments per ring is the heaviest
+  // single cost. Solid lines look identical at our widthPx ≤ 2 and the
+  // depth buffer guarantees correct overlap. Drop computeLineDistances too —
+  // we don't dash, so the per-segment distance buffer is dead weight.
+  const mat = new LineMaterial({
+    color,
+    linewidth: widthPx,
+    worldUnits: false,
+    depthTest: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+    toneMapped: false,
+  });
+  mat.resolution.set(window.innerWidth, window.innerHeight);
+  return mat;
+}
+
+function _pushSegments(out, ring, lift, sampleY) {
+  // For each consecutive pair in a closed ring, emit a segment.
+  // ring elements: [x, z] (buildings) or [x, z, yAbs] (parcels).
+  const n = ring.length;
+  for (let i = 0; i < n; i++) {
+    const a = ring[i];
+    const b = ring[(i + 1) % n];
+    const ya = (a.length > 2 && a[2] > 0) ? a[2] : sampleY(a[0], a[1]);
+    const yb = (b.length > 2 && b[2] > 0) ? b[2] : sampleY(b[0], b[1]);
+    if (ya == null || yb == null) continue;
+    out.push(a[0], ya - yMid + lift, a[1],
+             b[0], yb - yMid + lift, b[1]);
+  }
+}
+
+function buildVectorCadastreForRing(r, parcels, buildings) {
+  // Sample heightmap for buildings (2D coords only). For parcels, server
+  // returns DSM-sampled Y per vertex but on cache misses the value is 0;
+  // fall back to sampleAt() in that case too.
+  const sampleY = (lx, lz) => {
+    const y = sampleAt(lx, lz);
+    return y == null ? 0 : y;
+  };
+
+  // Lift slightly above terrain. Polygon offset handles the rest of the
+  // z-fight at steep view angles.
+  const PARCEL_LIFT = 0.3;
+  const BUILDING_LIFT = 0.4;
+
+  const parcelPos = [];
+  for (const p of parcels) {
+    if (!p.ring_local || p.ring_local.length < 3) continue;
+    _pushSegments(parcelPos, p.ring_local, PARCEL_LIFT, sampleY);
+  }
+  const buildingPos = [];
+  for (const b of buildings) {
+    if (!b.coords || b.coords.length < 3) continue;
+    _pushSegments(buildingPos, b.coords, BUILDING_LIFT, sampleY);
+  }
+
+  const out = { lines: [], material: null, segCount: 0 };
+  if (parcelPos.length) {
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(parcelPos);
+    const mat = makeCadLineMaterial(0xffffff, 1.2);
+    out.lines.push(new LineSegments2(geo, mat));
+    out.material = mat;
+    out.segCount += parcelPos.length / 6;
+  }
+  if (buildingPos.length) {
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(buildingPos);
+    const mat = makeCadLineMaterial(0xffe680, 1.6);   // warm yellow buildings
+    out.lines.push(new LineSegments2(geo, mat));
+    out.segCount += buildingPos.length / 6;
+  }
+  return out;
+}
+
+async function ensureVectorCadastre() {
+  if (cadVectorPromise) return cadVectorPromise;
+  cadStatus.textContent = 'načítám vektorový katastr…';
+  cadVectorPromise = (async () => {
+    const t0 = performance.now();
+    let totalSegs = 0;
+    await Promise.all(rings.map(async (r) => {
+      if (cadVectorRingNodes[r.slug]) return;
+      const tFetch = performance.now();
+      const [parcelsResp, buildingsResp] = await Promise.all([
+        fetch(asset(r.parcels_file)),
+        fetch(asset(r.buildings_file)),
+      ]);
+      if (!parcelsResp.ok) throw new Error(`parcels ${parcelsResp.status} for ${r.slug}`);
+      if (!buildingsResp.ok) throw new Error(`buildings ${buildingsResp.status} for ${r.slug}`);
+      const [parcels, buildings] = await Promise.all([
+        parcelsResp.json(), buildingsResp.json()
+      ]);
+      const tParsed = performance.now();
+      parcelsBySlug[r.slug] = parcels;
+      const node = buildVectorCadastreForRing(r, parcels, buildings);
+      const tBuilt = performance.now();
+      for (const line of node.lines) cadVectorGroup.add(line);
+      cadVectorRingNodes[r.slug] = node;
+      for (const p of parcels) parcelsById?.set?.(p.id, p);
+      totalSegs += node.segCount;
+      console.info(`[cad ${r.slug}] fetch+parse ${(tParsed-tFetch).toFixed(0)} ms, ` +
+        `build ${(tBuilt-tParsed).toFixed(0)} ms, ` +
+        `${parcels.length} parcels + ${buildings.length} buildings → ${node.segCount} segments`);
+    }));
+    const elapsed = (performance.now() - t0).toFixed(0);
+    const total = Object.values(parcelsBySlug).reduce((n, ps) => n + ps.length, 0);
+    cadStatus.textContent = `${total} parcel, ${totalSegs} seg (${elapsed} ms)`;
+    console.info(`[cad] total ${elapsed} ms wall, ${totalSegs} segments`);
+  })();
+  return cadVectorPromise;
 }
 
 cadToggle.addEventListener('change', async () => {
   if (cadToggle.checked) {
-    await ensureCadastre();
-    for (let i = 0; i < ringMeshes.length; i++) {
-      const mesh = ringMeshes[i];
-      const r = rings[i];
-      mesh.material.uniforms.uCadastre.value = cadTextures[r.slug];
-      mesh.material.uniforms.uCadEnabled.value = 1.0;
+    if (VECTOR_AVAILABLE) {
+      try {
+        await ensureVectorCadastre();
+        cadVectorGroup.visible = true;
+      } catch (e) {
+        cadStatus.textContent = `chyba: ${e.message}`;
+        console.error('[cad vector]', e);
+      }
+    } else {
+      await ensureCadastre();
+      for (let i = 0; i < ringMeshes.length; i++) {
+        const mesh = ringMeshes[i];
+        const r = rings[i];
+        const tex = cadTextures[r.slug];
+        mesh.material.uniforms.uCadastre.value = tex;
+        mesh.material.uniforms.uCadEnabled.value = 1.0;
+        // KTX2/compressed textures store rows in image-native order; WebGL
+        // ignores UNPACK_FLIP_Y_WEBGL on compressed paths so we flip V in
+        // the shader. R8 DataTexture (PNG fallback) already has flipY=false.
+        // KTX2 path: flip from URL flag (default 1 = vertical, matches ortho
+        // convention). PNG R8 path: no flip (flipY=false at upload).
+        mesh.material.uniforms.uCadFlipY.value = tex.isCompressedTexture ? (_CAD_FLIP & 1) : 0.0;
+        mesh.material.uniforms.uCadFlipX.value = tex.isCompressedTexture ? ((_CAD_FLIP >> 1) & 1) : 0.0;
+      }
     }
   } else {
-    for (const mesh of ringMeshes) {
-      mesh.material.uniforms.uCadEnabled.value = 0.0;
+    if (VECTOR_AVAILABLE) {
+      cadVectorGroup.visible = false;
+    } else {
+      for (const mesh of ringMeshes) {
+        mesh.material.uniforms.uCadEnabled.value = 0.0;
+      }
     }
     cadStatus.textContent = '';
   }
+});
+
+// LineMaterial resolution must follow the canvas. Hook into existing resize.
+window.addEventListener('resize', () => {
+  for (const node of Object.values(cadVectorRingNodes)) {
+    if (node.material) node.material.resolution.set(window.innerWidth, window.innerHeight);
+    for (const line of node.lines) {
+      if (line.material?.resolution) {
+        line.material.resolution.set(window.innerWidth, window.innerHeight);
+      }
+    }
+  }
+  if (_parcelLineMat) _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
 });
 
 // ── HUD ──
@@ -1586,6 +1927,13 @@ let lastT = performance.now(), frames = 0;
 // (env-map background pixels exceed 1.0) gets caught by the bloom pass
 // and the whole frame washes white.
 const BLOOM_LAYER = 1;
+// Composers always created (finalComposer is required for sRGB output
+// encoding on our custom ShaderMaterial — plain renderer.render skips
+// OutputPass and ortho ends up too dark, see memory/feedback_composer_colorspace.md).
+// What we DO skip when no parcels are selected is the bloom-only pass,
+// which is the heavy one (full-frame multi-mip blur). finalComposer keeps
+// running so colour stays correct; the combine shader reads the bloom
+// target's last state (zeros on first frame) so the contribution is ~0.
 const bloomComposer = new EffectComposer(renderer);
 bloomComposer.renderToScreen = false;
 bloomComposer.setPixelRatio(renderer.getPixelRatio());
@@ -1629,26 +1977,117 @@ function animate() {
   if (_NO_BLOOM) {
     renderer.render(scene, camera);
   } else {
-    // Phase 1 — bloom pass on parcel tubes only. Hide background (HDR sky
-    // would otherwise bloom across the entire frame) and restrict camera
-    // to the bloom layer so nothing else renders.
-    const oldBg = scene.background;
-    scene.background = null;
-    camera.layers.set(BLOOM_LAYER);
-    bloomComposer.render();
-    // Phase 2 — full scene + composite bloom additively.
-    scene.background = oldBg;
-    camera.layers.set(0);
+    // Skip the heavy bloom pass when no parcels are selected — the combine
+    // shader still reads `bloomTexture` (which keeps its previous state /
+    // zeros) so the additive contribution is ~0. finalComposer still runs
+    // to keep the OutputPass sRGB encoding active.
+    const hasGlow = selectedParcels.size > 0;
+    if (hasGlow) {
+      const oldBg = scene.background;
+      scene.background = null;
+      camera.layers.set(BLOOM_LAYER);
+      bloomComposer.render();
+      scene.background = oldBg;
+      camera.layers.set(0);
+    }
     finalComposer.render();
   }
   frames++;
   const now = performance.now();
   if (now - lastT > 500) {
-    stats.textContent = `${(frames * 1000 / (now - lastT)).toFixed(0)} fps`;
+    const fps = (frames * 1000 / (now - lastT)).toFixed(0);
+    const info = renderer.info;
+    const gpuMB = estimateGpuMB();
+    const heapMB = performance.memory
+      ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) + ' MB'
+      : '—';
+    stats.innerHTML =
+      `<span class="lbl">fps</span> <span class="val">${fps}</span><br>` +
+      `<span class="lbl">draw</span> <span class="val">${info.render.calls}</span> ` +
+      `<span class="lbl">tris</span> <span class="val">${(info.render.triangles/1000).toFixed(0)}k</span><br>` +
+      `<span class="lbl">tex</span> <span class="val">${info.memory.textures}</span> ` +
+      `<span class="lbl">geo</span> <span class="val">${info.memory.geometries}</span><br>` +
+      `<span class="lbl">gpu</span> <span class="val">${gpuMB} MB</span><br>` +
+      `<span class="lbl">heap</span> <span class="val">${heapMB}</span>`;
     frames = 0;
     lastT = now;
   }
 }
+
+// Estimate GPU memory by scanning materials + composers for unique textures
+// and summing image-byte-size by format/type. WebGL doesn't expose VRAM
+// directly; this is an upper bound for the texture footprint (mipmaps add
+// ~33 %, included). Render targets (bloom, shadow bake) are counted via
+// `renderer.info.memory.textures` heuristic — each RT contributes ~ W*H*4
+// bytes (RGBA half-float for HDR composer paths).
+function _texBytes(tex) {
+  if (!tex || !tex.image) return 0;
+  // Compressed (KTX2 ETC1S/UASTC): mipmaps array carries actual byte arrays.
+  if (tex.isCompressedTexture && Array.isArray(tex.mipmaps)) {
+    let total = 0;
+    for (const m of tex.mipmaps) if (m.data) total += m.data.length;
+    return total;
+  }
+  // DataTexture (heightmap, cadastre R8): payload is the typed array.
+  if (tex.image.data?.byteLength) {
+    let bytes = tex.image.data.byteLength;
+    if (tex.generateMipmaps) bytes = Math.round(bytes * 1.333);   // mip chain
+    return bytes;
+  }
+  // Regular Texture (image-backed): infer from dimensions × channels × bpc.
+  const W = tex.image.width || 0, H = tex.image.height || 0;
+  if (!W || !H) return 0;
+  let channels = 4;
+  if (tex.format === THREE.RedFormat) channels = 1;
+  else if (tex.format === THREE.RGFormat) channels = 2;
+  else if (tex.format === THREE.RGBFormat) channels = 3;
+  let bpc = 1;
+  if (tex.type === THREE.HalfFloatType) bpc = 2;
+  else if (tex.type === THREE.FloatType) bpc = 4;
+  let bytes = W * H * channels * bpc;
+  if (tex.generateMipmaps !== false) bytes = Math.round(bytes * 1.333);
+  return bytes;
+}
+
+function estimateGpuMB() {
+  const seen = new Set();
+  let total = 0;
+  // Walk scene materials for textures attached via uniforms or stock slots.
+  scene.traverse((obj) => {
+    const mats = obj.material
+      ? (Array.isArray(obj.material) ? obj.material : [obj.material])
+      : [];
+    for (const m of mats) {
+      if (m.uniforms) {
+        for (const u of Object.values(m.uniforms)) {
+          const t = u?.value;
+          if (t?.isTexture && !seen.has(t)) { seen.add(t); total += _texBytes(t); }
+        }
+      }
+      for (const k of ['map','normalMap','roughnessMap','metalnessMap','emissiveMap','envMap']) {
+        const t = m[k];
+        if (t?.isTexture && !seen.has(t)) { seen.add(t); total += _texBytes(t); }
+      }
+    }
+  });
+  // Shadow bake RTs (one per ring, not in scene graph).
+  if (typeof shadowMaps === 'object') {
+    for (const rt of Object.values(shadowMaps)) {
+      const t = rt?.texture;
+      if (t && !seen.has(t)) { seen.add(t); total += _texBytes(t); }
+    }
+  }
+  // Composer render targets: each composer holds 2 RTs (ping/pong) at
+  // viewport size × pixelRatio², typically RGBA HalfFloat = 8 bytes/px.
+  const dpr = renderer.getPixelRatio();
+  const composerRtBytes = innerWidth * innerHeight * dpr * dpr * 8;
+  if (bloomComposer) total += composerRtBytes * 2;   // bloomComposer 2 RTs
+  if (finalComposer) total += composerRtBytes * 2;   // finalComposer 2 RTs
+  // UnrealBloomPass adds 5 mip-chain RTs at half/quarter sizes.
+  if (bloomComposer) total += composerRtBytes * 0.4;   // ~5 mips of decreasing size
+  return (total / 1048576).toFixed(0);
+}
+
 animate();
 
 addEventListener('resize', () => {

@@ -477,13 +477,17 @@ function makeHeightTexture(data, n) {
 // buffer and gets its world size via `mesh.scale`. Saves ~⅔ of GPU upload
 // vs. per-ring PlaneGeometry.
 //
-// Subdivision is matched to the densest ring (inner heightmap is 2000²)
-// so even the outer ring's coarser 5 m heightmap gets over-sampled rather
-// than under-sampled — visually no difference, GPU memory drops from
-// ~350 MB to ~120 MB. Raise GEO_SUBDIVS only if a single ring's heightmap
-// goes above 2049 px on a side. Lower it (e.g. 1024) for iPad-class GPUs
-// where memory pressure matters more than mesh-vs-heightmap parity.
-const GEO_SUBDIVS = 2048;
+// Subdivision below the heightmap resolution (2001²) is fine: the vertex
+// shader does bilinear sampling of the heightmap, so sub-vertex detail
+// comes from the texture, not from extra geometry. 1024² already gives
+// ~3 m per vertex on the closeup ring and ~1 m on the inner ring — well
+// below visible precision at typical view distance. At 2048 a single
+// shared PlaneGeometry pinned ~235 MB of JS heap (position/uv/normal/
+// index buffers); 1024 drops that to ~60 MB.
+// Raise to 2048 only when geometric LOD (not heightmap detail) starts
+// limiting the silhouette of sharp ridges; on flat-to-rolling terrain
+// it's pure overhead.
+const GEO_SUBDIVS = 1024;
 const sharedGeo = new THREE.PlaneGeometry(1, 1, GEO_SUBDIVS, GEO_SUBDIVS);
 sharedGeo.rotateX(-Math.PI / 2);
 
@@ -1971,9 +1975,12 @@ finalComposer.addPass(new RenderPass(scene, camera));
 finalComposer.addPass(new ShaderPass(combineShader, 'baseTexture'));
 finalComposer.addPass(new OutputPass());
 
+renderer.info.autoReset = false;   // accumulate across multiple render() calls per frame
+
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  renderer.info.reset();   // manual reset at frame start
   if (_NO_BLOOM) {
     renderer.render(scene, camera);
   } else {
@@ -2097,6 +2104,239 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 });
+
+// ── Page Visibility unload ──
+// When the tab is hidden for >5 min, dispose every GPU asset (textures,
+// render targets, CPU heightmap, parcel outlines). Recovers ~150-250 MB
+// GPU + ~50-100 MB JS heap for forgotten tabs. On return, refetch from
+// browser disk cache (typically ~1-2 s) and re-apply the toggle states
+// the user had active. Composer targets are kept — re-creating them is
+// expensive and ~30 MB is a worthwhile baseline to keep frames rendering.
+const _UNLOAD_AFTER_MS = 5 * 60 * 1000;
+let _hiddenAt = null;
+let _unloadTimer = null;
+let _unloaded = false;
+let _savedToggleState = null;
+
+async function disposeAllAssets() {
+  // Snapshot toggle state so reloadAllAssets can restore the user's view.
+  _savedToggleState = {
+    cad: cadToggle.checked,
+    bare: bareToggle.checked,
+    parcels: parcelsToggle?.checked ?? false,
+    tier: currentTier,
+    selectedParcels: Array.from(selectedParcels),
+  };
+  // Per-ring uniforms — null + dispose. Material itself stays valid; we
+  // only swap its sampler targets back in during reload.
+  for (let i = 0; i < ringMeshes.length; i++) {
+    const u = ringMeshes[i].material.uniforms;
+    u.uHeight.value?.dispose();    u.uHeight.value = null;
+    u.uHeightBare.value?.dispose(); u.uHeightBare.value = null;
+    u.uBareMode.value = 0.0;
+    u.uOrtho.value?.dispose();     u.uOrtho.value = null;
+    u.uCadastre.value?.dispose();  u.uCadastre.value = null;
+    u.uCadEnabled.value = 0.0;
+    if (u.uShadowMap) { u.uShadowMap.value?.dispose?.(); u.uShadowMap.value = null; }
+  }
+  // Tier cache + cadastre/bare maps — fully drop.
+  for (const tex of Object.values(orthoTierCache)) tex.dispose();
+  for (const k of Object.keys(orthoTierCache)) delete orthoTierCache[k];
+  currentTier = null;
+  for (const tex of Object.values(cadTextures)) tex.dispose();
+  for (const k of Object.keys(cadTextures)) delete cadTextures[k];
+  for (const slug in bareLoadedTex) { bareLoadedTex[slug]?.dispose(); delete bareLoadedTex[slug]; }
+  // Shadow render targets.
+  for (const rt of Object.values(shadowMaps)) rt.dispose?.();
+  for (const k of Object.keys(shadowMaps)) delete shadowMaps[k];
+  // CPU heightmap (lazy anyway, but clear in case it was loaded).
+  for (const slug in ringData) {
+    ringData[slug].heightData = null;
+    ringData[slug].heightLoadPromise = null;
+  }
+  // Vector cadastre overlay (only when ?vector=1 was used).
+  for (const node of Object.values(cadVectorRingNodes)) {
+    for (const line of node.lines) {
+      line.geometry.dispose();
+      line.material.dispose();
+      cadVectorGroup.remove(line);
+    }
+  }
+  for (const k of Object.keys(cadVectorRingNodes)) delete cadVectorRingNodes[k];
+  cadVectorPromise = null;
+  cadVectorGroup.visible = false;
+  // Parcel outline tubes/lines.
+  while (outlineGroup.children.length) {
+    const m = outlineGroup.children.pop();
+    m.geometry.dispose();
+  }
+  // Don't dispose _parcelLineMat / _emissiveMat — singleton materials,
+  // cheap to keep. Composer RTs likewise stay (they re-clear naturally).
+  console.info(`[unload] disposed (hidden ${((Date.now() - _hiddenAt)/1000).toFixed(0)}s)`);
+}
+
+async function reloadAllAssets() {
+  const t0 = performance.now();
+  // Re-fetch heightmap + ortho per ring in parallel. Browser disk cache
+  // makes this typically < 200 ms per ring on a warm cache.
+  await Promise.all(rings.map(async (r, i) => {
+    const hmFmt = r.heightmap_format || 'png';
+    const heightP = loadHeightmapData(asset(r.heightmap_file), hmFmt,
+                                       r.heightmap_size, r.y_min, r.y_max);
+    await webpSupport;
+    const orthoP = loadTex(pickOrthoUrl(r));
+    const [heightRes, ortho] = await Promise.all([heightP, orthoP]);
+    const heightTex = makeHeightTexture(heightRes.data, heightRes.n);
+    ortho.colorSpace = THREE.SRGBColorSpace;
+    ortho.flipY = false;
+    ortho.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    const u = ringMeshes[i].material.uniforms;
+    u.uHeight.value = heightTex;
+    u.uOrtho.value = ortho;
+    u.uOrthoFlipY.value = ortho.isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
+    // Re-seed tier cache with the default tier so switchOrthoTier short-
+    // circuits the first time the user picks the same tier they had.
+    const defaultTier = r.ortho_default || 'mid';
+    orthoTierCache[`${r.slug}|${defaultTier}`] = ortho;
+  }));
+  currentTier = rings[0].ortho_default || 'mid';
+  syncTierButtons?.();
+  // Re-apply toggle states the user had on. Each `change` handler does
+  // the heavy lifting (load + apply uniforms). We dispatch a synthetic
+  // 'change' event so any side effects (status text, button hide) match
+  // a fresh user click.
+  const s = _savedToggleState;
+  if (s) {
+    if (s.cad && !cadToggle.checked) cadToggle.checked = true;
+    if (s.bare && !bareToggle.checked) bareToggle.checked = true;
+    if (s.parcels && parcelsToggle && !parcelsToggle.checked) parcelsToggle.checked = true;
+    // Fire handlers sequentially — they internally await heavy work.
+    if (s.cad)     cadToggle.dispatchEvent(new Event('change'));
+    if (s.bare)    bareToggle.dispatchEvent(new Event('change'));
+    if (s.parcels && parcelsToggle) parcelsToggle.dispatchEvent(new Event('change'));
+    // Restore parcel selection IDs (outline redraws after parcels load).
+    selectedParcels.clear();
+    for (const id of s.selectedParcels) selectedParcels.add(id);
+    // redrawOutlines runs after parcels finish loading (handler awaits it).
+  }
+  _savedToggleState = null;
+  console.info(`[unload] reloaded in ${((performance.now() - t0)/1000).toFixed(2)} s`);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _hiddenAt = Date.now();
+    if (_unloadTimer) clearTimeout(_unloadTimer);
+    _unloadTimer = setTimeout(() => {
+      if (document.hidden && !_unloaded) {
+        disposeAllAssets();
+        _unloaded = true;
+      }
+    }, _UNLOAD_AFTER_MS);
+  } else {
+    if (_unloadTimer) { clearTimeout(_unloadTimer); _unloadTimer = null; }
+    if (_unloaded) {
+      reloadAllAssets();
+      _unloaded = false;
+    }
+  }
+});
+// Manual triggers for debug: window._unload(), window._reload()
+window._unload = () => { disposeAllAssets(); _unloaded = true; };
+window._reload = () => { reloadAllAssets(); _unloaded = false; };
+
+// Heap breakdown — walk known global references and report sizes. Prints
+// to console (use _heapBreakdown() in DevTools). Identifies the heaviest
+// JS-heap allocations the app holds explicitly — anything beyond this is
+// engine internals / V8 pool overhead.
+window._heapBreakdown = () => {
+  const rows = [];
+  const push = (label, bytes) => bytes > 0 && rows.push([label, bytes]);
+  const seen = new Set();
+  const addTexture = (tex, label) => {
+    if (!tex || seen.has(tex)) return;
+    seen.add(tex);
+    // Compressed mipmap arrays — held in JS heap as Uint8Array refs.
+    if (tex.isCompressedTexture && Array.isArray(tex.mipmaps)) {
+      let total = 0;
+      for (const m of tex.mipmaps) if (m.data?.length) total += m.data.length;
+      push(`${label} (KTX2 mipmap arrays)`, total);
+    }
+    // DataTexture payloads — direct typed array reference.
+    if (tex.image?.data?.byteLength) {
+      push(`${label} (DataTexture.image.data)`, tex.image.data.byteLength);
+    }
+    // ImageBitmap / HTMLImageElement carry pixel data outside JS heap
+    // (browser-managed), so not counted here.
+  };
+  // Ring meshes
+  for (let i = 0; i < ringMeshes.length; i++) {
+    const u = ringMeshes[i].material.uniforms;
+    addTexture(u.uHeight.value,     `ring${i}.uHeight`);
+    addTexture(u.uHeightBare.value, `ring${i}.uHeightBare`);
+    addTexture(u.uOrtho.value,      `ring${i}.uOrtho`);
+    addTexture(u.uCadastre.value,   `ring${i}.uCadastre`);
+  }
+  // Caches
+  for (const [k, t] of Object.entries(orthoTierCache)) addTexture(t, `orthoTierCache[${k}]`);
+  for (const [k, t] of Object.entries(cadTextures)) addTexture(t, `cadTextures[${k}]`);
+  for (const [k, t] of Object.entries(bareLoadedTex)) addTexture(t, `bareLoadedTex[${k}]`);
+  // Shadow render targets (texture inside RT, but their data lives on GPU only)
+  // Skipped — no JS heap contribution.
+  // CPU heightmap (Uint16 quantized after lazy load)
+  for (const slug in ringData) {
+    const hd = ringData[slug].heightData;
+    if (hd?.byteLength) push(`ringData[${slug}].heightData (Uint16)`, hd.byteLength);
+  }
+  // Parcel data — RUIAN polygons
+  for (const slug in parcelsBySlug) {
+    const p = parcelsBySlug[slug];
+    // Estimate: each parcel ~200 bytes parsed (id, label, ring_local arrays)
+    push(`parcelsBySlug[${slug}] (~${p.length} parcels)`, p.length * 200);
+  }
+  // Vector cadastre geometry positions
+  for (const [slug, node] of Object.entries(cadVectorRingNodes)) {
+    for (const line of node.lines) {
+      const pos = line.geometry?.attributes?.instanceStart?.data?.array;
+      if (pos?.byteLength) push(`cadVectorRingNodes[${slug}].positions`, pos.byteLength);
+    }
+  }
+  // Outline group line geometry
+  for (const child of outlineGroup.children) {
+    const pos = child.geometry?.attributes?.instanceStart?.data?.array;
+    if (pos?.byteLength) push(`outlineGroup line positions`, pos.byteLength);
+  }
+  // Shared / per-mesh BufferGeometry attribute arrays — the silent
+  // killer at high GEO_SUBDIVS. position/uv/normal/index together can
+  // dwarf textures.
+  const geoSeen = new Set();
+  scene.traverse((obj) => {
+    const g = obj.geometry;
+    if (!g || geoSeen.has(g)) return;
+    geoSeen.add(g);
+    const label = obj.name || obj.type;
+    for (const [name, attr] of Object.entries(g.attributes || {})) {
+      if (attr.array?.byteLength) push(`geometry[${label}].${name}`, attr.array.byteLength);
+    }
+    if (g.index?.array?.byteLength) push(`geometry[${label}].index`, g.index.array.byteLength);
+  });
+
+  rows.sort((a, b) => b[1] - a[1]);
+  let total = 0;
+  console.log('%c[heap breakdown] (explicit refs we hold)', 'font-weight:bold');
+  for (const [label, bytes] of rows) {
+    total += bytes;
+    console.log(`  ${(bytes/1048576).toFixed(2).padStart(7)} MB  ${label}`);
+  }
+  const heapMB = performance.memory
+    ? (performance.memory.usedJSHeapSize / 1048576).toFixed(0) + ' MB'
+    : '—';
+  console.log(`%c  ────`, 'color:#888');
+  console.log(`  ${(total/1048576).toFixed(2).padStart(7)} MB  TRACKED total`);
+  console.log(`  ${heapMB.padStart(10)}  performance.memory.usedJSHeapSize`);
+  console.log(`  ${((performance.memory?.usedJSHeapSize/1048576 || 0) - total/1048576).toFixed(0).padStart(7)} MB  UNTRACKED (engine + V8 pool + decoded images)`);
+  return rows;
+};
 </script>
 </body>
 </html>

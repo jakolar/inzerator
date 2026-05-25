@@ -115,11 +115,20 @@
         <h2>Nastavení</h2>
         <div class="ctl">
           <label>Rozměr:</label>
-          <select id="size">
+          <select id="size" title="gpt-image-2: dimensions must be divisible by 16">
             <option value="auto" selected>Auto (dle vstupu)</option>
-            <option value="1024x1024">1024×1024 (square)</option>
-            <option value="1024x1536">1024×1536 (portrait)</option>
-            <option value="1536x1024">1536×1024 (landscape)</option>
+            <optgroup label="Square">
+              <option value="1024x1024">1024×1024</option>
+              <option value="2048x2048">2048×2048</option>
+            </optgroup>
+            <optgroup label="Landscape">
+              <option value="1536x1024">1536×1024</option>
+              <option value="2048x1376">2048×1376 (3:2)</option>
+            </optgroup>
+            <optgroup label="Portrait">
+              <option value="1024x1536">1024×1536</option>
+              <option value="1376x2048">1376×2048 (2:3)</option>
+            </optgroup>
           </select>
           <label>Kvalita:</label>
           <select id="quality">
@@ -127,13 +136,6 @@
             <option value="medium">Medium</option>
             <option value="auto">Auto</option>
           </select>
-        </div>
-        <div class="ctl">
-          <label>API token:</label>
-          <div class="token-bar" style="flex:1">
-            <input type="password" id="token" placeholder="INZERATOR_API_TOKEN" autocomplete="off">
-            <button class="ghost" id="forget-token" type="button">Zapomenout</button>
-          </div>
         </div>
       </div>
 
@@ -166,19 +168,7 @@
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status');
 const outStatusEl = $('out-status');
-const tokenInput = $('token');
 const runBtn = $('run');
-
-// --- Token persistence (localStorage) ---
-const TOKEN_KEY = 'inzerator_api_token';
-tokenInput.value = localStorage.getItem(TOKEN_KEY) || '';
-tokenInput.addEventListener('change', () => {
-  localStorage.setItem(TOKEN_KEY, tokenInput.value);
-});
-$('forget-token').addEventListener('click', () => {
-  tokenInput.value = '';
-  localStorage.removeItem(TOKEN_KEY);
-});
 
 // --- Status / prompt boot ---
 let serverReady = false;
@@ -189,13 +179,10 @@ async function refreshStatus() {
     serverReady = !!s.ready;
     if (s.ready) {
       statusEl.className = 'status ok';
-      statusEl.textContent = `Server připraven (OpenAI key + token nastaveny, prompt ${s.prompt_loaded ? 'načten' : 'CHYBÍ'}).`;
+      statusEl.textContent = `Server připraven (OpenAI key nastaven, prompt ${s.prompt_loaded ? 'načten' : 'CHYBÍ'}).`;
     } else {
-      const missing = [];
-      if (!s.openai_key_set) missing.push('OPENAI_API_KEY');
-      if (!s.token_set) missing.push('INZERATOR_API_TOKEN');
       statusEl.className = 'status error';
-      statusEl.textContent = `Server nemá v env: ${missing.join(', ')}. Doplň do .env a restartuj.`;
+      statusEl.textContent = `Server nemá v env: OPENAI_API_KEY. Doplň do .env a restartuj.`;
     }
   } catch (e) {
     statusEl.className = 'status error';
@@ -273,9 +260,8 @@ bindDrop(dropA, files => setImageA(files[0]));
 bindDrop(dropRef, files => addRefs(Array.from(files)));
 
 function updateRunButton() {
-  runBtn.disabled = !(serverReady && imageA && tokenInput.value.trim());
+  runBtn.disabled = !(serverReady && imageA);
 }
-tokenInput.addEventListener('input', updateRunButton);
 
 // --- Run ---
 runBtn.addEventListener('click', async () => {
@@ -296,7 +282,6 @@ runBtn.addEventListener('click', async () => {
   try {
     const r = await fetch('/api/image-edit', {
       method: 'POST',
-      headers: { 'X-Inzerator-Token': tokenInput.value.trim() },
       body: fd,
     });
     if (!r.ok) {

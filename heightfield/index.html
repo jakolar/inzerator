@@ -87,6 +87,11 @@
     </span>
     <span id="ortho-quality-status" style="font-size:10px;color:#888;margin-left:4px;"></span>
   </div>
+  <div style="margin-top:8px;">
+    <button id="screenshot-btn" style="padding:4px 10px;font-size:12px;cursor:pointer;
+            background:#1a6a8e;color:#fff;border:0;border-radius:4px;">📸 Screenshot</button>
+    <span style="font-size:10px;color:#888;margin-left:6px;">P = klávesa</span>
+  </div>
   Drag = orbit · Scroll = zoom · Right-drag = pan
 </div>
 <div id="stats"></div>
@@ -247,7 +252,12 @@ for (const r of manifest.rings) {
 renderProgress();
 
 // ── Scene setup ──
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// preserveDrawingBuffer: true is required for `renderer.domElement.toBlob()`
+// to capture the last frame — without it the browser composites the canvas
+// to the page and clears the WebGL framebuffer, so screenshots come back
+// blank. Cost is a ~5 % per-frame penalty (WebGL keeps an extra
+// readable buffer); negligible on desktop / Apple Silicon.
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 // On Retina (devicePixelRatio=2) the fragment shader runs 4× more pixels
 // per frame than native res. Cap at 1.5 to claw back ~30 % per-frame
 // cost; text/labels on ortho stay readable and the parcel tubes only
@@ -1971,6 +1981,57 @@ window.addEventListener('resize', () => {
     }
   }
   if (_parcelLineMat) _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
+});
+
+// ── Screenshot ──
+// renderer.domElement.toBlob() captures only the 3D canvas — no HUD,
+// no info panel, no buttons (HTML overlays don't end up in the WebGL
+// framebuffer). Forces an immediate render so the captured pixels match
+// what the user just saw (preserveDrawingBuffer would be alternative
+// but it costs perf every frame). Filename includes slug + tier + ts.
+function captureScreenshot() {
+  // Render once with preserveDrawingBuffer-equivalent: re-run animate
+  // pipeline now, then toBlob within the same microtask so the
+  // framebuffer is still valid (WebGL otherwise clears it after compositing).
+  const oldBg = scene.background;
+  // Re-render through finalComposer for correct sRGB encoding (see
+  // memory/feedback_composer_colorspace.md). Skip bloomComposer when
+  // nothing emissive — same logic as animate().
+  const hasGlow = !_NO_BLOOM && selectedParcels.size > 0;
+  if (hasGlow) {
+    scene.background = null;
+    camera.layers.set(BLOOM_LAYER);
+    bloomComposer.render();
+    scene.background = oldBg;
+    camera.layers.set(0);
+  }
+  finalComposer.render();
+  renderer.domElement.toBlob((blob) => {
+    if (!blob) {
+      console.error('[screenshot] toBlob returned null');
+      return;
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${slug}_${currentTier || 'view'}_${ts}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    console.info(`[screenshot] saved ${a.download} (${(blob.size/1024).toFixed(0)} KB)`);
+  }, 'image/png');
+}
+document.getElementById('screenshot-btn').addEventListener('click', captureScreenshot);
+document.addEventListener('keydown', (e) => {
+  // 'P' for photo — only when no form input has focus (don't steal
+  // keystrokes from the OSM/cad toggle label tabbing, etc.)
+  if ((e.key === 'p' || e.key === 'P') &&
+      !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) {
+    e.preventDefault();
+    captureScreenshot();
+  }
 });
 
 // ── HUD ──

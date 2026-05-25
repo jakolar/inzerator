@@ -2961,40 +2961,34 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def _api_image_edit_status(self):
         """Report whether the image-edit endpoint is configured. UI uses this
         to enable/disable the upload button and show a friendly hint when
-        the OPENAI_API_KEY or INZERATOR_API_TOKEN is missing from env."""
-        ready = bool(os.environ.get("OPENAI_API_KEY")) and bool(os.environ.get("INZERATOR_API_TOKEN"))
+        OPENAI_API_KEY is missing from env."""
+        ready = bool(os.environ.get("OPENAI_API_KEY"))
         self._send_json(200, {
             "ready": ready,
-            "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
-            "token_set": bool(os.environ.get("INZERATOR_API_TOKEN")),
+            "openai_key_set": ready,
             "prompt_loaded": bool(_IMAGE_EDIT_PROMPT),
         })
 
     def _api_image_edit(self):
-        """Edit an oblique aerial 3D mesh render via OpenAI gpt-image-1.
+        """Edit an oblique aerial 3D mesh render via OpenAI gpt-image-2.
 
         Body: multipart with `image_a` (required, target), `refs[]` (optional,
-        up to 5 imperfect reference images), `size` (auto/1024x1024/1024x1536/
-        1536x1024), `quality` (low/medium/high; default high). Prompt is held
-        server-side in `_IMAGE_EDIT_PROMPT` — clients can't override it.
+        up to 5 imperfect reference images), `size` (auto / WxH where both
+        dims are multiples of 16 and longest edge ≤ 3840), `quality`
+        (low/medium/high; default high). Prompt is held server-side in
+        `_IMAGE_EDIT_PROMPT` — clients can't override it.
 
-        Auth: `X-Inzerator-Token` header must match `INZERATOR_API_TOKEN` env.
-        Without the env set, the endpoint is disabled (returns 503) to avoid
-        accidentally exposing the OpenAI key on an open LAN.
+        Auth: none. The endpoint is open to anyone who can reach the server.
+        Set INZERATOR_API_TOKEN env + re-enable the header check below if
+        you ever expose this beyond a trusted LAN — otherwise random clients
+        in the network can spend your OPENAI_API_KEY credit.
 
         Result: PNG bytes of the edited image. Also writes input + output +
         metadata to `cache/image_edit/<timestamp>/` for audit and rerun.
         """
         api_key = os.environ.get("OPENAI_API_KEY")
-        token = os.environ.get("INZERATOR_API_TOKEN")
         if not api_key:
             self._send_json(503, {"error": "OPENAI_API_KEY not set on server"})
-            return
-        if not token:
-            self._send_json(503, {"error": "INZERATOR_API_TOKEN not set; endpoint disabled"})
-            return
-        if self.headers.get("X-Inzerator-Token") != token:
-            self._send_json(401, {"error": "invalid or missing X-Inzerator-Token"})
             return
 
         # Parse multipart. cgi.FieldStorage is deprecated in 3.13 but still
@@ -3044,9 +3038,26 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
         size = fs.getvalue("size", "auto")
         quality = fs.getvalue("quality", "high")
-        if size not in ("auto", "1024x1024", "1024x1536", "1536x1024"):
-            self._send_json(400, {"error": f"invalid size: {size}"})
-            return
+        # gpt-image-2 accepts flexible sizes: both dimensions multiples of 16,
+        # longest edge ≤ 3840, minimum total pixel budget (≈512²). We let the
+        # OpenAI API do the final validation but pre-check the obvious shape
+        # to fail fast with a clearer message.
+        if size != "auto":
+            import re
+            m = re.match(r"^(\d{3,4})x(\d{3,4})$", size)
+            if not m:
+                self._send_json(400, {"error": f"size must be 'auto' or WIDTHxHEIGHT (e.g. 2048x2048), got {size!r}"})
+                return
+            w, h = int(m.group(1)), int(m.group(2))
+            if w % 16 or h % 16:
+                self._send_json(400, {"error": f"size {size}: both dimensions must be divisible by 16"})
+                return
+            if max(w, h) > 3840:
+                self._send_json(400, {"error": f"size {size}: longest edge must be ≤ 3840 for gpt-image-2"})
+                return
+            if w < 512 or h < 512:
+                self._send_json(400, {"error": f"size {size}: each dimension must be ≥ 512"})
+                return
         if quality not in ("low", "medium", "high", "auto"):
             self._send_json(400, {"error": f"invalid quality: {quality}"})
             return
@@ -3066,12 +3077,18 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             parts.append(content)
             parts.append(b'\r\n')
 
-        add_field("model", "gpt-image-1")
+        # gpt-image-2 (released 2026-04-21) — flexible sizes up to 3840 px on
+        # the longest edge (vs gpt-image-1's 1536 max). Same prompt format,
+        # same /v1/images/edits endpoint. Older gpt-image-1 still works if
+        # you swap the model id back.
+        add_field("model", "gpt-image-2")
         add_field("prompt", _IMAGE_EDIT_PROMPT)
         add_field("size", size)
         add_field("quality", quality)
-        # gpt-image-1 returns b64_json by default for /edits; explicit for clarity.
-        add_field("response_format", "b64_json")
+        # gpt-image-2 always returns b64_json on /edits (the parameter was
+        # removed entirely — passing it now triggers 'Unknown parameter:
+        # response_format'). For gpt-image-1 it was explicit; for v2 the
+        # default is the only option.
         # First image is the target. Subsequent images are references.
         # gpt-image-1 accepts `image[]` array form.
         add_file("image[]", "image_a.png", image_a_bytes)

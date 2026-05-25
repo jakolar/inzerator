@@ -490,6 +490,13 @@ function makeHeightTexture(data, n) {
 const GEO_SUBDIVS = 1024;
 const sharedGeo = new THREE.PlaneGeometry(1, 1, GEO_SUBDIVS, GEO_SUBDIVS);
 sharedGeo.rotateX(-Math.PI / 2);
+// Drop the auto-generated normal attribute (-12 MB JS heap, -12 MB GPU
+// upload). Our fragment shader reconstructs the normal per-pixel from
+// heightmap gradients (`sampleNormal()` — 4 texture taps), so the
+// per-vertex normal Three.js generates is never read. If you ever swap
+// in a material that DOES read `attribute vec3 normal` (e.g. MeshStandard
+// for PBR), regenerate it via sharedGeo.computeVertexNormals() first.
+sharedGeo.deleteAttribute('normal');
 
 // Surface the load failure in the UI rather than hanging at "načítám…".
 function fatalLoadError(msg) {

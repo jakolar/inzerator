@@ -542,6 +542,11 @@ def _fetch_parcels_area(gcx, gcy, radius):
         }
         raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(params), timeout=60))
         feats = raw.get("features", [])
+        # Empty page = we can't advance the offset; treat as terminal even
+        # when the server claims exceededTransferLimit (rare ČÚZK quirk —
+        # without this guard offset += 0 → infinite identical query).
+        if not feats:
+            break
         raw_features.extend(feats)
         # exceededTransferLimit signals "there are more pages"; absence means
         # we got the tail. Some ArcGIS servers omit this field on the final
@@ -550,6 +555,11 @@ def _fetch_parcels_area(gcx, gcy, radius):
         if not more:
             break
         offset += len(feats)
+        # Hard safety cap: even densely zoned villages stay under ~10k
+        # parcels for our largest closeup ring; 50k means the loop has lost
+        # the plot. Better to truncate than spin.
+        if offset > 50000:
+            break
 
     # Open every cached DSM TIFF once; per-vertex sample picks the right one.
     tifs = []
@@ -1689,11 +1699,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         timeout=60,
                     ))
                     feats = raw.get("features", [])
+                    # Same guard as _fetch_parcels_area — empty page with
+                    # exceededTransferLimit=true would loop forever otherwise.
+                    if not feats:
+                        break
                     raw_features.extend(feats)
                     more = raw.get("exceededTransferLimit") or len(feats) >= page_size
                     if not more:
                         break
                     offset += len(feats)
+                    if offset > 50000:
+                        break
             except Exception as e:
                 self.send_error(502, f"RÚIAN query failed: {e}")
                 return

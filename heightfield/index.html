@@ -83,6 +83,7 @@
       <button class="oq" data-tier="mid"   style="padding:2px 6px;font-size:11px;cursor:pointer;">Mid</button>
       <button class="oq" data-tier="high"  style="padding:2px 6px;font-size:11px;cursor:pointer;">High</button>
       <button class="oq" data-tier="ultra" style="padding:2px 6px;font-size:11px;cursor:pointer;">Ultra</button>
+      <button class="oq" data-tier="super" style="padding:2px 6px;font-size:11px;cursor:pointer;">Super</button>
     </span>
     <span id="ortho-quality-status" style="font-size:10px;color:#888;margin-left:4px;"></span>
   </div>
@@ -906,16 +907,24 @@ async function ensureHeightDataLoaded() {
     if (d.heightData) continue;
     if (!d.heightLoadPromise) {
       d.heightLoadPromise = (async () => {
+        const startEpoch = _epoch;
         const info = d.heightLoadInfo;
         const t0 = performance.now();
         const res = await loadHeightmapData(info.url, info.fmt, info.size, info.y_min, info.y_max);
+        // Bailed: dispose ran while LERC was decoding. Don't write into
+        // the cleared ringData — caller will retrigger if still needed.
+        if (startEpoch !== _epoch) return;
         const f32 = res.data;
         // Quantize to Uint16 spanning [y_min, y_max]. We keep y_min/y_scale
         // on the ringData entry so sampleAt can decode without per-ring
         // lookup overhead.
         const y_min = info.y_min;
-        const y_scale = (info.y_max - info.y_min) / 65535;
-        const inv = 1 / y_scale;
+        const range = info.y_max - info.y_min;
+        // Degenerate flat ring (range==0) — e.g. corrupt manifest, ocean
+        // test fixture, or accidentally-uniform terrain — would divide by
+        // zero and NaN the parcel raycast. Pin to "every sample = y_min".
+        const y_scale = range > 1e-6 ? range / 65535 : 0;
+        const inv = y_scale > 0 ? 1 / y_scale : 0;
         const u16 = new Uint16Array(f32.length);
         for (let i = 0; i < f32.length; i++) {
           const v = Math.round((f32[i] - y_min) * inv);
@@ -924,8 +933,11 @@ async function ensureHeightDataLoaded() {
         d.heightData = u16;
         d.y_scale = y_scale;
         // f32 is now eligible for GC.
+        const precisionLabel = y_scale > 0
+          ? `±${(y_scale/2*1000).toFixed(1)} mm precision`
+          : `flat (range=0)`;
         console.info(`[ring ${r.slug}] heightData re-loaded in ${(performance.now()-t0).toFixed(0)} ms ` +
-          `(Uint16, ${(u16.byteLength/1048576).toFixed(1)} MB, ±${(y_scale/2*1000).toFixed(1)} mm precision)`);
+          `(Uint16, ${(u16.byteLength/1048576).toFixed(1)} MB, ${precisionLabel})`);
       })();
     }
     promises.push(d.heightLoadPromise);
@@ -958,11 +970,15 @@ bareToggle.parentElement.appendChild(bareStatus);
 async function ensureBareLoaded() {
   if (Object.keys(bareLoadedTex).length === rings.length) return;
   if (bareLoadInFlight) return bareLoadInFlight;
+  const startEpoch = _epoch;
   bareLoadInFlight = Promise.all(rings.map(async (r, i) => {
     if (bareLoadedTex[r.slug]) return;
     const info = bareLoadInfo[i];
     if (!info) return;   // no bare file for this ring
     const res = await loadHeightmapData(info.url, info.fmt, info.size, info.y_min, info.y_max);
+    // Bailed mid-flight: dispose cleared bareLoadedTex + nulled uHeightBare.
+    // Drop the just-decoded texture rather than writing into stale state.
+    if (startEpoch !== _epoch) { return; }
     const tex = makeHeightTexture(res.data, res.n);
     bareLoadedTex[r.slug] = tex;
     ringMeshes[i].material.uniforms.uHeightBare.value = tex;
@@ -1260,34 +1276,47 @@ const initialOrthoTex = {};     // slug → THREE.Texture (snapshot at first tog
 const osmToggle = document.getElementById('osm-toggle');
 osmToggle.addEventListener('change', async () => {
   if (osmToggle.checked) {
+    // try/finally ensures `disabled` flips back even if /proxy/osm fails
+    // mid-fetch — without this the toggle gets stuck and user can't
+    // re-click to turn it off.
     osmToggle.disabled = true;
-    for (let i = 0; i < rings.length; i++) {
-      const r = rings[i];
-      if (!initialOrthoTex[r.slug]) {
-        initialOrthoTex[r.slug] = ringMeshes[i].material.uniforms.uOrtho.value;
+    try {
+      for (let i = 0; i < rings.length; i++) {
+        const r = rings[i];
+        if (!initialOrthoTex[r.slug]) {
+          initialOrthoTex[r.slug] = ringMeshes[i].material.uniforms.uOrtho.value;
+        }
+        if (!osmTextures[r.slug]) {
+          const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
+          const url = `/proxy/osm?BBOX=${bbox}&size=4096`;
+          const tex = await loadTex(url);
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+          tex.flipY = false;
+          osmTextures[r.slug] = tex;
+        }
+        const mat = ringMeshes[i].material;
+        mat.uniforms.uOrtho.value = osmTextures[r.slug];
+        mat.uniforms.uOrthoFlipY.value = osmTextures[r.slug].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
       }
-      if (!osmTextures[r.slug]) {
-        const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
-        const url = `/proxy/osm?BBOX=${bbox}&size=4096`;
-        const tex = await loadTex(url);
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-        tex.flipY = false;
-        osmTextures[r.slug] = tex;
-      }
-      const mat = ringMeshes[i].material;
-      mat.uniforms.uOrtho.value = osmTextures[r.slug];
-      mat.uniforms.uOrthoFlipY.value = osmTextures[r.slug].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
+    } catch (e) {
+      console.error('[osm] load failed:', e);
+      // Uncheck since we didn't fully swap; user sees the failure and can retry.
+      osmToggle.checked = false;
+    } finally {
+      osmToggle.disabled = false;
     }
-    osmToggle.disabled = false;
   } else {
     for (let i = 0; i < rings.length; i++) {
       const r = rings[i];
-      if (initialOrthoTex[r.slug]) {
-        const mat = ringMeshes[i].material;
-        mat.uniforms.uOrtho.value = initialOrthoTex[r.slug];
-        mat.uniforms.uOrthoFlipY.value = initialOrthoTex[r.slug].isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
-      }
+      const tex = initialOrthoTex[r.slug];
+      // Skip stale references — after Page Visibility unload the original
+      // texture was disposed; fall back to whatever the current orthoTier
+      // points at.
+      if (!tex || tex.image === undefined) continue;
+      const mat = ringMeshes[i].material;
+      mat.uniforms.uOrtho.value = tex;
+      mat.uniforms.uOrthoFlipY.value = tex.isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
     }
   }
 });
@@ -1700,6 +1729,7 @@ async function loadCadastreKtx2Tex(url) {
 
 async function ensureCadastre() {
   if (Object.keys(cadTextures).length === rings.length) return;
+  const startEpoch = _epoch;
   cadStatus.textContent = 'načítám katastr…';
   for (const r of rings) {
     if (cadTextures[r.slug]) continue;
@@ -1716,6 +1746,9 @@ async function ensureCadastre() {
         const bbox = [cx - r.half, cy - r.half, cx + r.half, cy + r.half].join(',');
         tex = await loadCadastreAlphaTex(`/proxy/cadastre?BBOX=${bbox}&layer=KN&size=4096`);
       }
+      // Bailed mid-flight: dispose ran. Throw the just-decoded texture
+      // away so it doesn't leak into cleared caches.
+      if (startEpoch !== _epoch) { tex.dispose(); return; }
       cadTextures[r.slug] = tex;
     } catch (e) {
       cadStatus.textContent = `chyba: ${e.message}`;
@@ -1830,6 +1863,7 @@ function buildVectorCadastreForRing(r, parcels, buildings) {
 
 async function ensureVectorCadastre() {
   if (cadVectorPromise) return cadVectorPromise;
+  const startEpoch = _epoch;
   cadStatus.textContent = 'načítám vektorový katastr…';
   cadVectorPromise = (async () => {
     const t0 = performance.now();
@@ -1846,13 +1880,16 @@ async function ensureVectorCadastre() {
       const [parcels, buildings] = await Promise.all([
         parcelsResp.json(), buildingsResp.json()
       ]);
+      // Bailed mid-flight: dispose ran while we were fetching. Don't
+      // populate the cleared caches — drop the parsed data on the floor.
+      if (startEpoch !== _epoch) return;
       const tParsed = performance.now();
       parcelsBySlug[r.slug] = parcels;
       const node = buildVectorCadastreForRing(r, parcels, buildings);
       const tBuilt = performance.now();
       for (const line of node.lines) cadVectorGroup.add(line);
       cadVectorRingNodes[r.slug] = node;
-      for (const p of parcels) parcelsById?.set?.(p.id, p);
+      for (const p of parcels) parcelsById.set(p.id, p);
       totalSegs += node.segCount;
       console.info(`[cad ${r.slug}] fetch+parse ${(tParsed-tFetch).toFixed(0)} ms, ` +
         `build ${(tBuilt-tParsed).toFixed(0)} ms, ` +
@@ -2124,6 +2161,12 @@ let _hiddenAt = null;
 let _unloadTimer = null;
 let _unloaded = false;
 let _savedToggleState = null;
+// Bumped on every disposeAllAssets() — in-flight async loaders capture the
+// current epoch at start and bail before writing if it changed mid-flight.
+// Without this, a load triggered before unload would happily push into
+// just-cleared caches (cadVectorRingNodes, ringData.heightData, cadTextures),
+// causing zombie state that reloadAllAssets then double-builds.
+let _epoch = 0;
 
 async function disposeAllAssets() {
   // Snapshot toggle state so reloadAllAssets can restore the user's view.
@@ -2153,6 +2196,10 @@ async function disposeAllAssets() {
   for (const tex of Object.values(cadTextures)) tex.dispose();
   for (const k of Object.keys(cadTextures)) delete cadTextures[k];
   for (const slug in bareLoadedTex) { bareLoadedTex[slug]?.dispose(); delete bareLoadedTex[slug]; }
+  // OSM textures + the "what was the ortho before OSM" snapshot — both
+  // hold references that point at GPU-side resources cleared in this fn.
+  for (const slug in osmTextures) { osmTextures[slug]?.dispose(); delete osmTextures[slug]; }
+  for (const slug in initialOrthoTex) delete initialOrthoTex[slug];
   // Shadow render targets.
   for (const rt of Object.values(shadowMaps)) rt.dispose?.();
   for (const k of Object.keys(shadowMaps)) delete shadowMaps[k];
@@ -2179,7 +2226,10 @@ async function disposeAllAssets() {
   }
   // Don't dispose _parcelLineMat / _emissiveMat — singleton materials,
   // cheap to keep. Composer RTs likewise stay (they re-clear naturally).
-  console.info(`[unload] disposed (hidden ${((Date.now() - _hiddenAt)/1000).toFixed(0)}s)`);
+  // Bump epoch LAST so any in-flight loader notices on its next await
+  // boundary and bails before writing into the just-cleared caches.
+  _epoch++;
+  console.info(`[unload] disposed (hidden ${((Date.now() - _hiddenAt)/1000).toFixed(0)}s, epoch=${_epoch})`);
 }
 
 async function reloadAllAssets() {

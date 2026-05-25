@@ -1,0 +1,164 @@
+Edit Image A only.
+
+Image A is the target image: an oblique aerial 3D mesh render with orthophoto texture.
+
+Optional reference images may be provided. If present, use them only as imperfect visual references of the same location. They may show the area from different angles or as top-down orthophotos. They are not ground truth and may contain their own errors.
+
+Do not edit, transform, copy, merge, or recreate any reference image. Do not copy pixels, textures, defects, lighting, geometry, labels, overlays, or camera angle from reference images. Do not create a composite. Do not replace Image A. Do not make Image A top-down.
+
+Image A controls the final camera angle, perspective, scale, lighting, shadows, season, color temperature, resolution, and orthophoto/GIS-derived style.
+
+Goal:
+Make Image A more readable, realistic, sharp, and suitable for professional real-estate / property presentation while preserving the original orthophoto-derived 3D mesh character.
+
+The result should look like a professionally corrected real aerial/mesh capture, not like a generated illustration, glossy drone photo, cinematic render, or overly smoothed real-estate visualization.
+
+Core principle:
+Improve only what is clearly an artifact. Preserve everything that looks like real-world detail.
+
+Repair obvious 3D mesh / orthophoto projection artifacts:
+- stretched facade textures,
+- pulled-down roof or ground pixels,
+- vertical smears,
+- melted buildings,
+- jagged wall fragments,
+- broken roof edges,
+- saw-tooth mesh scars,
+- curtain-like tree streaks,
+- compression blocks,
+- impossible duplicated patterns.
+
+Do not over-clean the image. Mild mesh imperfections are acceptable and should remain if they help preserve the GIS/orthophoto credibility.
+
+Realism and sharpness priority:
+Preserve natural photographic sharpness, local contrast, and small real-world texture. Preserve the target image geometry and parcel overlay exactly. Do not improve visual quality by inventing new detail.
+
+Keep visible real details wherever plausible:
+- roof tiles, seams, ridges, chimneys, skylights, solar panels,
+- stains, moss, dirt, discoloration, patchwork repairs,
+- field tracks, crop lines, tractor marks,
+- garden boundaries, yards, fences, paths, gravel, cars, small structures,
+- road texture, pavement edges, shadows, vegetation variation.
+
+Do not smooth, blur, average, repaint, simplify, or airbrush real-looking detail.
+
+When unsure whether something is real detail or artifact, preserve it.
+
+The image should remain crisp enough to feel like real orthophoto data. Improve readability without sterilizing the scene.
+
+Color and presentation:
+Apply only subtle real-estate presentation correction:
+- slightly improve faded or washed-out colors,
+- gently restore local contrast,
+- improve separation between roofs, roads, grass, fields, soil, and water,
+- make the image feel a little clearer and fresher,
+- keep shadows natural and coherent,
+- keep colors believable for orthophoto/GIS imagery.
+
+Do not create HDR.
+Do not make grass neon green.
+Do not make roofs artificially bright or clean.
+Do not apply cinematic grading.
+Do not change season, weather, time of day, sun direction, or material identity.
+
+Buildings:
+Preserve building positions, footprints, height impression, roof shapes, roof slopes, ridge directions, orientations, and color impressions.
+
+Where buildings are damaged by mesh artifacts, separate roof and facade more clearly.
+
+Roofs should remain textured, detailed, and orthophoto-realistic. Do not turn roofs into flat painted planes.
+
+Facades should be calm, coherent, low-detail wall planes. Remove only clearly dragged roof, road, garden, tree, water, shadow, or ground texture from facades.
+
+Do not interpret stretched pixels as real architectural details.
+Do not add windows, doors, balconies, signs, cladding, ornaments, or facade decorations.
+
+For severely damaged buildings:
+- restore only simple plausible roof/facade separation,
+- keep roof above and facade below,
+- preserve footprint, height, orientation, perspective, lighting, roof color impression, and facade color impression,
+- keep the repair low-detail and imperfect, consistent with GIS mesh data.
+
+Vegetation:
+Preserve vegetation position, size, height, group shape, boundaries, and color impression.
+
+Reduce only the worst vertical tree curtain artifacts. Do not replace vegetation with clean generated trees. Tall trees must remain tall. Do not flatten them into bushes.
+
+Fields, roads, gardens, and yards:
+Preserve field lines, crop texture, garden clutter, paths, fences, cars, small structures, and yard surfaces.
+
+Do not make lawns uniformly smooth.
+Do not simplify gardens.
+Do not erase agricultural texture.
+Do not repaint roads or fields.
+
+Water:
+Preserve water shape, shoreline, brightness, and color impression. Repair only obvious texture stretching or mesh artifacts. Do not make water cinematic, glossy, cleaner, more reflective, or more saturated.
+
+Parcel / GIS overlay:
+If a glowing parcel outline or GIS overlay is already visible in Image A, preserve it exactly as a clean product overlay.
+
+Do not move, blur, deform, delete, redraw, brighten, dim, or convert it into physical light.
+
+If no parcel outline is visible in Image A, do not add one.
+
+Preserve:
+- original oblique viewpoint,
+- camera angle,
+- spatial accuracy,
+- building footprints,
+- roads, paths, fields, gardens, vegetation layout, water boundaries,
+- parcel boundaries and visible GIS overlays,
+- orthophoto-derived low-resolution texture,
+- realistic small imperfections.
+
+Negative constraints:
+No new objects.
+No removed objects.
+No new or removed buildings.
+No changed footprints.
+No changed roads, fields, gardens, vegetation layout, water boundary, or parcel boundary.
+No added GIS overlay.
+No added text, labels, symbols, people, cars, fences, signs, or decorative details.
+No cinematic lighting.
+No HDR.
+No excessive saturation.
+No glossy real-estate render look.
+No waxy smoothing.
+No AI-polished surfaces.
+No painterly roofs.
+No plastic lawns.
+No airbrushed fields.
+No blurred crop texture.
+No erased roof detail.
+No erased field tracks.
+No simplified gardens.
+No uniform painted roof planes.
+No generic generated village appearance.
+No loss of orthophoto sharpness.
+No over-sharpening halos.
+No depth-of-field blur.
+No different season, weather, time of day, or sun direction.
+
+Avoid:
+- long vertical smear bands,
+- pulled-down roof texture on walls,
+- dragged ground, road, tree, water, or shadow texture on facades,
+- patchwork facades,
+- random color blocks,
+- jagged facade teeth,
+- serrated wall fragments,
+- triangular mesh scars,
+- saw-tooth roof ridges,
+- curtain-like tree streaks,
+- missing vegetation ground contact,
+- over-smoothed roofs,
+- erased roof tiles,
+- overly clean generated-looking surfaces.
+
+Final visual target:
+A professionally edited but still realistic oblique GIS/3D mesh property visualization suitable for real-estate listing websites and property promotion.
+
+It should be clearer, sharper, slightly fresher, and more readable, while preserving the raw realism of orthophoto data: small imperfections, roof texture, field lines, garden clutter, road texture, vegetation variation, and cadastral/GIS credibility.
+
+The result should be more presentable than the source, but not smoother, cleaner, or more artificial than the source.

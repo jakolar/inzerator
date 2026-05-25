@@ -32,6 +32,18 @@ _CUZK_SEM = threading.Semaphore(6)
 # multiple regions are fetched concurrently.
 _OSM_SEM = threading.Semaphore(2)
 
+# Prompt for /api/image-edit. Kept server-side so clients can't override the
+# system instruction (which is tuned for orthophoto-derived 3D mesh repair).
+# The full text lives in image_edit_prompt.txt — single source of truth that
+# both the server reads and the UI can preview read-only.
+_IMAGE_EDIT_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "image_edit_prompt.txt")
+try:
+    with open(_IMAGE_EDIT_PROMPT_PATH, "r", encoding="utf-8") as _f:
+        _IMAGE_EDIT_PROMPT = _f.read().strip()
+except OSError:
+    _IMAGE_EDIT_PROMPT = ""
+
 # In-memory LRU cache for fetched ČÚZK subtiles — once fetched, never refetch.
 # Bounded to ~2000 entries (≈500 MB if every tile full PNG; real avg much less).
 _CUZK_CACHE = {}
@@ -1637,6 +1649,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._proxy_osm()
         elif self.path.startswith("/api/sjtsk-to-wgs?"):
             self._api_sjtsk_to_wgs()
+        elif self.path == "/api/image-edit/prompt":
+            self._api_image_edit_prompt()
+        elif self.path == "/api/image-edit/status":
+            self._api_image_edit_status()
         elif self.path.startswith("/api/buildings?"):
             self._api_buildings()
         elif self.path.startswith("/api/parcel-at-point?"):
@@ -2927,6 +2943,201 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self._send_json(200, {"lat": lat, "lon": lon})
 
     # ------------------------------------------------------------------
+    # POST /api/image-edit — OpenAI gpt-image-1 proxy
+    # ------------------------------------------------------------------
+
+    def _api_image_edit_prompt(self):
+        """Return the server-side prompt as plain text so the UI can show it
+        read-only. The endpoint is intentionally unauthenticated — the prompt
+        itself isn't a secret, only the OpenAI key is."""
+        body = _IMAGE_EDIT_PROMPT.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _api_image_edit_status(self):
+        """Report whether the image-edit endpoint is configured. UI uses this
+        to enable/disable the upload button and show a friendly hint when
+        the OPENAI_API_KEY or INZERATOR_API_TOKEN is missing from env."""
+        ready = bool(os.environ.get("OPENAI_API_KEY")) and bool(os.environ.get("INZERATOR_API_TOKEN"))
+        self._send_json(200, {
+            "ready": ready,
+            "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
+            "token_set": bool(os.environ.get("INZERATOR_API_TOKEN")),
+            "prompt_loaded": bool(_IMAGE_EDIT_PROMPT),
+        })
+
+    def _api_image_edit(self):
+        """Edit an oblique aerial 3D mesh render via OpenAI gpt-image-1.
+
+        Body: multipart with `image_a` (required, target), `refs[]` (optional,
+        up to 5 imperfect reference images), `size` (auto/1024x1024/1024x1536/
+        1536x1024), `quality` (low/medium/high; default high). Prompt is held
+        server-side in `_IMAGE_EDIT_PROMPT` — clients can't override it.
+
+        Auth: `X-Inzerator-Token` header must match `INZERATOR_API_TOKEN` env.
+        Without the env set, the endpoint is disabled (returns 503) to avoid
+        accidentally exposing the OpenAI key on an open LAN.
+
+        Result: PNG bytes of the edited image. Also writes input + output +
+        metadata to `cache/image_edit/<timestamp>/` for audit and rerun.
+        """
+        api_key = os.environ.get("OPENAI_API_KEY")
+        token = os.environ.get("INZERATOR_API_TOKEN")
+        if not api_key:
+            self._send_json(503, {"error": "OPENAI_API_KEY not set on server"})
+            return
+        if not token:
+            self._send_json(503, {"error": "INZERATOR_API_TOKEN not set; endpoint disabled"})
+            return
+        if self.headers.get("X-Inzerator-Token") != token:
+            self._send_json(401, {"error": "invalid or missing X-Inzerator-Token"})
+            return
+
+        # Parse multipart. cgi.FieldStorage is deprecated in 3.13 but still
+        # ships, and works for our modest payload (single image_a + a few
+        # refs, ~5-20 MB total). Switch to email.parser-based parsing if it
+        # ever gets removed.
+        import cgi
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self._send_json(400, {"error": "expected multipart/form-data"})
+            return
+        try:
+            fs = cgi.FieldStorage(
+                fp=self.rfile, headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+                keep_blank_values=True,
+            )
+        except Exception as e:
+            self._send_json(400, {"error": f"multipart parse failed: {e}"})
+            return
+
+        if "image_a" not in fs:
+            self._send_json(400, {"error": "field image_a is required"})
+            return
+        image_a = fs["image_a"]
+        if not getattr(image_a, "file", None):
+            self._send_json(400, {"error": "image_a must be a file upload"})
+            return
+        image_a_bytes = image_a.file.read()
+        if not image_a_bytes:
+            self._send_json(400, {"error": "image_a is empty"})
+            return
+
+        # Optional references — accept either `refs` (single) or `refs[]`
+        # (browser convention); cgi exposes them as a list.
+        refs = []
+        ref_field = fs["refs"] if "refs" in fs else None
+        if ref_field is not None:
+            ref_items = ref_field if isinstance(ref_field, list) else [ref_field]
+            for r in ref_items:
+                if getattr(r, "file", None):
+                    rb = r.file.read()
+                    if rb:
+                        refs.append(rb)
+                if len(refs) >= 5:
+                    break
+
+        size = fs.getvalue("size", "auto")
+        quality = fs.getvalue("quality", "high")
+        if size not in ("auto", "1024x1024", "1024x1536", "1536x1024"):
+            self._send_json(400, {"error": f"invalid size: {size}"})
+            return
+        if quality not in ("low", "medium", "high", "auto"):
+            self._send_json(400, {"error": f"invalid quality: {quality}"})
+            return
+
+        # Build multipart for OpenAI.
+        import uuid, mimetypes
+        boundary = f"----InzeratorBoundary{uuid.uuid4().hex}"
+        parts = []
+        def add_field(name, value):
+            parts.append(f'--{boundary}\r\n'
+                         f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                         f'{value}\r\n'.encode())
+        def add_file(name, filename, content, ctype="image/png"):
+            parts.append(f'--{boundary}\r\n'
+                         f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                         f'Content-Type: {ctype}\r\n\r\n'.encode())
+            parts.append(content)
+            parts.append(b'\r\n')
+
+        add_field("model", "gpt-image-1")
+        add_field("prompt", _IMAGE_EDIT_PROMPT)
+        add_field("size", size)
+        add_field("quality", quality)
+        # gpt-image-1 returns b64_json by default for /edits; explicit for clarity.
+        add_field("response_format", "b64_json")
+        # First image is the target. Subsequent images are references.
+        # gpt-image-1 accepts `image[]` array form.
+        add_file("image[]", "image_a.png", image_a_bytes)
+        for i, rb in enumerate(refs):
+            add_file("image[]", f"ref_{i}.png", rb)
+        parts.append(f'--{boundary}--\r\n'.encode())
+        body = b"".join(parts)
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/images/edits",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        # gpt-image-1 high quality takes 20-60 s. Timeout 180 leaves headroom.
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                resp_body = resp.read()
+        except urllib.error.HTTPError as e:
+            import sys as _sys
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+            print(f"[image-edit] OpenAI {e.code}: {err_body}", file=_sys.stderr)
+            self._send_json(e.code, {"error": f"OpenAI {e.code}", "details": err_body})
+            return
+        except (urllib.error.URLError, TimeoutError) as e:
+            self._send_json(504, {"error": f"OpenAI request failed: {e}"})
+            return
+
+        # Decode b64 PNG from response.
+        try:
+            payload = json.loads(resp_body)
+            import base64
+            out_png = base64.b64decode(payload["data"][0]["b64_json"])
+        except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+            self._send_json(502, {"error": f"OpenAI response unparseable: {e}"})
+            return
+
+        # Persist for audit. Atomic write via tmp.
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+        run_dir = Path("cache/image_edit") / ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "image_a.png").write_bytes(image_a_bytes)
+        for i, rb in enumerate(refs):
+            (run_dir / f"ref_{i}.png").write_bytes(rb)
+        (run_dir / "output.png").write_bytes(out_png)
+        (run_dir / "meta.json").write_text(json.dumps({
+            "ts": ts, "size": size, "quality": quality,
+            "image_a_bytes": len(image_a_bytes),
+            "ref_count": len(refs),
+            "output_bytes": len(out_png),
+        }, indent=2))
+        print(f"[image-edit] {ts}: {len(refs)} ref(s), {len(image_a_bytes)} in, {len(out_png)} out")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(out_png)))
+        self.send_header("X-Run-Id", ts)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(out_png)
+
+    # ------------------------------------------------------------------
     # Helpers shared by GET and POST handlers
     # ------------------------------------------------------------------
 
@@ -2960,6 +3171,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self._handle_post_jobs_retry(path[len("/api/jobs/"):-len("/retry")])
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 self._handle_post_jobs_cancel(path[len("/api/jobs/"):-len("/cancel")])
+            elif path == "/api/image-edit":
+                self._api_image_edit()
             else:
                 self.send_error(404, "POST endpoint not found")
         except json.JSONDecodeError:

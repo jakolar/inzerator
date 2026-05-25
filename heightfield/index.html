@@ -1319,6 +1319,9 @@ osmToggle.addEventListener('change', async () => {
       mat.uniforms.uOrthoFlipY.value = tex.isCompressedTexture ? (_KTX2_FLIP & 1) : 0.0;
     }
   }
+  // Repaint any active parcel outline so colour + bloom match the new
+  // basemap (black/no-glow on OSM, HDR white/glow on orthophoto).
+  if (selectedParcels.size > 0) redrawOutlines();
 });
 
 // ── Parcel selection (for screenshots) ──
@@ -1406,13 +1409,16 @@ function redrawOutlines() {
   }
   if (!_parcelLineMat) {
     // Pixel-space line width (worldUnits: false) keeps the outline equally
-    // legible whether the camera is 50 m or 2 km away — earlier TubeGeometry
-    // path was world-space (radius 0.15 m) and dropped below sub-pixel at
-    // typical regional view distances. HDR colour 1.6 still drives the
-    // bloom halo; depthWrite=false kills self-z-fight twinkle.
+    // legible whether the camera is 50 m or 2 km away. Colour + glow are
+    // swapped per-frame based on which basemap is active (see updates
+    // below) — black + no bloom over OSM (light background), HDR white +
+    // bloom over orthophoto (mixed dark/light, glow makes it pop).
     _parcelLineMat = new LineMaterial({
       color: new THREE.Color(1.15, 1.15, 1.15),
-      linewidth: 0.6,         // pixels
+      // 1.0 px (was 0.6) — at oblique view + great distance the 0.6
+      // sub-pixel rendering let parts of the line drop below the
+      // rasterizer's coverage threshold, making the outline look dashed.
+      linewidth: 1.0,
       worldUnits: false,
       toneMapped: false,
       depthTest: true,
@@ -1423,6 +1429,19 @@ function redrawOutlines() {
     });
     _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
   }
+  // Sync style to current basemap. osmToggle.checked is the single source
+  // of truth — when OSM is on we paint black with no bloom (light OSM
+  // background); when off we paint HDR white with bloom for that classic
+  // selected-on-orthophoto look.
+  const onOsm = osmToggle?.checked === true;
+  if (onOsm) {
+    _parcelLineMat.color.setRGB(0, 0, 0);
+    _parcelLineMat.linewidth = 1.4;   // OSM is busier visually, slightly thicker
+  } else {
+    _parcelLineMat.color.setRGB(1.15, 1.15, 1.15);
+    _parcelLineMat.linewidth = 1.0;
+  }
+  _parcelLineMat.needsUpdate = true;
   // Pass 1: count edge occurrences across all selected parcels. Adjacent
   // parcels share their common boundary; the inner edges occur twice and
   // we skip them so the silhouette draws as one continuous perimeter.
@@ -1460,10 +1479,9 @@ function redrawOutlines() {
     geo.setPositions(positions);
     const line = new LineSegments2(geo, _parcelLineMat);
     line.renderOrder = 99;
-    // Bloom layer keeps default layer 0 too so the line renders in both
-    // passes — bloom-only pass picks it up for the halo, final pass draws
-    // the crisp inner core.
-    line.layers.enable(BLOOM_LAYER);
+    // Bloom only when OSM is off — over OSM the black outline reads fine
+    // on its own and a glow would just produce a grey haze.
+    if (!onOsm) line.layers.enable(BLOOM_LAYER);
     outlineGroup.add(line);
   }
   parcelsClear.style.display = selectedParcels.size ? '' : 'none';

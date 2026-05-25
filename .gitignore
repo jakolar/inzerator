@@ -36,3 +36,7 @@ tests/__pycache__/
 # Server runtime
 /tmp/
 *.log
+
+# Secrets — never commit. Use .env.example as the shareable template.
+.env
+.env.local

@@ -657,16 +657,20 @@ def main():
                         "uses its own value (closeup=0.15, inner=0.10). "
                         "Set this to force a single tolerance, e.g. 0.05 "
                         "for archival-grade or 0.30 for size-minimised.")
-    p.add_argument("--ortho-tiers", default="low,mid,high",
+    p.add_argument("--ortho-tiers", default="mid,high,ultra",
                    help="comma-separated list of ortho quality tiers to emit. "
-                        "low=1024² q75 4:2:0, mid=2048² q80 4:2:0, "
-                        "high=4096² q92 4:4:4 (max). Viewer can switch live. "
-                        "Default: low,mid,high (all three)")
-    p.add_argument("--ortho-default", default="mid",
-                   choices=["low", "mid", "high"],
+                        "low=1024², mid=2048², high=4096², ultra=8192², "
+                        "super=16384² (closest to ČÚZK source). Viewer can "
+                        "switch live. Default: mid,high,ultra (no low — "
+                        "rarely useful since ultra is the boot tier; no "
+                        "super — opt-in via refresh_ortho.py).")
+    p.add_argument("--ortho-default", default="ultra",
+                   choices=["low", "mid", "high", "ultra", "super"],
                    help="which tier becomes manifest's `ortho_file` (legacy "
-                        "key). Viewer falls back to this when no quality "
-                        "switcher is wired. Default: mid")
+                        "key) AND boots the viewer. Must be one of the tiers "
+                        "in --ortho-tiers. Default: ultra (since 2026-05-25; "
+                        "was 'mid' — bumped now that KTX2 ETC1S makes the "
+                        "32 MB GPU cost acceptable on most devices).")
     args = p.parse_args()
     if args.slug:
         cx, cy, out_dir = resolve_slug_paths(args.slug)

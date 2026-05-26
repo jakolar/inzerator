@@ -76,6 +76,10 @@
     <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
   </label>
   <button id="parcels-clear" style="display:none;margin-left:18px;font-size:11px;padding:1px 6px;cursor:pointer;">Zrušit výběr</button>
+  <label style="display:block;cursor:pointer;">
+    <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
+    <span id="poi-status" style="font-size:11px;color:#9c9;"></span>
+  </label>
   <div id="ortho-quality" style="margin-top:6px;display:none;font-size:12px;">
     Ortho kvalita:
     <span style="display:inline-flex;gap:2px;margin-left:4px;">
@@ -2072,6 +2076,7 @@ window.addEventListener('resize', () => {
   }
   if (_parcelLineMat) _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
   if (_parcelHaloMat) _parcelHaloMat.resolution.set(window.innerWidth, window.innerHeight);
+  if (_poiStickMat) _poiStickMat.resolution.set(window.innerWidth, window.innerHeight);
 });
 
 // ── Screenshot ──
@@ -2122,6 +2127,196 @@ document.addEventListener('keydown', (e) => {
       !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) {
     e.preventDefault();
     captureScreenshot();
+  }
+});
+
+// ── POI markers (real-estate "what's nearby") ──
+// Vertical stick from terrain up + 2D sprite label on top. Single fetch
+// per location (cached server-side). Icons + categories pulled from
+// /api/poi which proxies Overpass. Markers fade out when the camera is
+// too far away (anti-clutter) and when too close (to avoid blocking the
+// terrain view of the immediate area).
+const POI_ICONS = {
+  // Maps category|subtype → emoji. Subtype takes priority; falls back
+  // to category-level default.
+  'historic|castle': '🏰', 'historic|memorial': '🗿', 'historic|monument': '🗿',
+  'historic|ruins': '🪦', 'historic|archaeological_site': '🪦',
+  'tourism|viewpoint': '🔭', 'tourism|attraction': '⭐',
+  'tourism|museum': '🏛', 'tourism|hotel': '🏨', 'tourism|information': 'ℹ️',
+  'peak|peak': '⛰',
+  'amenity|school': '🏫', 'amenity|kindergarten': '🧸',
+  'amenity|pharmacy': '💊', 'amenity|doctors': '🩺', 'amenity|hospital': '🏥',
+  'amenity|post_office': '✉️', 'amenity|place_of_worship': '⛪',
+  'amenity|restaurant': '🍽', 'amenity|cafe': '☕', 'amenity|pub': '🍺',
+  'amenity|bar': '🍸', 'amenity|fast_food': '🍔', 'amenity|bank': '🏦',
+  'amenity|library': '📚', 'amenity|townhall': '🏛',
+  'amenity|police': '👮', 'amenity|fire_station': '🚒', 'amenity|fuel': '⛽',
+  'amenity|community_centre': '🎭',
+  'leisure|swimming_pool': '🏊', 'leisure|playground': '🛝',
+  'leisure|park': '🌳', 'leisure|sports_centre': '🏟', 'leisure|pitch': '⚽',
+  'leisure|fitness_centre': '💪', 'leisure|garden': '🌷',
+  'leisure|nature_reserve': '🌲',
+  'shop|supermarket': '🛒', 'shop|bakery': '🥖', 'shop|butcher': '🥩',
+  'shop|convenience': '🏪', 'shop|department_store': '🛍',
+  'transit|station': '🚉', 'transit|halt': '🚉', 'transit|tram_stop': '🚊',
+  'transit|bus_stop': '🚏',
+};
+const POI_CAT_FALLBACK = {
+  historic: '🏛', tourism: '📷', amenity: '📍', leisure: '🌳',
+  shop: '🛒', transit: '🚏', peak: '⛰', unknown: '📍',
+};
+function poiIcon(p) {
+  return POI_ICONS[`${p.category}|${p.type}`] || POI_CAT_FALLBACK[p.category] || '📍';
+}
+
+const poiToggle = document.getElementById('poi-toggle');
+const poiStatusEl = document.getElementById('poi-status');
+const poiGroup = new THREE.Group();
+poiGroup.visible = false;
+scene.add(poiGroup);
+let _poiLoaded = false;
+let _poiLoadPromise = null;
+
+function _poiSpriteCanvas(label, icon) {
+  // Render emoji + name onto an HTMLCanvas, return as CanvasTexture.
+  // System font on Mac includes Apple Color Emoji so icons render in
+  // colour without bundling a webfont.
+  const text = `${icon}  ${label}`;
+  const padding = 8;
+  // Probe text width on a tmp canvas before sizing the final one.
+  const probe = document.createElement('canvas').getContext('2d');
+  probe.font = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
+  const w = Math.ceil(probe.measureText(text).width) + padding * 2;
+  const h = 44;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.font = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
+  // Pill background
+  ctx.fillStyle = 'rgba(20, 24, 32, 0.88)';
+  const r = 12;
+  ctx.beginPath();
+  ctx.moveTo(r, 0); ctx.lineTo(w-r, 0); ctx.arcTo(w, 0, w, r, r);
+  ctx.lineTo(w, h-r); ctx.arcTo(w, h, w-r, h, r);
+  ctx.lineTo(r, h); ctx.arcTo(0, h, 0, h-r, r);
+  ctx.lineTo(0, r); ctx.arcTo(0, 0, r, 0, r);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // Text
+  ctx.fillStyle = '#fff';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, padding, h / 2 + 1);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return { tex, w, h };
+}
+
+function buildPoiMarker(p) {
+  // Find terrain Y. Out-of-ring POIs skip rendering. heightData may be
+  // null at startup (lazy load); fall back to 0 so the marker still
+  // appears at the right XZ but at sea level. Once ensureHeightData
+  // runs the marker is rebuilt on next toggle.
+  const lx = p.coords[0], lz = p.coords[1];
+  let yAbs = sampleAt(lx, lz);
+  if (yAbs == null) yAbs = (globalYmin + globalYmax) / 2;
+  const baseY = yAbs - yMid;
+  // Stick height: tall enough to clear buildings + tree canopy + give
+  // visible separation from terrain. Czech rural buildings are ~8-15 m,
+  // trees ~15-25 m, so 70 m sits clearly above with room to read labels
+  // even at oblique view angles. Sprite scale tracks the stick — bigger
+  // labels for the new viewing distance.
+  const STICK_H = 70;            // metres above terrain
+  const SPRITE_SCALE = 48;       // world-units (height of label sprite)
+
+  const group = new THREE.Group();
+  group.position.set(lx, baseY, lz);
+
+  // Thin vertical stick: line from base to top
+  const stickPos = new Float32Array([0, 0, 0, 0, STICK_H, 0]);
+  const stickGeo = new LineSegmentsGeometry();
+  stickGeo.setPositions(stickPos);
+  if (!_poiStickMat) {
+    _poiStickMat = new LineMaterial({
+      color: 0xffffff, linewidth: 1.5, worldUnits: false, toneMapped: false,
+      depthTest: false, transparent: true, opacity: 0.85,
+    });
+    _poiStickMat.resolution.set(window.innerWidth, window.innerHeight);
+  }
+  const stick = new LineSegments2(stickGeo, _poiStickMat);
+  stick.renderOrder = 100;
+  group.add(stick);
+
+  // Label sprite on top
+  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p));
+  const mat = new THREE.SpriteMaterial({
+    map: tex, depthTest: false, transparent: true, toneMapped: false,
+  });
+  const sprite = new THREE.Sprite(mat);
+  // Scale: keep aspect ratio, world-units height ≈ SPRITE_SCALE
+  sprite.scale.set(SPRITE_SCALE * (w / h), SPRITE_SCALE, 1);
+  sprite.position.y = STICK_H + SPRITE_SCALE / 2 + 1;
+  sprite.renderOrder = 101;
+  group.add(sprite);
+
+  // Stash data for dispose later
+  group.userData.poi = p;
+  group.userData.disposables = [stickGeo, tex, mat];
+  return group;
+}
+let _poiStickMat = null;
+
+async function ensurePoiLoaded() {
+  if (_poiLoaded) return;
+  if (_poiLoadPromise) return _poiLoadPromise;
+  _poiLoadPromise = (async () => {
+    poiStatusEl.textContent = 'načítám…';
+    const outerHalf = Math.max(...rings.map(r => r.half));
+    const radius = Math.min(2000, outerHalf);
+    const url = `/api/poi?gcx=${cx}&gcy=${cy}&radius=${radius}`;
+    const startEpoch = _epoch;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`/api/poi ${r.status}`);
+      const pois = await r.json();
+      if (startEpoch !== _epoch) return;  // unload mid-flight
+      // Also need heightData for terrain-Y of each marker.
+      if (rings.some(r => !ringData[r.slug].heightData)) {
+        await ensureHeightDataLoaded();
+        if (startEpoch !== _epoch) return;
+      }
+      // Rebuild meshes
+      while (poiGroup.children.length) {
+        const m = poiGroup.children.pop();
+        for (const d of (m.userData?.disposables || [])) d.dispose?.();
+      }
+      for (const p of pois) poiGroup.add(buildPoiMarker(p));
+      _poiLoaded = true;
+      poiStatusEl.textContent = `${pois.length} POI`;
+      console.info(`[poi] loaded ${pois.length} markers (radius ${radius} m)`);
+    } catch (e) {
+      console.error('[poi]', e);
+      poiStatusEl.textContent = `chyba: ${e.message}`;
+      throw e;
+    }
+  })().finally(() => { _poiLoadPromise = null; });
+  return _poiLoadPromise;
+}
+
+poiToggle.addEventListener('change', async () => {
+  if (poiToggle.checked) {
+    poiToggle.disabled = true;
+    try {
+      await ensurePoiLoaded();
+      poiGroup.visible = true;
+    } catch {} finally { poiToggle.disabled = false; }
+  } else {
+    poiGroup.visible = false;
+    poiStatusEl.textContent = '';
   }
 });
 

@@ -32,6 +32,28 @@ _CUZK_SEM = threading.Semaphore(6)
 # multiple regions are fetched concurrently.
 _OSM_SEM = threading.Semaphore(2)
 
+# Czech labels for unnamed POIs — Overpass returns lots of un-named amenity
+# nodes (especially leisure tags like swimming_pool / playground). For
+# real-estate context "Hřiště" is more useful than "(bez názvu)".
+_POI_FALLBACK_LABELS = {
+    "school": "Škola", "kindergarten": "Školka", "pharmacy": "Lékárna",
+    "doctors": "Lékař", "post_office": "Pošta", "place_of_worship": "Kostel",
+    "restaurant": "Restaurace", "cafe": "Kavárna", "pub": "Hospoda",
+    "bar": "Bar", "fast_food": "Občerstvení", "bank": "Banka",
+    "library": "Knihovna", "community_centre": "KD", "townhall": "Úřad",
+    "police": "Policie", "fire_station": "Hasiči", "fuel": "Čerpací st.",
+    "hospital": "Nemocnice",
+    "swimming_pool": "Bazén", "playground": "Hřiště", "park": "Park",
+    "sports_centre": "Sportoviště", "pitch": "Hřiště", "fitness_centre": "Fitness",
+    "garden": "Zahrada", "nature_reserve": "Přírodní rezervace",
+    "supermarket": "Supermarket", "bakery": "Pekárna", "butcher": "Řezník",
+    "convenience": "Smíšenka", "greengrocer": "Zelenina", "hairdresser": "Kadeřník",
+    "chemist": "Drogerie", "department_store": "Obchodní dům", "kiosk": "Stánek",
+    "station": "Nádraží", "halt": "Zastávka", "tram_stop": "Tramvaj",
+    "bus_stop": "Bus",
+    "peak": "Vrchol",
+}
+
 # Prompt for /api/image-edit. Kept server-side so clients can't override the
 # system instruction (which is tuned for orthophoto-derived 3D mesh repair).
 # The full text lives in image_edit_prompt.txt — single source of truth that
@@ -2405,15 +2427,48 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             t_back = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)
             clon, clat = t.transform(gcx, gcy)
 
+            # Curated for the real-estate buyer's quick "what's nearby"
+            # scan. Aim: enough signal to read the neighbourhood, not
+            # so much that labels overlap into noise.
+            #
+            # Kept (high signal):
+            #   historic (any) → memorials, castles, ruins — gives a
+            #     place character at a glance
+            #   tourism: viewpoint / attraction / museum / hotel —
+            #     skips information / hostel / camp_pitch noise
+            #   peak (mountain peaks)
+            #   amenity: school / kindergarten / pharmacy / doctors /
+            #     hospital / post_office / place_of_worship / townhall
+            #     — services that anchor a village
+            #   leisure: swimming_pool / park / nature_reserve / garden /
+            #     playground — green + recreation
+            #   shop: supermarket only — bakeries / butchers / kiosks
+            #     are every street and add no info
+            #   railway: station / halt / tram_stop — bus stops dropped
+            #     (one every 200 m, drowns the rest)
+            #
+            # Dropped (noise for real-estate context):
+            #   amenity: restaurant, cafe, pub, bar, fast_food, library,
+            #            bank, community_centre, police, fire_station,
+            #            fuel
+            #   leisure: pitch, sports_centre, fitness_centre
+            #   shop:    bakery, butcher, convenience, greengrocer,
+            #            hairdresser, chemist, department_store, kiosk
+            #   highway: bus_stop
             overpass_q = f"""
             [out:json][timeout:30];
             (
               node["historic"](around:{radius},{clat},{clon});
-              node["tourism"](around:{radius},{clat},{clon});
+              node["tourism"~"^(viewpoint|attraction|museum|hotel)$"](around:{radius},{clat},{clon});
               node["natural"="peak"](around:{radius},{clat},{clon});
-              node["amenity"="place_of_worship"](around:{radius},{clat},{clon});
+              node["amenity"~"^(school|kindergarten|pharmacy|doctors|hospital|post_office|place_of_worship|townhall)$"](around:{radius},{clat},{clon});
+              node["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground)$"](around:{radius},{clat},{clon});
+              node["shop"="supermarket"](around:{radius},{clat},{clon});
+              node["railway"~"^(station|halt|tram_stop)$"](around:{radius},{clat},{clon});
               way["historic"](around:{radius},{clat},{clon});
-              way["amenity"="place_of_worship"](around:{radius},{clat},{clon});
+              way["amenity"~"^(school|kindergarten|hospital|place_of_worship|townhall)$"](around:{radius},{clat},{clon});
+              way["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground)$"](around:{radius},{clat},{clon});
+              way["shop"="supermarket"](around:{radius},{clat},{clon});
             );
             out center tags;
             """
@@ -2435,12 +2490,38 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 lx = sx - gcx
                 lz = -(sy - gcy)
                 tags = el.get("tags", {})
-                poi_type = (tags.get("historic") or tags.get("tourism")
-                            or tags.get("natural") or tags.get("amenity") or "unknown")
+                # Decide category (broad bucket for UI grouping/icons) and
+                # subtype (specific tag value for label). Order matters —
+                # `historic` wins over `tourism` when both present.
+                if tags.get("historic"):
+                    category, subtype = "historic", tags["historic"]
+                elif tags.get("tourism"):
+                    category, subtype = "tourism", tags["tourism"]
+                elif tags.get("natural") == "peak":
+                    category, subtype = "peak", "peak"
+                elif tags.get("amenity"):
+                    category, subtype = "amenity", tags["amenity"]
+                elif tags.get("leisure"):
+                    category, subtype = "leisure", tags["leisure"]
+                elif tags.get("shop"):
+                    category, subtype = "shop", tags["shop"]
+                elif tags.get("railway"):
+                    category, subtype = "transit", tags["railway"]
+                elif tags.get("highway") == "bus_stop":
+                    category, subtype = "transit", "bus_stop"
+                else:
+                    category, subtype = "unknown", "unknown"
+                name = tags.get("name") or tags.get("name:cs")
+                if not name:
+                    # Unnamed but tagged — fall back to a human-readable
+                    # subtype label (e.g. "Hřiště" instead of "(bez názvu)"
+                    # for an unnamed playground).
+                    name = _POI_FALLBACK_LABELS.get(subtype, "(bez názvu)")
                 pois.append({
                     "id": el["id"],
-                    "name": tags.get("name") or tags.get("name:cs") or "(bez názvu)",
-                    "type": poi_type,
+                    "name": name,
+                    "category": category,
+                    "type": subtype,
                     "coords": [round(lx, 1), round(lz, 1)],
                     "wikipedia": tags.get("wikipedia"),
                     "wikidata": tags.get("wikidata"),

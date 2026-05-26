@@ -2177,28 +2177,24 @@ scene.add(poiGroup);
 let _poiLoaded = false;
 let _poiLoadPromise = null;
 
-function _poiSpriteCanvas(label, icon, why) {
-  // Two-line pill: top row "icon  name" (bold), bottom row "why"
-  // (smaller, dimmer) when AI curation provided one. Plain pill when
-  // no why (raw-mode POIs).
-  const padding = 10;
-  const fontName = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
-  const fontWhy  = '400 20px -apple-system, system-ui, sans-serif';
-  const nameText = `${icon}  ${label}`;
+function _poiSpriteCanvas(label, icon) {
+  // Compact single-line pill: "icon  name" in a smaller font on a dark
+  // rounded background. Sized tight to the text so dense POI clusters
+  // overlap less. Why-captions are dropped — they're still in p.why
+  // for future tooltip use.
+  const padding = 8;
+  const font = '600 22px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
+  const text = `${icon}  ${label}`;
   const probe = document.createElement('canvas').getContext('2d');
-  probe.font = fontName;
-  const nameW = probe.measureText(nameText).width;
-  let whyW = 0;
-  if (why) { probe.font = fontWhy; whyW = probe.measureText(why).width; }
-  const w = Math.ceil(Math.max(nameW, whyW)) + padding * 2;
-  const h = why ? 66 : 44;
+  probe.font = font;
+  const w = Math.ceil(probe.measureText(text).width) + padding * 2;
+  const h = 36;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d');
-  // Pill background
   ctx.fillStyle = 'rgba(20, 24, 32, 0.88)';
-  const r = 12;
+  const r = 10;
   ctx.beginPath();
   ctx.moveTo(r, 0); ctx.lineTo(w-r, 0); ctx.arcTo(w, 0, w, r, r);
   ctx.lineTo(w, h-r); ctx.arcTo(w, h, w-r, h, r);
@@ -2208,16 +2204,10 @@ function _poiSpriteCanvas(label, icon, why) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
   ctx.lineWidth = 1.5;
   ctx.stroke();
-  // Name (top line)
-  ctx.font = fontName;
+  ctx.font = font;
   ctx.fillStyle = '#fff';
   ctx.textBaseline = 'middle';
-  ctx.fillText(nameText, padding, why ? 22 : (h / 2 + 1));
-  if (why) {
-    ctx.font = fontWhy;
-    ctx.fillStyle = '#b6d2e1';
-    ctx.fillText(why, padding, h - 18);
-  }
+  ctx.fillText(text, padding, h / 2 + 1);
   const tex = new THREE.CanvasTexture(canvas);
   tex.minFilter = THREE.LinearFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -2234,13 +2224,23 @@ function buildPoiMarker(p) {
   let yAbs = sampleAt(lx, lz);
   if (yAbs == null) yAbs = (globalYmin + globalYmax) / 2;
   const baseY = yAbs - yMid;
-  // Stick height: tall enough to clear buildings + tree canopy + give
-  // visible separation from terrain. Czech rural buildings are ~8-15 m,
-  // trees ~15-25 m, so 70 m sits clearly above with room to read labels
-  // even at oblique view angles. Sprite scale tracks the stick — bigger
-  // labels for the new viewing distance.
-  const STICK_H = 70;            // metres above terrain
-  const SPRITE_SCALE = 48;       // world-units (height of label sprite)
+  // Stagger stick height per POI to avoid label overlap at oblique view
+  // angles. Base 50 m clears typical Czech buildings/trees; per-POI jitter
+  // of 0-35 m spreads labels vertically so a cluster doesn't read as a
+  // wall of pills. Jitter is deterministic from id so the same POI keeps
+  // its height across reloads (no flickering).
+  const STICK_BASE_H = 50;
+  const STICK_JITTER = 35;
+  // FNV-1a-ish hash from numeric/string id → [0, 1).
+  const idStr = String(p.id);
+  let hash = 2166136261;
+  for (let i = 0; i < idStr.length; i++) {
+    hash ^= idStr.charCodeAt(i);
+    hash = (hash * 16777619) >>> 0;
+  }
+  const jitter = (hash / 0xffffffff) * STICK_JITTER;
+  const STICK_H = STICK_BASE_H + jitter;
+  const SPRITE_SCALE = 28;       // compact pill — was 48
 
   const group = new THREE.Group();
   group.position.set(lx, baseY, lz);
@@ -2260,9 +2260,12 @@ function buildPoiMarker(p) {
   stick.renderOrder = 100;
   group.add(stick);
 
-  // Label sprite on top. If AI curation added a 'why' string, show
-  // it as a smaller sub-label (e.g. "Vlaková zastávka — denní spojení").
-  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p), p.why);
+  // Label sprite on top — compact single-line pill (icon + name).
+  // The AI "why" caption is dropped from the label: it ate vertical
+  // pixels and made it impossible to stagger sticks without runaway
+  // overlap. We keep p.why in the data so a future hover tooltip can
+  // surface it.
+  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p));
   const mat = new THREE.SpriteMaterial({
     map: tex, depthTest: false, transparent: true, toneMapped: false,
   });

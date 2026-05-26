@@ -3279,9 +3279,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             },
             method="POST",
         )
-        # gpt-image-1 high quality takes 20-60 s. Timeout 180 leaves headroom.
+        # gpt-image-2 high quality at 2048×1376 routinely takes 60-180 s,
+        # but during OpenAI capacity spikes can exceed 300 s. We let it
+        # run up to 10 minutes — well past anything reasonable — to avoid
+        # spurious 500s on the client side. The client's progress text
+        # ("20-60 s") is just a hint, not a contract.
+        import socket   # for socket.timeout — pre-3.10 isn't aliased to TimeoutError
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=600) as resp:
                 resp_body = resp.read()
         except urllib.error.HTTPError as e:
             import sys as _sys
@@ -3289,8 +3294,21 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             print(f"[image-edit] OpenAI {e.code}: {err_body}", file=_sys.stderr)
             self._send_json(e.code, {"error": f"OpenAI {e.code}", "details": err_body})
             return
-        except (urllib.error.URLError, TimeoutError) as e:
-            self._send_json(504, {"error": f"OpenAI request failed: {e}"})
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            # On 3.9 socket.timeout is its own class (subclass of OSError),
+            # not aliased to TimeoutError — without it the read-timeout
+            # case fell through to do_POST's generic 500 handler.
+            import sys as _sys
+            print(f"[image-edit] OpenAI request timed out / failed: {e}", file=_sys.stderr)
+            self._send_json(504, {"error": f"OpenAI request failed (timeout or network): {e}"})
+            return
+        except OSError as e:
+            # Connection reset / SSL errors / similar transport issues —
+            # all surface as OSError subclasses on 3.9. Map to 502 with
+            # an explicit message so the client doesn't see "500 internal".
+            import sys as _sys
+            print(f"[image-edit] transport error: {e}", file=_sys.stderr)
+            self._send_json(502, {"error": f"OpenAI transport error: {e}"})
             return
 
         # Decode b64 PNG from response.

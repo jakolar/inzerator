@@ -75,7 +75,27 @@
     <input id="parcels-toggle" type="checkbox"> 🟦 Označit parcely
     <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
   </label>
-  <button id="parcels-clear" style="display:none;margin-left:18px;font-size:11px;padding:1px 6px;cursor:pointer;">Zrušit výběr</button>
+  <div style="margin-left:18px;font-size:11px;">
+    <label style="color:#9c9;">Styl:
+      <select id="parcel-style" style="font-size:11px;padding:1px 4px;">
+        <option value="auto" selected>Auto (dle podkladu)</option>
+        <optgroup label="Obrys">
+          <option value="classic">Klasik (bílá + glow)</option>
+          <option value="hero">Hero (žlutá výplň)</option>
+          <option value="neon">Neon (tyrkysová HDR)</option>
+          <option value="print">Print (tmavá, bez glow)</option>
+          <option value="cadastre">Katastr (žluto-černá)</option>
+        </optgroup>
+        <optgroup label="Speciální">
+          <option value="bare">Bare-earth (skrz vegetaci)</option>
+          <option value="pin">📍 Pin (špendlík nad parcelou)</option>
+          <option value="beam">💡 Beam (světelný kužel)</option>
+          <option value="label">🔢 Číslo (parcelní označení)</option>
+        </optgroup>
+      </select>
+    </label>
+    <button id="parcels-clear" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:8px;">Zrušit výběr</button>
+  </div>
   <label style="display:block;cursor:pointer;">
     <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
     <span id="poi-status" style="font-size:11px;color:#9c9;"></span>
@@ -916,6 +936,63 @@ function sampleAt(lx, lz) {
   }
   return null;
 }
+
+// Same lookup against the bare-earth (DMR5G) heightmap. Used by the
+// "bare" parcel style so the outline sits on actual ground instead of
+// climbing tree canopies / building roofs (DSM has those baked in).
+// Returns null until ensureBareDataLoaded() has populated the array
+// for at least one matching ring.
+function sampleBareAt(lx, lz) {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    const d = ringData[r.slug];
+    if (Math.abs(lx) > d.half || Math.abs(lz) > d.half) continue;
+    if (!d.bareData) return null;
+    const u = (lx + d.side_m / 2) / d.side_m;
+    const v = (lz + d.side_m / 2) / d.side_m;
+    const col = Math.max(0, Math.min(d.n - 1, (u * (d.n - 1)) | 0));
+    const row = Math.max(0, Math.min(d.n - 1, (v * (d.n - 1)) | 0));
+    const intVal = d.bareData[row * d.n + col];
+    return d.y_min + intVal * d.y_scale;
+  }
+  return null;
+}
+
+function _bareDataReady() {
+  return rings.every(r => ringData[r.slug].bareData);
+}
+
+let _bareDataPromise = null;
+
+async function ensureBareDataLoaded() {
+  // Lazy-fetch bare-earth LERC files + Uint16-quantize them next to
+  // ringData[slug].bareData. Same shape as ensureHeightDataLoaded —
+  // we just write to a different field so the DSM path stays intact.
+  const startEpoch = _epoch;
+  const promises = rings.map(async (r) => {
+    const d = ringData[r.slug];
+    if (d.bareData) return;
+    const info = d.heightLoadInfo;
+    if (!info) return;
+    const bareUrl = asset(r.bare_file);
+    if (!r.bare_file) return;
+    const res = await loadHeightmapData(bareUrl, info.fmt, info.size, info.y_min, info.y_max);
+    if (startEpoch !== _epoch) return;
+    const f32 = res.data;
+    const range = info.y_max - info.y_min;
+    const y_scale = range > 1e-6 ? range / 65535 : 0;
+    const inv = y_scale > 0 ? 1 / y_scale : 0;
+    const u16 = new Uint16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const v = Math.round((f32[i] - info.y_min) * inv);
+      u16[i] = v < 0 ? 0 : (v > 65535 ? 65535 : v);
+    }
+    d.bareData = u16;
+    // y_min + y_scale on the ring already match (same range for DSM/bare).
+    console.info(`[ring ${r.slug}] bareData loaded (Uint16, ${(u16.byteLength/1048576).toFixed(1)} MB)`);
+  });
+  await Promise.all(promises);
+}
 window._sampleAt = sampleAt;   // debug probe — try `_sampleAt(0, 0)` in console
 
 // Rehydrate per-ring CPU heightmap arrays on demand. The startup pipeline
@@ -1430,13 +1507,92 @@ function _parcelEdgeKey(a, b) {
   return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
 }
 
+// Parcel style presets — each one is a complete look-and-feel for the
+// selection outline. Set via the dropdown next to 🟦 Parcely. 'auto' is
+// the default: classic on orthophoto, hero on OSM.
+const PARCEL_STYLES = {
+  // Subtle HDR white line + soft bloom halo, no fill. Default ortho look.
+  classic: { line: { rgb: [1.05, 1.05, 1.05], width: 1.6, bloom: true },
+             fill: null, halo: null },
+  // Yellow translucent fill, white halo line behind, bold orange stroke.
+  // Default OSM look — pops on busy light backgrounds.
+  hero:    { line: { hex: 0xd97706, width: 4.0, bloom: false },
+             fill: { hex: 0xf6c343, opacity: 0.30 },
+             halo: { hex: 0xffffff, width: 6, opacity: 0.85 } },
+  // Vibrant tyrkysová with HDR core — strong bloom for tech/startup vibes.
+  neon:    { line: { rgb: [1.8, 4.0, 5.5], width: 2.0, bloom: true },
+             fill: { hex: 0x14b8a6, opacity: 0.12 },
+             halo: null },
+  // Solid dark line, no glow — for print / PDF / documents.
+  print:   { line: { hex: 0x1e293b, width: 2.6, bloom: false },
+             fill: null, halo: null },
+  // Yellow line with a black offset shadow — old cadastre map convention.
+  cadastre:{ line: { hex: 0xfbbf24, width: 2.2, bloom: false },
+             fill: null,
+             halo: { hex: 0x000000, width: 4.0, opacity: 0.7 } },
+  // Bare-earth drape: scene stays as DSM (vegetation/buildings visible),
+  // but the outline samples DMR5G bare-earth Y per vertex — the line
+  // hugs the actual ground under trees instead of climbing tree
+  // canopies. depthTest off so the line is visible THROUGH foliage.
+  bare:    { line: { rgb: [1.0, 1.0, 1.0], width: 2.0, bloom: false, throughTrees: true },
+             fill: null, halo: null,
+             useBareDrape: true },
+  // Classic outline + a vertical pin marker (stick + sphere head) over
+  // the parcel centroid — like a 3D map pin. Pin is bloom-tinted so it
+  // pops over photo + OSM. Use case: hero shot of "this is the plot".
+  pin:     { line: { rgb: [1.05, 1.05, 1.05], width: 1.6, bloom: true },
+             fill: null, halo: null,
+             decoration: 'pin' },
+  // Classic outline + translucent vertical light cone over the parcel.
+  // Bottom narrow, top wide, additive blend — reads as a beam of light
+  // pointing at the property.
+  beam:    { line: { rgb: [1.05, 1.05, 1.05], width: 1.6, bloom: true },
+             fill: { hex: 0xfacc15, opacity: 0.12 },
+             halo: null,
+             decoration: 'beam' },
+  // Classic outline + parcel number label sprite over the centroid.
+  // Reads like a cadastral overlay: outline + visible identifier.
+  label:   { line: { hex: 0xfbbf24, width: 2.0, bloom: false },
+             fill: null,
+             halo: { hex: 0x000000, width: 3.5, opacity: 0.6 },
+             decoration: 'label' },
+};
+
+function _resolveStyle(name, onOsm) {
+  if (name === 'auto') return PARCEL_STYLES[onOsm ? 'hero' : 'classic'];
+  return PARCEL_STYLES[name] || PARCEL_STYLES.classic;
+}
+
 function redrawOutlines() {
   while (outlineGroup.children.length) {
     const m = outlineGroup.children.pop();
-    m.geometry.dispose();
+    // Group nodes (decoration containers like pin) hold their own
+    // children and userData.disposables list; drill in.
+    if (m.isGroup) {
+      for (const child of m.children) {
+        child.geometry?.dispose?.();
+        if (child.material && !PERSISTENT_MATERIALS.has(child.material)) child.material.dispose?.();
+      }
+      for (const d of (m.userData.disposables || [])) d.dispose?.();
+    } else {
+      m.geometry?.dispose?.();
+      if (m.material && !PERSISTENT_MATERIALS.has(m.material)) m.material.dispose?.();
+      for (const d of (m.userData?.disposables || [])) d.dispose?.();
+    }
   }
   const onOsm = osmToggle?.checked === true;
-  // Lazy-create the material trio. Settings are tuned per-basemap on each
+  const style = _resolveStyle(_parcelStyle, onOsm);
+  // Bare-earth drape needs CPU-side bare data for sampleBareAt. Kick
+  // off the load now; the drape pass below falls back to DSM if the
+  // bare data isn't ready yet, then a re-trigger redraws cleanly.
+  if (style.useBareDrape) {
+    if (!_bareDataPromise && !_bareDataReady()) {
+      _bareDataPromise = ensureBareDataLoaded().then(() => {
+        if (selectedParcels.size > 0 && _parcelStyle === 'bare') redrawOutlines();
+      }).finally(() => { _bareDataPromise = null; });
+    }
+  }
+  // Lazy-create the material trio. Settings are tuned per-style on each
   // redraw (cheap — just colour + linewidth swaps).
   if (!_parcelLineMat) {
     _parcelLineMat = new LineMaterial({
@@ -1445,41 +1601,52 @@ function redrawOutlines() {
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -512,
     });
     _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
+    PERSISTENT_MATERIALS.add(_parcelLineMat);
   }
   if (!_parcelHaloMat) {
-    // White halo behind the main stroke — makes the orange line readable
-    // even on dark OSM forest patches.
     _parcelHaloMat = new LineMaterial({
       color: 0xffffff, linewidth: 6, worldUnits: false, toneMapped: false,
       depthTest: true, depthWrite: false, transparent: true, opacity: 0.85,
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -480,
     });
     _parcelHaloMat.resolution.set(window.innerWidth, window.innerHeight);
+    PERSISTENT_MATERIALS.add(_parcelHaloMat);
   }
   if (!_parcelFillMat) {
-    // Translucent warm fill: #F6C343 at ~30 % opacity. side=DoubleSide so
-    // the fan triangles render no matter which way they happen to wind.
     _parcelFillMat = new THREE.MeshBasicMaterial({
       color: 0xf6c343, transparent: true, opacity: 0.30,
       side: THREE.DoubleSide, depthTest: true, depthWrite: false,
       toneMapped: false,
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -384,
     });
+    PERSISTENT_MATERIALS.add(_parcelFillMat);
   }
-  // Per-basemap style. Over OSM go hero (fill + halo + bold orange line);
-  // over orthophoto keep the classic HDR white + bloom (no fill, no halo).
-  if (onOsm) {
-    _parcelLineMat.color.setHex(0xd97706);
-    _parcelLineMat.linewidth = 4;
-    _parcelLineMat.transparent = false;
-    _parcelLineMat.opacity = 1.0;
-  } else {
-    _parcelLineMat.color.setRGB(1.15, 1.15, 1.15);
-    _parcelLineMat.linewidth = 1.0;
-    _parcelLineMat.transparent = false;
-    _parcelLineMat.opacity = 1.0;
-  }
+  // Apply line style.
+  const ls = style.line;
+  if (ls.rgb) _parcelLineMat.color.setRGB(...ls.rgb);
+  else if (ls.hex !== undefined) _parcelLineMat.color.setHex(ls.hex);
+  _parcelLineMat.linewidth = ls.width;
+  _parcelLineMat.transparent = false;
+  _parcelLineMat.opacity = 1.0;
+  // 'throughTrees' flag — bare-earth style needs the outline to render
+  // visibly even when occluded by DSM vegetation / buildings in front.
+  // We swap depthTest dynamically so non-bare styles keep proper 3D
+  // occlusion (looks more grounded).
+  _parcelLineMat.depthTest = !ls.throughTrees;
   _parcelLineMat.needsUpdate = true;
+  // Apply halo style.
+  if (style.halo) {
+    _parcelHaloMat.color.setHex(style.halo.hex);
+    _parcelHaloMat.linewidth = style.halo.width;
+    _parcelHaloMat.opacity = style.halo.opacity;
+    _parcelHaloMat.needsUpdate = true;
+  }
+  // Apply fill style.
+  if (style.fill) {
+    _parcelFillMat.color.setHex(style.fill.hex);
+    _parcelFillMat.opacity = style.fill.opacity;
+    _parcelFillMat.needsUpdate = true;
+  }
   // Pass 1: count edge occurrences across all selected parcels. Adjacent
   // parcels share their common boundary; the inner edges occur twice and
   // we skip them so the silhouette draws as one continuous perimeter.
@@ -1505,49 +1672,216 @@ function redrawOutlines() {
       const a = ring[i];
       const b = ring[(i + 1) % ring.length];
       if (edgeCount.get(_parcelEdgeKey(a, b)) !== 1) continue;
-      const pts = drapeEdge(a, b);
+      const pts = drapeEdge(a, b, !!style.useBareDrape);
       for (let j = 0; j < pts.length - 1; j++) {
         const A = pts[j], B = pts[j + 1];
         positions.push(A.x, A.y, A.z, B.x, B.y, B.z);
       }
     }
   }
-  // OSM hero treatment: translucent fill per parcel (drape-sampled),
-  // drawn first so the halo + main line stroke on top of it.
-  if (onOsm) {
+  // Fill — drawn first (lowest renderOrder) so halo + main stroke
+  // overlay it cleanly.
+  if (style.fill) {
     for (const p of selectedEntries) {
       const fill = buildParcelFillMesh(p.ring_local);
-      if (fill) {
-        fill.renderOrder = 97;
-        outlineGroup.add(fill);
-      }
+      if (fill) { fill.renderOrder = 97; outlineGroup.add(fill); }
     }
   }
   if (positions.length > 0) {
-    if (onOsm) {
-      // Halo first (wider, white, slightly translucent) — sits behind
-      // the main stroke so the orange edge stays sharp.
+    // Halo line — wider, semi-transparent, behind main stroke. Used by
+    // hero/cadastre/bare styles for readability.
+    if (style.halo) {
       const haloGeo = new LineSegmentsGeometry();
       haloGeo.setPositions(positions);
       const halo = new LineSegments2(haloGeo, _parcelHaloMat);
       halo.renderOrder = 98;
       outlineGroup.add(halo);
     }
-    // Main outline (orange on OSM, HDR white on ortho).
+    // Main outline.
     const geo = new LineSegmentsGeometry();
     geo.setPositions(positions);
     const line = new LineSegments2(geo, _parcelLineMat);
     line.renderOrder = 99;
-    // Bloom only when OSM is off — over OSM the bold orange line on a
-    // white halo reads fine without glow.
-    if (!onOsm) line.layers.enable(BLOOM_LAYER);
+    if (style.line.bloom) line.layers.enable(BLOOM_LAYER);
     outlineGroup.add(line);
+  }
+  // Per-parcel decoration (pin / beam / label). Anchored at the
+  // ring centroid, sampled to terrain Y so it stands on real ground.
+  if (style.decoration) {
+    for (const p of selectedEntries) {
+      const c = _parcelCentroid(p.ring_local);
+      if (!c) continue;
+      let deco = null;
+      if (style.decoration === 'pin')   deco = _buildParcelPin(c);
+      else if (style.decoration === 'beam')  deco = _buildParcelBeam(c, p.ring_local);
+      else if (style.decoration === 'label') deco = _buildParcelLabel(c, p.label || p.name);
+      if (deco) outlineGroup.add(deco);
+    }
   }
   parcelsClear.style.display = selectedParcels.size ? '' : 'none';
 }
+
+// Centroid of a parcel ring in scene-local coords + Y from terrain.
+// Average of XZ (good enough for convex parcels; for star-shaped or
+// L-shaped lots the centroid can land outside — acceptable here since
+// the decoration is purely indicative, not geometrically exact).
+function _parcelCentroid(ring) {
+  if (!ring || ring.length < 3) return null;
+  let sx = 0, sz = 0;
+  for (const v of ring) { sx += v[0]; sz += v[1]; }
+  sx /= ring.length; sz /= ring.length;
+  let y = sampleAt(sx, sz);
+  if (y == null) y = ring[0][2] || 0;
+  return { x: sx, y, z: sz };
+}
+
+// 📍 Pin: vertical white stick + glowing sphere head over centroid.
+// Pin head sits on BLOOM_LAYER so the bloom pass paints a soft halo
+// around it without over-clipping the core.
+function _buildParcelPin(c) {
+  const PIN_H = 120;
+  const group = new THREE.Group();
+  group.position.set(c.x, c.y - yMid, c.z);
+  // Stick — slim, white, depthTest:false so it reads through buildings/trees
+  if (!_pinStickMat) {
+    _pinStickMat = new LineMaterial({
+      color: 0xffffff, linewidth: 2.0, worldUnits: false, toneMapped: false,
+      depthTest: false, transparent: true, opacity: 0.95,
+    });
+    _pinStickMat.resolution.set(window.innerWidth, window.innerHeight);
+    PERSISTENT_MATERIALS.add(_pinStickMat);
+  }
+  const stickGeo = new LineSegmentsGeometry();
+  stickGeo.setPositions([0, 0, 0, 0, PIN_H, 0]);
+  const stick = new LineSegments2(stickGeo, _pinStickMat);
+  stick.renderOrder = 100;
+  group.add(stick);
+  // Pin head — small sphere, HDR emissive so bloom adds halo
+  if (!_pinHeadGeo) _pinHeadGeo = new THREE.SphereGeometry(3.5, 18, 12);
+  if (!_pinHeadMat) {
+    _pinHeadMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(2.0, 2.0, 2.0),
+      toneMapped: false, depthTest: false, transparent: true,
+    });
+    PERSISTENT_MATERIALS.add(_pinHeadMat);
+  }
+  const head = new THREE.Mesh(_pinHeadGeo, _pinHeadMat);
+  head.position.y = PIN_H + 2;
+  head.renderOrder = 101;
+  head.layers.enable(BLOOM_LAYER);
+  group.add(head);
+  group.userData.disposables = [stickGeo];
+  return group;
+}
+
+// 💡 Beam: vertical cone of warm light over the parcel. Big at top,
+// narrow at the ring centroid. Additive blending + HDR colour so it
+// reads as a beam of light. Bloom layer adds outward glow.
+function _buildParcelBeam(c, ring) {
+  const BEAM_H = 250;
+  // Beam radius is proportional to the parcel's footprint — never less
+  // than 6 m so tiny lots still get a visible cone, never more than
+  // 30 m so a large parcel doesn't get a stadium spotlight.
+  let maxR = 0;
+  for (const v of ring) {
+    const dx = v[0] - c.x, dz = v[1] - c.z;
+    maxR = Math.max(maxR, Math.hypot(dx, dz));
+  }
+  const topR = Math.max(6, Math.min(30, maxR * 0.5));
+  if (!_beamMat) {
+    _beamMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(1.8, 1.4, 0.6),     // warm amber HDR
+      transparent: true, opacity: 0.18, side: THREE.DoubleSide,
+      depthWrite: false, blending: THREE.AdditiveBlending,
+      toneMapped: false,
+    });
+    PERSISTENT_MATERIALS.add(_beamMat);
+  }
+  // Open cylinder; bottom narrower than top so the cone widens upward.
+  const geo = new THREE.CylinderGeometry(topR, 0.5, BEAM_H, 28, 1, true);
+  const beam = new THREE.Mesh(geo, _beamMat);
+  beam.position.set(c.x, c.y - yMid + BEAM_H / 2, c.z);
+  beam.renderOrder = 96;
+  beam.layers.enable(BLOOM_LAYER);
+  beam.userData.disposables = [geo];
+  return beam;
+}
+
+// 🔢 Label: sprite with the parcel number over the centroid. Same
+// pill style as POI markers but smaller and uses the cadastre yellow
+// accent so it visually fits the cadastre look.
+function _buildParcelLabel(c, text) {
+  const t = String(text || '?');
+  const pad = 6;
+  const font = '700 26px -apple-system, system-ui, sans-serif';
+  const probe = document.createElement('canvas').getContext('2d');
+  probe.font = font;
+  const tw = probe.measureText(t).width;
+  const innerW = Math.ceil(tw) + pad * 2 + 4;
+  const innerH = 34;
+  const margin = 6;
+  const w = innerW + margin * 2, h = innerH + margin * 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.shadowColor = 'rgba(0,0,0,0.7)';
+  ctx.shadowBlur = 6;
+  ctx.shadowOffsetY = 2;
+  ctx.fillStyle = 'rgba(251, 191, 36, 0.95)';
+  const r = 8;
+  ctx.beginPath();
+  ctx.moveTo(margin + r, margin);
+  ctx.lineTo(margin + innerW - r, margin); ctx.arcTo(margin + innerW, margin, margin + innerW, margin + r, r);
+  ctx.lineTo(margin + innerW, margin + innerH - r); ctx.arcTo(margin + innerW, margin + innerH, margin + innerW - r, margin + innerH, r);
+  ctx.lineTo(margin + r, margin + innerH); ctx.arcTo(margin, margin + innerH, margin, margin + innerH - r, r);
+  ctx.lineTo(margin, margin + r); ctx.arcTo(margin, margin, margin + r, margin, r);
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.font = font;
+  ctx.fillStyle = '#0c1015';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillText(t, margin + innerW / 2, margin + innerH / 2 + 1);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({
+    map: tex, depthTest: false, transparent: true, toneMapped: false,
+  });
+  const sprite = new THREE.Sprite(mat);
+  // World-units scale — match the pill canvas aspect, ~20 m tall.
+  sprite.scale.set(20 * (w / h), 20, 1);
+  sprite.position.set(c.x, c.y - yMid + 18, c.z);
+  sprite.renderOrder = 102;
+  sprite.userData.disposables = [tex, mat];
+  return sprite;
+}
+let _pinStickMat = null;
+let _pinHeadGeo = null;
+let _pinHeadMat = null;
+let _beamMat = null;
 let _parcelLineMat = null;
 let _parcelHaloMat = null;
 let _parcelFillMat = null;
+let _parcelGlowMat = null;
+const PERSISTENT_MATERIALS = new WeakSet();   // materials that survive outline rebuilds
+
+// Parcel style picker — persisted to localStorage so the user's pick
+// survives page reloads.
+let _parcelStyle = localStorage.getItem('parcel_style') || 'auto';
+const _parcelStyleSel = document.getElementById('parcel-style');
+if (_parcelStyleSel) {
+  _parcelStyleSel.value = _parcelStyle;
+  _parcelStyleSel.addEventListener('change', () => {
+    _parcelStyle = _parcelStyleSel.value;
+    localStorage.setItem('parcel_style', _parcelStyle);
+    if (selectedParcels.size > 0) redrawOutlines();
+  });
+}
 
 // Build a translucent fill mesh for a single parcel ring (in OSM mode).
 // Triangulates the 2D polygon via THREE.ShapeUtils.triangulateShape, then
@@ -1595,13 +1929,15 @@ function buildParcelFillMesh(ring) {
 // Drape one edge (between two consecutive ring vertices) onto the
 // heightfield. Split off from drapeRing so the edge-dedup loop above
 // can emit per-edge tubes without having to subdivide entire rings.
-function drapeEdge(a, b) {
+function drapeEdge(a, b, useBare) {
   const SUB_M = 1.5;
-  // Increased from 0.4 to 0.8 to eliminate z-fight twinkle when the camera
-  // moves: terrain Y is shader-displaced from heightmap each frame, tube
-  // Y is CPU-sampled once at click. Sub-metre LIFT plus depthWrite=false
-  // (see _parcelTubeMat) lets the outline sit cleanly above terrain.
-  const LIFT = 0.8;
+  // LIFT defaults to 0.8 above DSM (kills z-fight twinkle vs shader
+  // displacement). With bare-earth drape we sit ~tree height below the
+  // DSM mesh — the outline is intentionally "buried" under vegetation,
+  // depthTest:false in the style lets it shine through canopy. Small
+  // lift just keeps it off the bare ground itself.
+  const LIFT = useBare ? 0.3 : 0.8;
+  const sampler = useBare ? sampleBareAt : sampleAt;
   const pts = [];
   const dx = b[0] - a[0];
   const dz = b[1] - a[1];
@@ -1611,7 +1947,7 @@ function drapeEdge(a, b) {
     const t = s / steps;
     const x = a[0] + dx * t;
     const z = a[1] + dz * t;
-    const absY = sampleAt(x, z);
+    const absY = sampler(x, z);
     const ySource = absY !== null ? absY : (a[2] + (b[2] - a[2]) * t);
     pts.push(new THREE.Vector3(x, ySource - yMid + LIFT, z));
   }
@@ -2077,6 +2413,7 @@ window.addEventListener('resize', () => {
   if (_parcelLineMat) _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
   if (_parcelHaloMat) _parcelHaloMat.resolution.set(window.innerWidth, window.innerHeight);
   if (_poiStickMat) _poiStickMat.resolution.set(window.innerWidth, window.innerHeight);
+  if (_pinStickMat) _pinStickMat.resolution.set(window.innerWidth, window.innerHeight);
 });
 
 // ── Screenshot ──
@@ -2168,6 +2505,29 @@ const POI_CAT_FALLBACK = {
 function poiIcon(p) {
   return POI_ICONS[`${p.category}|${p.type}`] || POI_CAT_FALLBACK[p.category] || '📍';
 }
+// Category colour palette — picked from Tailwind-500 so the pills feel
+// consistent with web UI conventions. Each colour matches the rough
+// real-estate buyer intent: blue = childcare/school, red = health,
+// yellow = heritage, green = recreation, amber = shopping, purple =
+// transit, neutral for civic/other.
+const POI_CAT_COLOUR = {
+  amenity:  { hex: 0x3b82f6, css: '#3b82f6' },   // blue (school/kindergarten dominant)
+  health:   { hex: 0xef4444, css: '#ef4444' },   // red (pharmacy/doctors/hospital)
+  historic: { hex: 0xeab308, css: '#eab308' },   // amber/gold (memorial/castle/ruin)
+  tourism:  { hex: 0xeab308, css: '#eab308' },   // same family — landmarks
+  peak:     { hex: 0xeab308, css: '#eab308' },
+  leisure:  { hex: 0x10b981, css: '#10b981' },   // emerald (park/pool/playground)
+  shop:     { hex: 0xf59e0b, css: '#f59e0b' },   // amber (supermarket)
+  transit:  { hex: 0xa855f7, css: '#a855f7' },   // purple (train/tram)
+  unknown:  { hex: 0x9ca3af, css: '#9ca3af' },   // grey
+};
+// Health amenities deserve their own colour even though OSM still tags
+// them under category=amenity. Split here.
+const _POI_HEALTH_TYPES = new Set(['pharmacy', 'doctors', 'hospital']);
+function poiColour(p) {
+  if (p.category === 'amenity' && _POI_HEALTH_TYPES.has(p.type)) return POI_CAT_COLOUR.health;
+  return POI_CAT_COLOUR[p.category] || POI_CAT_COLOUR.unknown;
+}
 
 const poiToggle = document.getElementById('poi-toggle');
 const poiStatusEl = document.getElementById('poi-status');
@@ -2177,37 +2537,79 @@ scene.add(poiGroup);
 let _poiLoaded = false;
 let _poiLoadPromise = null;
 
-function _poiSpriteCanvas(label, icon) {
-  // Compact single-line pill: "icon  name" in a smaller font on a dark
-  // rounded background. Sized tight to the text so dense POI clusters
-  // overlap less. Why-captions are dropped — they're still in p.why
-  // for future tooltip use.
-  const padding = 8;
-  const font = '600 22px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
-  const text = `${icon}  ${label}`;
+function _poiSpriteCanvas(label, icon, accentCss) {
+  // Compact single-line pill:
+  //   - category accent stripe (4 px) on the left
+  //   - drop shadow for readability on bright photos
+  //   - emoji + name on one line, vertically centred against the cap
+  //     height of the system font (not the em box, which makes the
+  //     text float up on labels without descenders)
+  const padX = 8;
+  const padY = 5;
+  const stripeW = 4;
+  const shadowOffset = 2;
+  const shadowBlur = 5;
+  const fontSize = 18;
+  const font = `600 ${fontSize}px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif`;
+  const text = `${icon} ${label}`;             // single space — emoji glyphs are wide
   const probe = document.createElement('canvas').getContext('2d');
   probe.font = font;
-  const w = Math.ceil(probe.measureText(text).width) + padding * 2;
-  const h = 36;
+  const tw = probe.measureText(text).width;
+  // Cap height for the SF/system font @ 18 px is about 13 px; ascent
+  // ~14, descent ~4. We want the visual centre line to land at the
+  // pill's vertical centre, so size the pill to (capHeight + 2*padY)
+  // and place the text baseline at padY + capHeight.
+  const capHeight = Math.round(fontSize * 0.72);
+  const innerH = capHeight + padY * 2 + 4;     // +4 for emoji descent
+  const innerW = Math.ceil(tw) + padX * 2 + stripeW;
+  const margin = shadowBlur + shadowOffset;
+  const w = innerW + margin * 2;
+  const h = innerH + margin * 2;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(20, 24, 32, 0.88)';
-  const r = 10;
+  const x0 = margin, y0 = margin;
+  // Drop shadow on the pill body only
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+  ctx.shadowBlur = shadowBlur;
+  ctx.shadowOffsetY = shadowOffset;
+  ctx.fillStyle = 'rgba(20, 24, 32, 0.92)';
+  const r = Math.min(8, innerH / 2 - 1);
   ctx.beginPath();
-  ctx.moveTo(r, 0); ctx.lineTo(w-r, 0); ctx.arcTo(w, 0, w, r, r);
-  ctx.lineTo(w, h-r); ctx.arcTo(w, h, w-r, h, r);
-  ctx.lineTo(r, h); ctx.arcTo(0, h, 0, h-r, r);
-  ctx.lineTo(0, r); ctx.arcTo(0, 0, r, 0, r);
+  ctx.moveTo(x0 + r, y0);
+  ctx.lineTo(x0 + innerW - r, y0); ctx.arcTo(x0 + innerW, y0, x0 + innerW, y0 + r, r);
+  ctx.lineTo(x0 + innerW, y0 + innerH - r); ctx.arcTo(x0 + innerW, y0 + innerH, x0 + innerW - r, y0 + innerH, r);
+  ctx.lineTo(x0 + r, y0 + innerH); ctx.arcTo(x0, y0 + innerH, x0, y0 + innerH - r, r);
+  ctx.lineTo(x0, y0 + r); ctx.arcTo(x0, y0, x0 + r, y0, r);
   ctx.fill();
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-  ctx.lineWidth = 1.5;
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+  // Hairline border for definition on dark photos
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+  ctx.lineWidth = 1.25;
   ctx.stroke();
+  // Left accent stripe — category colour, rounded to match border.
+  if (accentCss) {
+    ctx.fillStyle = accentCss;
+    ctx.beginPath();
+    ctx.moveTo(x0 + r, y0);
+    ctx.lineTo(x0 + stripeW, y0);
+    ctx.lineTo(x0 + stripeW, y0 + innerH);
+    ctx.lineTo(x0 + r, y0 + innerH);
+    ctx.arcTo(x0, y0 + innerH, x0, y0 + innerH - r, r);
+    ctx.lineTo(x0, y0 + r);
+    ctx.arcTo(x0, y0, x0 + r, y0, r);
+    ctx.fill();
+  }
+  // Text — use alphabetic baseline + an explicit Y so emoji + latin
+  // letters land on the same line consistently across Chrome/Safari.
   ctx.font = font;
   ctx.fillStyle = '#fff';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, padding, h / 2 + 1);
+  ctx.textBaseline = 'alphabetic';
+  const textBaseY = y0 + padY + capHeight;
+  ctx.fillText(text, x0 + stripeW + padX, textBaseY);
   const tex = new THREE.CanvasTexture(canvas);
   tex.minFilter = THREE.LinearFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -2240,7 +2642,7 @@ function buildPoiMarker(p) {
   }
   const jitter = (hash / 0xffffffff) * STICK_JITTER;
   const STICK_H = STICK_BASE_H + jitter;
-  const SPRITE_SCALE = 28;       // compact pill — was 48
+  const SPRITE_SCALE = 22;       // compact pill — was 28
 
   const group = new THREE.Group();
   group.position.set(lx, baseY, lz);
@@ -2260,12 +2662,39 @@ function buildPoiMarker(p) {
   stick.renderOrder = 100;
   group.add(stick);
 
-  // Label sprite on top — compact single-line pill (icon + name).
-  // The AI "why" caption is dropped from the label: it ate vertical
-  // pixels and made it impossible to stagger sticks without runaway
-  // overlap. We keep p.why in the data so a future hover tooltip can
-  // surface it.
-  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p));
+  // Per-marker accent colour drives stripe + dots.
+  const accent = poiColour(p);
+
+  // Ground dot — flat disc on the terrain at the POI's true XZ, in the
+  // category colour. The visual "pin point" — at oblique view angles
+  // the stick alone leaves ambiguity about which building/park is
+  // tagged. The disc is small in world units (4 m radius) so it stays
+  // proportional to the scene.
+  const groundGeo = new THREE.CircleGeometry(4, 24);
+  groundGeo.rotateX(-Math.PI / 2);
+  const groundMat = new THREE.MeshBasicMaterial({
+    color: accent.hex, transparent: true, opacity: 0.85,
+    side: THREE.DoubleSide, depthTest: false, toneMapped: false,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -256,
+  });
+  const groundDot = new THREE.Mesh(groundGeo, groundMat);
+  groundDot.position.y = 0.5;        // tiny lift to avoid z-fight
+  groundDot.renderOrder = 99;
+  group.add(groundDot);
+
+  // Connector dot — small sprite at the top of the stick, where the
+  // pill anchors. Same category colour, billboards toward the camera
+  // so it always reads as a clear "pin head".
+  const connector = new THREE.Sprite(_poiConnectorMat(accent.css));
+  connector.position.y = STICK_H;
+  connector.scale.set(4, 4, 1);      // world-units, ~4 m disc
+  connector.renderOrder = 102;
+  group.add(connector);
+
+  // Label sprite — compact single-line pill (icon + name + left-edge
+  // category accent stripe + drop shadow). AI "why" caption stays in
+  // p.why for a future tooltip; the label is intentionally tight.
+  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p), accent.css);
   const mat = new THREE.SpriteMaterial({
     map: tex, depthTest: false, transparent: true, toneMapped: false,
   });
@@ -2278,10 +2707,39 @@ function buildPoiMarker(p) {
 
   // Stash data for dispose later
   group.userData.poi = p;
-  group.userData.disposables = [stickGeo, tex, mat];
+  group.userData.disposables = [stickGeo, tex, mat, groundGeo, groundMat, connector.material];
   return group;
 }
 let _poiStickMat = null;
+
+// Tiny round sprite for the connector dot at the top of each POI stick.
+// Built from a 64×64 canvas with a solid filled circle + 1 px white outer
+// ring (helps it pop on dark photo backgrounds). One material per
+// colour, cached so we share it across markers in the same category.
+const _poiConnectorMats = new Map();
+function _poiConnectorMat(css) {
+  let mat = _poiConnectorMats.get(css);
+  if (mat) return mat;
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  // Outer white halo
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(size/2, size/2, size/2 - 2, 0, Math.PI * 2); ctx.fill();
+  // Coloured core
+  ctx.fillStyle = css;
+  ctx.beginPath(); ctx.arc(size/2, size/2, size/2 - 7, 0, Math.PI * 2); ctx.fill();
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  mat = new THREE.SpriteMaterial({
+    map: tex, depthTest: false, transparent: true, toneMapped: false,
+  });
+  _poiConnectorMats.set(css, mat);
+  return mat;
+}
 
 async function ensurePoiLoaded() {
   if (_poiLoaded) return;
@@ -2367,8 +2825,8 @@ bloomComposer.setSize(innerWidth, innerHeight);
 bloomComposer.addPass(new RenderPass(scene, camera));
 bloomComposer.addPass(new UnrealBloomPass(
   new THREE.Vector2(innerWidth, innerHeight),
-  /* strength */  1.4,
-  /* radius   */  0.55,
+  /* strength */  0.55,    // halved from 1.4 — was burning through the parcel area
+  /* radius   */  0.35,    // tighter halo (was 0.55)
   /* threshold */ 0.0,
 ));
 

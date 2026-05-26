@@ -195,6 +195,111 @@ def _query_overpass(query_text, timeout=30):
             continue
     raise last_err if last_err else RuntimeError("All Overpass mirrors failed")
 
+
+# Default model for POI curation. gpt-5.4-mini (released 2026-03-17) is
+# our cheap-tier sweet spot: structured JSON output, fast, ~$0.0005 per
+# POI batch. Override via env if a newer mini lands or budget changes.
+_POI_CURATOR_MODEL = os.environ.get("POI_CURATOR_MODEL", "gpt-5.4-mini")
+
+def _curate_pois_with_ai(pois, max_items=15):
+    """Send raw OSM POI list to OpenAI, get a curated TOP-N back with a
+    Czech 'why' caption per item. Drops duplicates (no five bus stops),
+    prioritises real-estate-relevant categories.
+
+    Input:  list of dicts {id, name, category, type, coords, wikipedia,
+                           wikidata}
+    Output: filtered list, each item enriched with 'why' (short Czech
+            sentence). On any failure the caller falls back to raw.
+    """
+    api_key = os.environ["OPENAI_API_KEY"]   # caller checked
+    # Send only the fields the model needs to decide; keep id as the
+    # join key for filtering the original list.
+    digest = [
+        {"id": p["id"], "name": p["name"], "category": p["category"],
+         "type": p["type"], "coords": p["coords"]}
+        for p in pois
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["integer", "string"]},
+                        "why": {"type": "string"},
+                    },
+                    "required": ["id", "why"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+    sys_prompt = (
+        "Jsi asistent kurátor POI pro realitní portál. "
+        f"Dostaneš seznam OSM POI v okolí nemovitosti v Česku. "
+        f"Vyber nejvýše {max_items} opravdu užitečných a unikátních pro budoucího kupce. "
+        "Pravidla výběru:\n"
+        "1) Priorita: školy, školky, lékař/lékárna/nemocnice, supermarket, "
+        "vlak/tram, památky, voda/park/příroda, kostel.\n"
+        "2) Nikdy nevracej více než JEDEN supermarket / školku / školu / "
+        "kostel / hřiště pokud nejsou výrazně daleko od sebe (>500 m) "
+        "a obě mají jmené; preferuj pojmenovaná místa, jen pokud nejsou pojmenovaná, vrať jedno nejbližší.\n"
+        "3) Nikdy nevracej více než 2 hospody/restaurace/kavárny dohromady.\n"
+        "4) Vynechej úplně: police, fire_station, fuel, bank, community_centre, "
+        "library — pokud nejsou jediným zajímavým bodem v okolí.\n"
+        "5) Vynechej nepojmenované POI pokud je pojmenovaný stejného typu poblíž.\n"
+        "6) Pro každý vybraný POI vrať 'id' (přesně jak přišel) a 'why' "
+        "= krátká česká věta (max 8 slov) proč je relevantní pro kupce. "
+        "Příklady why: 'Základní škola v dosahu', 'Místní bazén', "
+        "'Kostel — orientační bod', 'Vlaková zastávka — denní spojení'."
+    )
+    user_prompt = "POI seznam (JSON):\n" + json.dumps(digest, ensure_ascii=False)
+
+    body = json.dumps({
+        "model": _POI_CURATOR_MODEL,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "poi_curation", "schema": schema, "strict": True},
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        resp_data = json.loads(resp.read())
+    content = resp_data["choices"][0]["message"]["content"]
+    parsed = json.loads(content)
+    items = parsed.get("items", [])
+
+    # Build id → why lookup. Coerce both sides to string in case the
+    # model echoed ints as strings.
+    why_by_id = {str(it["id"]): it["why"] for it in items}
+    out = []
+    for p in pois:
+        why = why_by_id.get(str(p["id"]))
+        if why is None:
+            continue
+        q = dict(p)
+        q["why"] = why
+        out.append(q)
+    # Preserve OpenAI's chosen ordering (top-priority first) when possible.
+    order = {str(it["id"]): i for i, it in enumerate(items)}
+    out.sort(key=lambda p: order.get(str(p["id"]), 999))
+    return out
+
+
 def _ransac_plane(pts, n_iter=200, eps=0.30, seed=42):
     """Fit a single plane z = ax + by + c to (N,3) points via RANSAC.
     Returns (a, b, c, inlier_mask) for the largest consensus, or None."""
@@ -2427,48 +2532,25 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             t_back = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)
             clon, clat = t.transform(gcx, gcy)
 
-            # Curated for the real-estate buyer's quick "what's nearby"
-            # scan. Aim: enough signal to read the neighbourhood, not
-            # so much that labels overlap into noise.
-            #
-            # Kept (high signal):
-            #   historic (any) → memorials, castles, ruins — gives a
-            #     place character at a glance
-            #   tourism: viewpoint / attraction / museum / hotel —
-            #     skips information / hostel / camp_pitch noise
-            #   peak (mountain peaks)
-            #   amenity: school / kindergarten / pharmacy / doctors /
-            #     hospital / post_office / place_of_worship / townhall
-            #     — services that anchor a village
-            #   leisure: swimming_pool / park / nature_reserve / garden /
-            #     playground — green + recreation
-            #   shop: supermarket only — bakeries / butchers / kiosks
-            #     are every street and add no info
-            #   railway: station / halt / tram_stop — bus stops dropped
-            #     (one every 200 m, drowns the rest)
-            #
-            # Dropped (noise for real-estate context):
-            #   amenity: restaurant, cafe, pub, bar, fast_food, library,
-            #            bank, community_centre, police, fire_station,
-            #            fuel
-            #   leisure: pitch, sports_centre, fitness_centre
-            #   shop:    bakery, butcher, convenience, greengrocer,
-            #            hairdresser, chemist, department_store, kiosk
-            #   highway: bus_stop
+            # Broad query — let OpenAI do the curation downstream. This
+            # gives the model enough raw signal to dedupe + rank without
+            # us having to guess which tags matter in every village
+            # context (e.g. a single hospoda in a hamlet IS relevant;
+            # five in a tourist town are noise).
             overpass_q = f"""
             [out:json][timeout:30];
             (
               node["historic"](around:{radius},{clat},{clon});
-              node["tourism"~"^(viewpoint|attraction|museum|hotel)$"](around:{radius},{clat},{clon});
+              node["tourism"~"^(viewpoint|attraction|museum|hotel|information)$"](around:{radius},{clat},{clon});
               node["natural"="peak"](around:{radius},{clat},{clon});
-              node["amenity"~"^(school|kindergarten|pharmacy|doctors|hospital|post_office|place_of_worship|townhall)$"](around:{radius},{clat},{clon});
-              node["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground)$"](around:{radius},{clat},{clon});
-              node["shop"="supermarket"](around:{radius},{clat},{clon});
+              node["amenity"~"^(school|kindergarten|pharmacy|doctors|hospital|post_office|place_of_worship|townhall|community_centre|library|restaurant|cafe|pub|bank|fuel|police|fire_station)$"](around:{radius},{clat},{clon});
+              node["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground|sports_centre|pitch|fitness_centre)$"](around:{radius},{clat},{clon});
+              node["shop"~"^(supermarket|bakery|department_store|convenience)$"](around:{radius},{clat},{clon});
               node["railway"~"^(station|halt|tram_stop)$"](around:{radius},{clat},{clon});
               way["historic"](around:{radius},{clat},{clon});
-              way["amenity"~"^(school|kindergarten|hospital|place_of_worship|townhall)$"](around:{radius},{clat},{clon});
-              way["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground)$"](around:{radius},{clat},{clon});
-              way["shop"="supermarket"](around:{radius},{clat},{clon});
+              way["amenity"~"^(school|kindergarten|hospital|place_of_worship|townhall|library|community_centre)$"](around:{radius},{clat},{clon});
+              way["leisure"~"^(swimming_pool|park|nature_reserve|garden|playground|sports_centre|pitch)$"](around:{radius},{clat},{clon});
+              way["shop"~"^(supermarket|department_store)$"](around:{radius},{clat},{clon});
             );
             out center tags;
             """
@@ -2527,6 +2609,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     "wikidata": tags.get("wikidata"),
                 })
 
+            # AI curation: trim + dedupe to the 12-15 most useful for a
+            # real-estate buyer, attach short "why" text. Skipped when
+            # there's no OPENAI_API_KEY (the endpoint stays useful in
+            # raw mode) or when the raw list is already short.
+            if os.environ.get("OPENAI_API_KEY") and len(pois) > 8:
+                try:
+                    pois = _curate_pois_with_ai(pois)
+                except Exception as e:
+                    import sys as _sys
+                    print(f"[poi] AI curation failed, returning raw: {e}", file=_sys.stderr)
             data = json.dumps(pois).encode()
             _POI_CACHE.put(cache_key, data)
 

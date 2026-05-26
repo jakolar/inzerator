@@ -2177,22 +2177,25 @@ scene.add(poiGroup);
 let _poiLoaded = false;
 let _poiLoadPromise = null;
 
-function _poiSpriteCanvas(label, icon) {
-  // Render emoji + name onto an HTMLCanvas, return as CanvasTexture.
-  // System font on Mac includes Apple Color Emoji so icons render in
-  // colour without bundling a webfont.
-  const text = `${icon}  ${label}`;
-  const padding = 8;
-  // Probe text width on a tmp canvas before sizing the final one.
+function _poiSpriteCanvas(label, icon, why) {
+  // Two-line pill: top row "icon  name" (bold), bottom row "why"
+  // (smaller, dimmer) when AI curation provided one. Plain pill when
+  // no why (raw-mode POIs).
+  const padding = 10;
+  const fontName = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
+  const fontWhy  = '400 20px -apple-system, system-ui, sans-serif';
+  const nameText = `${icon}  ${label}`;
   const probe = document.createElement('canvas').getContext('2d');
-  probe.font = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
-  const w = Math.ceil(probe.measureText(text).width) + padding * 2;
-  const h = 44;
+  probe.font = fontName;
+  const nameW = probe.measureText(nameText).width;
+  let whyW = 0;
+  if (why) { probe.font = fontWhy; whyW = probe.measureText(why).width; }
+  const w = Math.ceil(Math.max(nameW, whyW)) + padding * 2;
+  const h = why ? 66 : 44;
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d');
-  ctx.font = '600 28px -apple-system, "Segoe UI Emoji", "Apple Color Emoji", system-ui, sans-serif';
   // Pill background
   ctx.fillStyle = 'rgba(20, 24, 32, 0.88)';
   const r = 12;
@@ -2205,10 +2208,16 @@ function _poiSpriteCanvas(label, icon) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
   ctx.lineWidth = 1.5;
   ctx.stroke();
-  // Text
+  // Name (top line)
+  ctx.font = fontName;
   ctx.fillStyle = '#fff';
   ctx.textBaseline = 'middle';
-  ctx.fillText(text, padding, h / 2 + 1);
+  ctx.fillText(nameText, padding, why ? 22 : (h / 2 + 1));
+  if (why) {
+    ctx.font = fontWhy;
+    ctx.fillStyle = '#b6d2e1';
+    ctx.fillText(why, padding, h - 18);
+  }
   const tex = new THREE.CanvasTexture(canvas);
   tex.minFilter = THREE.LinearFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -2251,8 +2260,9 @@ function buildPoiMarker(p) {
   stick.renderOrder = 100;
   group.add(stick);
 
-  // Label sprite on top
-  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p));
+  // Label sprite on top. If AI curation added a 'why' string, show
+  // it as a smaller sub-label (e.g. "Vlaková zastávka — denní spojení").
+  const { tex, w, h } = _poiSpriteCanvas(p.name, poiIcon(p), p.why);
   const mat = new THREE.SpriteMaterial({
     map: tex, depthTest: false, transparent: true, toneMapped: false,
   });

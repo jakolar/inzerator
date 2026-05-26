@@ -336,6 +336,20 @@ controls.enableDamping = true;
 // short enough that double-clicks don't get swallowed by an ongoing glide.
 controls.dampingFactor = 0.1;
 
+// Zoom + tilt limits. Without these the user can wheel-out to infinity
+// (where the heightfield is a postage stamp), zoom into the terrain mesh,
+// or orbit below the ground plane and see the back of the geometry.
+// Bounds are derived from the outermost ring half so the limits scale
+// with whatever rings the manifest carries.
+const _outerHalf = Math.max(...rings.map(r => r.half));   // m, biggest ring
+controls.minDistance = 30;                   // 30 m — close enough for roof detail
+controls.maxDistance = _outerHalf * 4;       // 4× outer half ≈ ring fills ~25% of screen at fully zoomed-out
+// Stop just shy of horizontal so the user can't dip below the terrain
+// (where backface culling would show black or the orthophoto from below).
+// 88° leaves a tiny margin so the camera doesn't get stuck flat at the
+// equator (where azimuth orbit becomes ambiguous).
+controls.maxPolarAngle = Math.PI / 2 - 0.04;  // ~88°
+
 // Adaptive DPR: drop to 1.0 during user interaction, restore the configured
 // pixel ratio when idle. Heavy fragment shader (hillshade + cast shadow +
 // composer) means a 1.5×1.5 = 2.25× per-pixel cost — halving area during
@@ -1417,39 +1431,49 @@ function redrawOutlines() {
     const m = outlineGroup.children.pop();
     m.geometry.dispose();
   }
+  const onOsm = osmToggle?.checked === true;
+  // Lazy-create the material trio. Settings are tuned per-basemap on each
+  // redraw (cheap — just colour + linewidth swaps).
   if (!_parcelLineMat) {
-    // Pixel-space line width (worldUnits: false) keeps the outline equally
-    // legible whether the camera is 50 m or 2 km away. Colour + glow are
-    // swapped per-frame based on which basemap is active (see updates
-    // below) — black + no bloom over OSM (light background), HDR white +
-    // bloom over orthophoto (mixed dark/light, glow makes it pop).
     _parcelLineMat = new LineMaterial({
-      color: new THREE.Color(1.15, 1.15, 1.15),
-      // 1.0 px (was 0.6) — at oblique view + great distance the 0.6
-      // sub-pixel rendering let parts of the line drop below the
-      // rasterizer's coverage threshold, making the outline look dashed.
-      linewidth: 1.0,
-      worldUnits: false,
-      toneMapped: false,
-      depthTest: true,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -512,
+      color: 0xffffff, linewidth: 1.0, worldUnits: false, toneMapped: false,
+      depthTest: true, depthWrite: false,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -512,
     });
     _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
   }
-  // Sync style to current basemap. osmToggle.checked is the single source
-  // of truth — when OSM is on we paint black with no bloom (light OSM
-  // background); when off we paint HDR white with bloom for that classic
-  // selected-on-orthophoto look.
-  const onOsm = osmToggle?.checked === true;
+  if (!_parcelHaloMat) {
+    // White halo behind the main stroke — makes the orange line readable
+    // even on dark OSM forest patches.
+    _parcelHaloMat = new LineMaterial({
+      color: 0xffffff, linewidth: 6, worldUnits: false, toneMapped: false,
+      depthTest: true, depthWrite: false, transparent: true, opacity: 0.85,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -480,
+    });
+    _parcelHaloMat.resolution.set(window.innerWidth, window.innerHeight);
+  }
+  if (!_parcelFillMat) {
+    // Translucent warm fill: #F6C343 at ~30 % opacity. side=DoubleSide so
+    // the fan triangles render no matter which way they happen to wind.
+    _parcelFillMat = new THREE.MeshBasicMaterial({
+      color: 0xf6c343, transparent: true, opacity: 0.30,
+      side: THREE.DoubleSide, depthTest: true, depthWrite: false,
+      toneMapped: false,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -384,
+    });
+  }
+  // Per-basemap style. Over OSM go hero (fill + halo + bold orange line);
+  // over orthophoto keep the classic HDR white + bloom (no fill, no halo).
   if (onOsm) {
-    _parcelLineMat.color.setRGB(0, 0, 0);
-    _parcelLineMat.linewidth = 1.4;   // OSM is busier visually, slightly thicker
+    _parcelLineMat.color.setHex(0xd97706);
+    _parcelLineMat.linewidth = 4;
+    _parcelLineMat.transparent = false;
+    _parcelLineMat.opacity = 1.0;
   } else {
     _parcelLineMat.color.setRGB(1.15, 1.15, 1.15);
     _parcelLineMat.linewidth = 1.0;
+    _parcelLineMat.transparent = false;
+    _parcelLineMat.opacity = 1.0;
   }
   _parcelLineMat.needsUpdate = true;
   // Pass 1: count edge occurrences across all selected parcels. Adjacent
@@ -1484,19 +1508,85 @@ function redrawOutlines() {
       }
     }
   }
+  // OSM hero treatment: translucent fill per parcel (drape-sampled),
+  // drawn first so the halo + main line stroke on top of it.
+  if (onOsm) {
+    for (const p of selectedEntries) {
+      const fill = buildParcelFillMesh(p.ring_local);
+      if (fill) {
+        fill.renderOrder = 97;
+        outlineGroup.add(fill);
+      }
+    }
+  }
   if (positions.length > 0) {
+    if (onOsm) {
+      // Halo first (wider, white, slightly translucent) — sits behind
+      // the main stroke so the orange edge stays sharp.
+      const haloGeo = new LineSegmentsGeometry();
+      haloGeo.setPositions(positions);
+      const halo = new LineSegments2(haloGeo, _parcelHaloMat);
+      halo.renderOrder = 98;
+      outlineGroup.add(halo);
+    }
+    // Main outline (orange on OSM, HDR white on ortho).
     const geo = new LineSegmentsGeometry();
     geo.setPositions(positions);
     const line = new LineSegments2(geo, _parcelLineMat);
     line.renderOrder = 99;
-    // Bloom only when OSM is off — over OSM the black outline reads fine
-    // on its own and a glow would just produce a grey haze.
+    // Bloom only when OSM is off — over OSM the bold orange line on a
+    // white halo reads fine without glow.
     if (!onOsm) line.layers.enable(BLOOM_LAYER);
     outlineGroup.add(line);
   }
   parcelsClear.style.display = selectedParcels.size ? '' : 'none';
 }
 let _parcelLineMat = null;
+let _parcelHaloMat = null;
+let _parcelFillMat = null;
+
+// Build a translucent fill mesh for a single parcel ring (in OSM mode).
+// Triangulates the 2D polygon via THREE.ShapeUtils.triangulateShape, then
+// uplifts each vertex to terrain Y (sampleAt) + a small lift so the fill
+// sits cleanly above the heightfield without z-fighting. Returns null on
+// degenerate / failed triangulation (very small parcels, sampleAt miss).
+function buildParcelFillMesh(ring) {
+  if (!ring || ring.length < 3) return null;
+  const FILL_LIFT = 0.5;
+  // 2D contour for triangulation (we only need XZ; Y comes from terrain
+  // sample per-vertex below).
+  const contour = ring.map(p => new THREE.Vector2(p[0], p[1]));
+  let tris;
+  try {
+    tris = THREE.ShapeUtils.triangulateShape(contour, []);
+  } catch (e) {
+    return null;
+  }
+  if (!tris || !tris.length) return null;
+  // Build BufferGeometry: per-vertex (x, sampledY + lift, z). Falls back
+  // to ring-vertex Y when sampleAt misses (returns null), and finally to
+  // 0 with a -? log — extremely rare and only at ring edges.
+  const positions = new Float32Array(ring.length * 3);
+  for (let i = 0; i < ring.length; i++) {
+    const x = ring[i][0];
+    const z = ring[i][1];
+    let y = sampleAt(x, z);
+    if (y == null) y = (ring[i].length > 2 && ring[i][2] > 0) ? ring[i][2] : 0;
+    positions[i*3]   = x;
+    positions[i*3+1] = y - yMid + FILL_LIFT;
+    positions[i*3+2] = z;
+  }
+  const indices = new Uint32Array(tris.length * 3);
+  for (let i = 0; i < tris.length; i++) {
+    indices[i*3]   = tris[i][0];
+    indices[i*3+1] = tris[i][1];
+    indices[i*3+2] = tris[i][2];
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
+  return new THREE.Mesh(geo, _parcelFillMat);
+}
 
 // Drape one edge (between two consecutive ring vertices) onto the
 // heightfield. Split off from drapeRing so the edge-dedup loop above
@@ -1981,6 +2071,7 @@ window.addEventListener('resize', () => {
     }
   }
   if (_parcelLineMat) _parcelLineMat.resolution.set(window.innerWidth, window.innerHeight);
+  if (_parcelHaloMat) _parcelHaloMat.resolution.set(window.innerWidth, window.innerHeight);
 });
 
 // ── Screenshot ──

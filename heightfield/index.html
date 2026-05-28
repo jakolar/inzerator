@@ -74,6 +74,9 @@
   <label style="display:block;cursor:pointer;">
     <input id="parcels-toggle" type="checkbox"> 🟦 Označit parcely
     <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
+    <button id="parcels-capture" style="display:none;font-size:11px;padding:2px 8px;
+            cursor:pointer;margin-left:8px;background:#1a6a8e;color:#fff;border:0;
+            border-radius:3px;font-weight:600;">📸 Generovat náhledy</button>
   </label>
   <div style="margin-left:18px;font-size:11px;">
     <label style="color:#9c9;">Styl:
@@ -95,7 +98,6 @@
       </select>
     </label>
     <button id="parcels-clear" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:8px;">Zrušit výběr</button>
-    <button id="parcels-capture" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:6px;background:#1a6a8e;color:#fff;border:0;border-radius:3px;">📸 Náhledy parcely</button>
   </div>
   <label style="display:block;cursor:pointer;">
     <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
@@ -2952,11 +2954,28 @@ async function captureParcelAngles() {
   const grid = document.getElementById('capture-grid');
   const statusEl = document.getElementById('capture-status');
   const resultsEl = document.getElementById('capture-results');
-  grid.innerHTML = '';
-  resultsEl.innerHTML = '';
   modal.style.display = 'block';
   statusEl.textContent = `načítám 0/${CAPTURE_ANGLES.length}…`;
-  _captureShots = [];
+  // New capture session — keep previous batches above so the user has
+  // a chronological history (newest at top) and can compare results
+  // across different distance multipliers without losing the old ones.
+  // Old batches stay clickable but the AI/ZIP buttons act on the
+  // current session's selection only.
+  const sessionStart = _captureShots.length;
+  const sessionTs = new Date();
+  const sessionHeader = document.createElement('div');
+  sessionHeader.className = 'cap-session-header';
+  sessionHeader.style.cssText =
+    'grid-column:1/-1;padding:8px 0 4px 0;color:#9aa0a8;font-size:11px;' +
+    'border-bottom:1px solid #2a2e36;display:flex;justify-content:space-between;align-items:center;';
+  sessionHeader.innerHTML =
+    `<span><b style="color:#e7e9ee;">Náhledy ${sessionTs.toLocaleTimeString('cs-CZ')}</b> ` +
+    `· ${_captureDistMul}× · vzdálenost ${distance.toFixed(0)} m</span>`;
+  // Prepend so newest session shows at the top.
+  if (grid.firstChild) grid.insertBefore(sessionHeader, grid.firstChild);
+  else grid.appendChild(sessionHeader);
+  // Track the latest inserted node so each new thumb lands after it.
+  let sessionLastNode = sessionHeader;
 
   // The centroid Y already has yMid subtracted? No — _parcelCentroid
   // returns absolute Y in scene space (sampleAt returns absolute Y,
@@ -3000,11 +3019,18 @@ async function captureParcelAngles() {
       const blob = await new Promise(res => renderer.domElement.toBlob(res, 'image/png'));
       if (!blob) continue;
       const dataUrl = URL.createObjectURL(blob);
-      _captureShots.push({ blob, dataUrl, az, pitch, tier, idx: i,
-                            distance, parcelRadius: maxR, selected: false });
+      const shot = { blob, dataUrl, az, pitch, tier, idx: _captureShots.length,
+                      distance, parcelRadius: maxR,
+                      ts: Date.now(), sessionIdx: sessionStart,
+                      selected: false };
+      _captureShots.push(shot);
       statusEl.textContent = `${i + 1}/${CAPTURE_ANGLES.length}…`;
-      // Append thumbnail incrementally so user sees progress.
-      _appendCaptureThumb(grid, _captureShots[_captureShots.length - 1]);
+      // Insert each thumb directly after the previously-inserted node
+      // so the session block stays in chronological order (first shot
+      // = top-left of the session block).
+      const thumb = _buildCaptureThumb(shot);
+      sessionLastNode.parentNode.insertBefore(thumb, sessionLastNode.nextSibling);
+      sessionLastNode = thumb;
     }
     statusEl.textContent = `${_captureShots.length} náhledů hotovo. Vyber které poslat AI.`;
   } finally {
@@ -3017,7 +3043,7 @@ async function captureParcelAngles() {
   }
 }
 
-function _appendCaptureThumb(grid, shot) {
+function _buildCaptureThumb(shot) {
   const div = document.createElement('div');
   div.className = 'cap-thumb';
   div.dataset.idx = shot.idx;
@@ -3033,8 +3059,6 @@ function _appendCaptureThumb(grid, shot) {
   check.className = 'check';
   check.textContent = '';
   div.appendChild(check);
-  // Expand icon (separate from the select-on-click area). Stops bubbling
-  // so a click on it doesn't also toggle selection.
   const expand = document.createElement('span');
   expand.className = 'expand';
   expand.textContent = '⤢';
@@ -3042,7 +3066,7 @@ function _appendCaptureThumb(grid, shot) {
   expand.addEventListener('click', (e) => { e.stopPropagation(); _openLightbox(shot.idx); });
   div.appendChild(expand);
   div.addEventListener('click', () => _toggleCaptureSelection(shot.idx));
-  grid.appendChild(div);
+  return div;
 }
 
 // Lightbox: full-window view of a single shot with metadata overlay.

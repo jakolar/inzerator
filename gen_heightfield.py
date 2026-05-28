@@ -122,6 +122,76 @@ def discover_sm5(cx, cy, half):
     return out
 
 
+def ensure_sm5_cached(cx, cy, half, *, fetch_missing=True):
+    """Resolve every SM5 sheet whose bbox intersects (cx±half, cy±half) and
+    make sure the cache directory `CACHE_DIR/ortofoto_<MAPNOM>/` has a
+    JPG+JGW pair for each. Missing tiles are downloaded via
+    `download_ortofoto.download(code, CACHE_DIR)`.
+
+    `fetch_missing=False` makes this read-only — we only print which
+    sheets are missing and let `discover_ortho` produce a composite with
+    holes. Use that for diagnostics or when the network is unavailable.
+
+    Returns a list of MAPNOM codes that were downloaded this call (empty
+    if everything was already cached or fetch_missing=False).
+    """
+    import urllib.parse, urllib.request, json
+    bbox = (cx - half, cy - half, cx + half, cy + half)
+    url = "https://ags.cuzk.cz/arcgis/rest/services/KladyMapovychListu/MapServer/24/query"
+    params = {
+        "geometry": json.dumps({
+            "xmin": bbox[0], "ymin": bbox[1], "xmax": bbox[2], "ymax": bbox[3],
+            "spatialReference": {"wkid": 5514},
+        }),
+        "geometryType": "esriGeometryEnvelope",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "MAPNOM", "f": "json", "returnGeometry": "false",
+    }
+    req = urllib.request.Request(
+        f"{url}?{urllib.parse.urlencode(params)}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        data = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except Exception as e:
+        print(f"  ⚠ SM5 grid lookup failed ({e}); using whatever's cached")
+        return []
+    codes = sorted({f["attributes"]["MAPNOM"] for f in data.get("features", [])})
+
+    def _is_cached(code):
+        d = CACHE_DIR / f"ortofoto_{code}"
+        if not d.is_dir():
+            return False
+        # JPG + matching JGW is what discover_ortho actually needs.
+        for jpg in d.glob("*.jpg"):
+            if jpg.with_suffix(".jgw").exists():
+                return True
+        return False
+
+    missing = [c for c in codes if not _is_cached(c)]
+    if not missing:
+        return []
+    print(f"  SM5 cache: {len(codes)} sheets in bbox, {len(missing)} missing: {missing}")
+    if not fetch_missing:
+        print(f"  (fetch_missing=False — composite will have empty stripes)")
+        return []
+    downloaded = []
+    import download_ortofoto as _dl
+    for code in missing:
+        try:
+            print(f"  fetching SM5 sheet {code}…")
+            _dl.download(code, CACHE_DIR, force=False)
+            downloaded.append(code)
+        except SystemExit as e:
+            # download_ortofoto uses SystemExit on hard failures (no
+            # ATOM feed entry, no .zip URL). Log and continue so the
+            # other sheets still get fetched.
+            print(f"  ⚠ SM5 {code} download failed: {e}")
+        except Exception as e:
+            print(f"  ⚠ SM5 {code} download error: {e}")
+    return downloaded
+
+
 def discover_ortho(cx, cy, half):
     out = []
     for d in sorted(CACHE_DIR.glob("ortofoto_*")):
@@ -643,6 +713,10 @@ def main():
     # to force a refetch (e.g. when ČÚZK has republished SM5G).
     p.add_argument("--refresh-bare", action="store_true",
                    help="force live DMR5G refetch even if cached bare exists.")
+    p.add_argument("--no-fetch-missing", action="store_true",
+                   help="don't auto-download missing SM5 ortofoto sheets; "
+                        "the composite will have empty stripes where cache "
+                        "is missing. Default: auto-fetch via ČÚZK ATOM feed.")
     p.add_argument("--cadastre-size", type=int, default=8192,
                    help="cadastre PNG side in px (default 8192; server caps at 8192)")
     p.add_argument("--bits", type=int, default=16, choices=[8, 10, 12, 16],
@@ -782,6 +856,13 @@ def main():
         # Naming: `<slug>_ortho_<tier>.jpg` + `<slug>_ortho_<tier>.webp`.
         # Composite built once per tier_size, re-encoded twice — saves the
         # SM5 sheet re-discovery + crop+paste cost.
+        # Make sure every SM5 sheet covering this ring is cached BEFORE
+        # the first composite build. Without this, gaps in cache show
+        # up as empty stripes in the ortho — exactly the recurring
+        # "one stripe didn't load" complaint. Per-ring call because each
+        # ring has its own bbox extent.
+        ensure_sm5_cached(args.cx, args.cy, half,
+                          fetch_missing=not args.no_fetch_missing)
         # The legacy `oh_path` (= `<slug>_ortho.jpg`) is kept as a copy of
         # the default tier JPEG so older viewers that don't know about
         # tiers still work.

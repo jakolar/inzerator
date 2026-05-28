@@ -95,6 +95,7 @@
       </select>
     </label>
     <button id="parcels-clear" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:8px;">Zrušit výběr</button>
+    <button id="parcels-capture" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:6px;background:#1a6a8e;color:#fff;border:0;border-radius:3px;">📸 Náhledy parcely</button>
   </div>
   <label style="display:block;cursor:pointer;">
     <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
@@ -119,6 +120,69 @@
   Drag = orbit · Scroll = zoom · Right-drag = pan
 </div>
 <div id="stats"></div>
+
+<!-- Parcel capture modal — hidden until 📸 Náhledy spustí orbit capture.
+     Grid 4×5 thumbnails with checkboxes; user picks which go to AI. -->
+<div id="capture-modal" style="display:none;position:fixed;inset:0;
+     background:rgba(8,10,14,0.92);z-index:200;overflow:auto;padding:24px;">
+  <div style="max-width:1280px;margin:0 auto;">
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:8px;">
+      <h2 style="margin:0;font-size:16px;font-weight:600;color:#e7e9ee;flex:1;">
+        📸 Náhledy parcely <span id="capture-status" style="color:#9aa0a8;font-weight:400;font-size:13px;margin-left:8px;"></span>
+      </h2>
+      <button id="capture-select-all" class="cap-btn">Vybrat vše</button>
+      <button id="capture-select-none" class="cap-btn">Žádné</button>
+      <button id="capture-ai" class="cap-btn cap-btn-primary" disabled>✨ Vylepšit vybrané přes AI (0)</button>
+      <button id="capture-zip" class="cap-btn" disabled>📦 Stáhnout vybrané</button>
+      <button id="capture-close" class="cap-btn">✕</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;
+                color:#9aa0a8;font-size:12px;">
+      <label style="display:flex;align-items:center;gap:8px;">
+        Vzdálenost:
+        <input id="capture-dist-mul" type="range" min="2" max="20" step="1" value="5"
+               style="width:200px;">
+        <span id="capture-dist-mul-val" style="color:#e7e9ee;font-family:ui-monospace,monospace;
+              min-width:28px;text-align:right;">5×</span>
+        <span id="capture-dist-meta" style="color:#6b7280;font-size:11px;"></span>
+      </label>
+      <button id="capture-recapture" class="cap-btn" disabled>↻ Re-capture</button>
+    </div>
+    <div id="capture-grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;"></div>
+    <div id="capture-results" style="margin-top:24px;"></div>
+  </div>
+</div>
+
+<style>
+  .cap-btn { background:#1e2530;color:#e7e9ee;border:1px solid #2a2e36;
+             border-radius:5px;padding:7px 12px;font-size:12px;cursor:pointer;
+             font-family:inherit; }
+  .cap-btn:hover { background:#2a3340;border-color:#4aa3d9; }
+  .cap-btn-primary { background:#1a6a8e;border-color:#1a6a8e;font-weight:600; }
+  .cap-btn-primary:hover { background:#2588b3; }
+  .cap-btn:disabled { opacity:0.4;cursor:not-allowed; }
+  .cap-thumb { position:relative;border-radius:6px;overflow:hidden;cursor:pointer;
+               border:2px solid transparent;background:#000;transition:border-color 0.15s; }
+  .cap-thumb img { width:100%;display:block;aspect-ratio:3/2;object-fit:cover; }
+  .cap-thumb.sel { border-color:#4aa3d9; }
+  .cap-thumb .badge { position:absolute;top:6px;left:6px;background:rgba(0,0,0,0.7);
+                      color:#fff;font-size:10px;padding:2px 6px;border-radius:3px; }
+  .cap-thumb .check { position:absolute;top:6px;right:6px;width:22px;height:22px;
+                      border-radius:50%;background:rgba(0,0,0,0.6);color:#fff;
+                      display:flex;align-items:center;justify-content:center;font-size:14px; }
+  .cap-thumb.sel .check { background:#4aa3d9; }
+  .cap-thumb .expand { position:absolute;bottom:6px;right:6px;width:24px;height:24px;
+                       border-radius:4px;background:rgba(0,0,0,0.7);color:#fff;
+                       display:flex;align-items:center;justify-content:center;
+                       font-size:14px;cursor:pointer;line-height:1; }
+  .cap-thumb .expand:hover { background:#4aa3d9; }
+  .cap-result-row { display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;
+                    border:1px solid #2a2e36;border-radius:6px;padding:8px;background:#14171f; }
+  .cap-result-row img { width:100%;display:block;border-radius:4px; }
+  .cap-result-row .lbl { color:#9aa0a8;font-size:11px;margin-bottom:4px; }
+  .cap-progress { color:#6cf;font-size:13px;margin-top:8px; }
+  .cap-error { color:#e07866;font-size:12px;margin-top:4px; }
+</style>
 
 <script type="importmap">
 { "imports": {
@@ -277,11 +341,37 @@ renderProgress();
 
 // ── Scene setup ──
 // preserveDrawingBuffer: true is required for `renderer.domElement.toBlob()`
-// to capture the last frame — without it the browser composites the canvas
-// to the page and clears the WebGL framebuffer, so screenshots come back
-// blank. Cost is a ~5 % per-frame penalty (WebGL keeps an extra
-// readable buffer); negligible on desktop / Apple Silicon.
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+// to capture the last frame. But it bumps memory per WebGL context and
+// browsers limit total contexts per origin (~16 on Chrome). If we hit
+// that ceiling (many viewer tabs open at once) WebGLRenderer throws
+// "Error creating WebGL context". Fall back to a context WITHOUT
+// preserveDrawingBuffer — screenshots lose precision (last-frame
+// re-render) but the page boots and the 3D view works.
+let renderer;
+let _screenshotCapable = true;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+} catch (e) {
+  console.warn('[renderer] preserveDrawingBuffer create failed; retrying without:', e);
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    _screenshotCapable = false;
+  } catch (e2) {
+    // Both attempts failed — likely the WebGL context budget is fully
+    // spent. Tell the user explicitly instead of silently rendering
+    // a black canvas.
+    const banner = document.createElement('div');
+    banner.style.cssText = 'position:fixed;inset:0;background:#1a0a0a;color:#ffaa88;' +
+      'display:flex;align-items:center;justify-content:center;text-align:center;' +
+      'font-family:system-ui;padding:24px;z-index:9999;font-size:16px;';
+    banner.innerHTML = '<div>⚠ WebGL context se nepodařilo vytvořit.<br><br>' +
+      'Pravděpodobně máš příliš mnoho otevřených záložek s 3D viewerem ' +
+      '(prohlížeč povoluje ~16 najednou).<br><br>' +
+      'Zavři ostatní heightfield taby a obnov stránku.</div>';
+    document.body.appendChild(banner);
+    throw e2;
+  }
+}
 // On Retina (devicePixelRatio=2) the fragment shader runs 4× more pixels
 // per frame than native res. Cap at 1.5 to claw back ~30 % per-frame
 // cost; text/labels on ortho stay readable and the parcel tubes only
@@ -1719,6 +1809,8 @@ function redrawOutlines() {
     }
   }
   parcelsClear.style.display = selectedParcels.size ? '' : 'none';
+  const captureBtn = document.getElementById('parcels-capture');
+  if (captureBtn) captureBtn.style.display = selectedParcels.size ? '' : 'none';
 }
 
 // Centroid of a parcel ring in scene-local coords + Y from terrain.
@@ -2790,6 +2882,475 @@ poiToggle.addEventListener('change', async () => {
     poiStatusEl.textContent = '';
   }
 });
+
+// ── Parcel multi-angle capture ──
+// Orbits the camera around a parcel's centroid, snaps 20 PNGs at
+// preset azimuth/pitch combos, then opens a grid modal where the
+// user picks which shots to (a) download or (b) send to the AI
+// image-edit endpoint for cleanup.
+const CAPTURE_ANGLES = [
+  // 8× outer ring, oblique (25° from horizontal — landscape feel)
+  ...[0, 45, 90, 135, 180, 225, 270, 315].map(az => ({ az, pitch: 25, tier: 'oblique' })),
+  // 4× medium pitch (50° — drone-like)
+  ...[0, 90, 180, 270].map(az => ({ az, pitch: 50, tier: 'medium' })),
+  // 4× high pitch (70° — near-overhead)
+  ...[0, 90, 180, 270].map(az => ({ az, pitch: 70, tier: 'high' })),
+  // 4× near-top-down (88°)
+  ...[0, 90, 180, 270].map(az => ({ az, pitch: 88, tier: 'top' })),
+];
+
+let _captureShots = [];   // array of { blob, dataUrl, az, pitch, tier, selected }
+// Distance = parcelRadius × multiplier. User-tunable via the slider in
+// the capture modal; persisted across sessions so the user's preferred
+// "context tightness" sticks. Range 5-40 covers macro-zoom (5×, lot
+// fills the frame) through wide context (40×, lot reads as a feature
+// in a hundred-metre neighbourhood).
+let _captureDistMul = parseInt(localStorage.getItem('capture_dist_mul') || '5', 10);
+// Clamp into current slider range — old (15) saved during the wider
+// default would otherwise sit outside the new 2-20 window.
+if (_captureDistMul < 2 || _captureDistMul > 20) _captureDistMul = 5;
+let _captureCurrentParcel = null;   // remembered for re-capture
+
+async function captureParcelAngles() {
+  if (selectedParcels.size === 0) return;
+  // Pick the first selected parcel as the orbit target. Future: option
+  // to capture a UNION of multiple selections.
+  const id = selectedParcels.values().next().value;
+  const p = parcelsById.get(id);
+  if (!p || !p.ring_local) return;
+  const centroid = _parcelCentroid(p.ring_local);
+  if (!centroid) return;
+  // Distance = max parcel radius × user-selected multiplier (slider in
+  // the modal header). Floor at 200 m so tiny lots still get usable
+  // context. Multiplier persists across sessions in localStorage.
+  let maxR = 0;
+  for (const v of p.ring_local) {
+    const dx = v[0] - centroid.x, dz = v[1] - centroid.z;
+    maxR = Math.max(maxR, Math.hypot(dx, dz));
+  }
+  const distance = Math.max(100, maxR * _captureDistMul);
+  // Remember the parcel for the re-capture button — same lot, new
+  // multiplier, no need to click on the canvas again.
+  _captureCurrentParcel = p;
+  // Update the meta label so the user sees what numbers their slider
+  // value resolves to for this specific parcel.
+  const metaEl = document.getElementById('capture-dist-meta');
+  if (metaEl) metaEl.textContent = `(parcela R=${maxR.toFixed(0)} m → ${distance.toFixed(0)} m)`;
+
+  // Snapshot UI state we have to restore.
+  const oldPos = camera.position.clone();
+  const oldTarget = controls.target.clone();
+  const oldDamping = controls.enableDamping;
+  const poiWasVisible = poiGroup.visible;
+  // Hide POI markers — user requested clean shots for the AI pipeline.
+  // Outline + ground markers stay so the AI knows which parcel is the
+  // target.
+  poiGroup.visible = false;
+  controls.enableDamping = false;
+
+  const modal = document.getElementById('capture-modal');
+  const grid = document.getElementById('capture-grid');
+  const statusEl = document.getElementById('capture-status');
+  const resultsEl = document.getElementById('capture-results');
+  grid.innerHTML = '';
+  resultsEl.innerHTML = '';
+  modal.style.display = 'block';
+  statusEl.textContent = `načítám 0/${CAPTURE_ANGLES.length}…`;
+  _captureShots = [];
+
+  // The centroid Y already has yMid subtracted? No — _parcelCentroid
+  // returns absolute Y in scene space (sampleAt returns absolute Y,
+  // not relative to yMid). For the camera target we need the scene-
+  // space position which is (x, y - yMid, z) where y is absolute.
+  const targetSceneY = centroid.y - yMid;
+
+  try {
+    for (let i = 0; i < CAPTURE_ANGLES.length; i++) {
+      const { az, pitch, tier } = CAPTURE_ANGLES[i];
+      // Convert spherical (az, pitch above horizontal) → cartesian.
+      const phi = pitch * Math.PI / 180;          // angle ABOVE horizontal
+      const theta = az * Math.PI / 180;            // azimuth (0 = +Z south, CW)
+      const r = distance;
+      const dy = r * Math.sin(phi);
+      const hr = r * Math.cos(phi);                // horizontal radius component
+      camera.position.set(
+        centroid.x + hr * Math.sin(theta),
+        targetSceneY + dy,
+        centroid.z + hr * Math.cos(theta)
+      );
+      controls.target.set(centroid.x, targetSceneY, centroid.z);
+      camera.lookAt(centroid.x, targetSceneY, centroid.z);
+      camera.updateMatrixWorld();
+      camera.updateProjectionMatrix();
+
+      // Render same as animate(): bloom pass for selected parcels,
+      // then finalComposer for sRGB-correct output.
+      const hasGlow = !_NO_BLOOM && selectedParcels.size > 0;
+      if (hasGlow) {
+        const oldBg = scene.background;
+        scene.background = null;
+        camera.layers.set(BLOOM_LAYER);
+        bloomComposer.render();
+        scene.background = oldBg;
+        camera.layers.set(0);
+      }
+      finalComposer.render();
+      // Wait one frame so the framebuffer is committed before toBlob.
+      await new Promise(r => requestAnimationFrame(r));
+      const blob = await new Promise(res => renderer.domElement.toBlob(res, 'image/png'));
+      if (!blob) continue;
+      const dataUrl = URL.createObjectURL(blob);
+      _captureShots.push({ blob, dataUrl, az, pitch, tier, idx: i,
+                            distance, parcelRadius: maxR, selected: false });
+      statusEl.textContent = `${i + 1}/${CAPTURE_ANGLES.length}…`;
+      // Append thumbnail incrementally so user sees progress.
+      _appendCaptureThumb(grid, _captureShots[_captureShots.length - 1]);
+    }
+    statusEl.textContent = `${_captureShots.length} náhledů hotovo. Vyber které poslat AI.`;
+  } finally {
+    // Restore camera + controls regardless of capture success.
+    camera.position.copy(oldPos);
+    controls.target.copy(oldTarget);
+    controls.enableDamping = oldDamping;
+    controls.update();
+    poiGroup.visible = poiWasVisible;
+  }
+}
+
+function _appendCaptureThumb(grid, shot) {
+  const div = document.createElement('div');
+  div.className = 'cap-thumb';
+  div.dataset.idx = shot.idx;
+  const img = document.createElement('img');
+  img.src = shot.dataUrl;
+  img.loading = 'lazy';
+  div.appendChild(img);
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  badge.innerHTML = `${shot.az}° · ${shot.pitch}°<br>${shot.distance.toFixed(0)} m`;
+  div.appendChild(badge);
+  const check = document.createElement('span');
+  check.className = 'check';
+  check.textContent = '';
+  div.appendChild(check);
+  // Expand icon (separate from the select-on-click area). Stops bubbling
+  // so a click on it doesn't also toggle selection.
+  const expand = document.createElement('span');
+  expand.className = 'expand';
+  expand.textContent = '⤢';
+  expand.title = 'Zvětšit';
+  expand.addEventListener('click', (e) => { e.stopPropagation(); _openLightbox(shot.idx); });
+  div.appendChild(expand);
+  div.addEventListener('click', () => _toggleCaptureSelection(shot.idx));
+  grid.appendChild(div);
+}
+
+// Lightbox: full-window view of a single shot with metadata overlay.
+// Lazy-builds the DOM on first open, reuses it after.
+let _lightboxEl = null;
+function _openLightbox(idx) {
+  const shot = _captureShots[idx];
+  if (!shot) return;
+  if (!_lightboxEl) {
+    _lightboxEl = document.createElement('div');
+    _lightboxEl.id = 'capture-lightbox';
+    _lightboxEl.style.cssText =
+      'position:fixed;inset:0;background:rgba(0,0,0,0.95);z-index:300;' +
+      'display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(_lightboxEl);
+    // Click on backdrop closes
+    _lightboxEl.addEventListener('click', (e) => {
+      if (e.target === _lightboxEl) _lightboxEl.style.display = 'none';
+    });
+  }
+  _lightboxEl.innerHTML = '';
+  _lightboxEl.style.display = 'flex';
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:relative;max-width:100%;max-height:100%;display:flex;flex-direction:column;gap:8px;';
+  const img = document.createElement('img');
+  img.src = shot.dataUrl;
+  img.style.cssText = 'max-width:100%;max-height:calc(100vh - 120px);object-fit:contain;border-radius:6px;';
+  wrap.appendChild(img);
+  const info = document.createElement('div');
+  info.style.cssText =
+    'background:rgba(20,24,32,0.9);color:#e7e9ee;padding:10px 16px;border-radius:6px;' +
+    'font-size:12px;font-family:ui-monospace,monospace;display:flex;gap:18px;flex-wrap:wrap;';
+  info.innerHTML =
+    `<span><b style="color:#9aa0a8;">Azimuth:</b> ${shot.az}°</span>` +
+    `<span><b style="color:#9aa0a8;">Pitch:</b> ${shot.pitch}° nad horizontem</span>` +
+    `<span><b style="color:#9aa0a8;">Vzdálenost:</b> ${shot.distance.toFixed(0)} m</span>` +
+    `<span><b style="color:#9aa0a8;">Tier:</b> ${shot.tier}</span>` +
+    `<span><b style="color:#9aa0a8;">Parcel R:</b> ${shot.parcelRadius.toFixed(1)} m</span>` +
+    `<span><b style="color:#9aa0a8;">Shot:</b> ${shot.idx + 1}/${_captureShots.length}</span>`;
+  wrap.appendChild(info);
+  const close = document.createElement('button');
+  close.textContent = '✕ Zavřít (Esc)';
+  close.className = 'cap-btn';
+  close.style.cssText = 'align-self:flex-start;';
+  close.addEventListener('click', () => { _lightboxEl.style.display = 'none'; });
+  wrap.appendChild(close);
+  _lightboxEl.appendChild(wrap);
+}
+// Esc closes lightbox
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && _lightboxEl && _lightboxEl.style.display !== 'none') {
+    _lightboxEl.style.display = 'none';
+  }
+});
+
+function _toggleCaptureSelection(idx) {
+  const shot = _captureShots[idx];
+  if (!shot) return;
+  shot.selected = !shot.selected;
+  const div = document.querySelector(`.cap-thumb[data-idx="${idx}"]`);
+  if (div) {
+    div.classList.toggle('sel', shot.selected);
+    div.querySelector('.check').textContent = shot.selected ? '✓' : '';
+  }
+  _refreshCaptureButtons();
+}
+
+function _refreshCaptureButtons() {
+  const n = _captureShots.filter(s => s.selected).length;
+  const aiBtn = document.getElementById('capture-ai');
+  const zipBtn = document.getElementById('capture-zip');
+  aiBtn.textContent = `✨ Vylepšit vybrané přes AI (${n})`;
+  aiBtn.disabled = n === 0;
+  zipBtn.disabled = n === 0;
+}
+
+document.getElementById('capture-select-all').addEventListener('click', () => {
+  for (const s of _captureShots) s.selected = true;
+  for (const div of document.querySelectorAll('.cap-thumb')) {
+    div.classList.add('sel');
+    div.querySelector('.check').textContent = '✓';
+  }
+  _refreshCaptureButtons();
+});
+document.getElementById('capture-select-none').addEventListener('click', () => {
+  for (const s of _captureShots) s.selected = false;
+  for (const div of document.querySelectorAll('.cap-thumb')) {
+    div.classList.remove('sel');
+    div.querySelector('.check').textContent = '';
+  }
+  _refreshCaptureButtons();
+});
+document.getElementById('capture-close').addEventListener('click', () => {
+  document.getElementById('capture-modal').style.display = 'none';
+  // Revoke object URLs so the blobs can be GC'd.
+  for (const s of _captureShots) {
+    if (s.dataUrl) URL.revokeObjectURL(s.dataUrl);
+    if (s.aiUrl) URL.revokeObjectURL(s.aiUrl);
+  }
+  _captureShots = [];
+});
+
+document.getElementById('capture-ai').addEventListener('click', async () => {
+  const selected = _captureShots.filter(s => s.selected);
+  if (selected.length === 0) return;
+  // Explicit cost-confirm gate — every click on this button calls the
+  // OpenAI API at ~$0.40/shot for 2048×1376 high quality. Confirm
+  // dialog lists exact shot count + estimated total so the user can't
+  // accidentally burn through credit with a wrong-button click.
+  const estUsd = (selected.length * 0.40).toFixed(2);
+  const ok = window.confirm(
+    `Poslat ${selected.length} náhledů na OpenAI gpt-image-2?\n\n` +
+    `Odhadovaná cena: $${estUsd} (high quality 2048×1376, ~$0.40/shot).\n` +
+    `Doba: ~1–3 min na shot, celkem ~${selected.length}–${selected.length * 3} min.\n\n` +
+    `Pokračovat?`
+  );
+  if (!ok) return;
+  const aiBtn = document.getElementById('capture-ai');
+  aiBtn.disabled = true;
+  const resultsEl = document.getElementById('capture-results');
+  resultsEl.innerHTML = '<h3 style="color:#e7e9ee;font-size:14px;margin:0 0 10px 0;">AI vylepšení</h3>';
+  const progress = document.createElement('div');
+  progress.className = 'cap-progress';
+  resultsEl.appendChild(progress);
+  // Run sequentially — gpt-image-2 high quality is slow and we don't
+  // want N parallel requests slamming the same key.
+  for (let i = 0; i < selected.length; i++) {
+    const shot = selected[i];
+    progress.textContent = `Posílám ${i + 1}/${selected.length}…`;
+    const fd = new FormData();
+    fd.append('image_a', shot.blob, `parcel_${shot.az}_${shot.pitch}.png`);
+    fd.append('size', '2048x1376');
+    fd.append('quality', 'high');
+    try {
+      const t0 = performance.now();
+      const r = await fetch('/api/image-edit', { method: 'POST', body: fd });
+      if (!r.ok) {
+        let detail = '';
+        try { const j = await r.json(); detail = j.error || ''; if (j.details) detail += ' — ' + j.details; }
+        catch { detail = await r.text(); }
+        throw new Error(`${r.status}: ${detail}`);
+      }
+      const aiBlob = await r.blob();
+      const aiUrl = URL.createObjectURL(aiBlob);
+      shot.aiBlob = aiBlob;
+      shot.aiUrl = aiUrl;
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      _appendCaptureResult(resultsEl, shot, elapsed);
+    } catch (e) {
+      const err = document.createElement('div');
+      err.className = 'cap-error';
+      err.textContent = `Shot ${shot.az}°/${shot.pitch}°: ${e.message}`;
+      resultsEl.appendChild(err);
+    }
+  }
+  progress.textContent = `Hotovo (${selected.length} náhledů).`;
+  aiBtn.disabled = false;
+});
+
+function _appendCaptureResult(parent, shot, elapsedSec) {
+  const row = document.createElement('div');
+  row.className = 'cap-result-row';
+  const a = document.createElement('div');
+  a.innerHTML = `<div class="lbl">Před — ${shot.az}° / ${shot.pitch}°</div>`;
+  const aImg = document.createElement('img'); aImg.src = shot.dataUrl;
+  a.appendChild(aImg);
+  const b = document.createElement('div');
+  b.innerHTML = `<div class="lbl">Po AI — ${elapsedSec} s
+    <a href="${shot.aiUrl}" download="parcel_ai_${shot.az}_${shot.pitch}.png"
+       style="color:#4aa3d9;margin-left:8px;">stáhnout</a></div>`;
+  const bImg = document.createElement('img'); bImg.src = shot.aiUrl;
+  b.appendChild(bImg);
+  row.appendChild(a); row.appendChild(b);
+  parent.appendChild(row);
+}
+
+// ZIP without external libs: minimal ZIP encoder for the selected PNGs.
+// Each file: local file header + DEFLATE-stored (no compression) bytes
+// + central directory + EOCD. Plain enough that browsers happily open
+// it; PNG bytes are already compressed so no double-deflate hit.
+async function _buildCaptureZip(selectedShots, includeAi) {
+  const enc = new TextEncoder();
+  const files = [];
+  for (const s of selectedShots) {
+    const name = `parcel_${s.az}deg_${s.pitch}deg.png`;
+    files.push({ name, data: new Uint8Array(await s.blob.arrayBuffer()) });
+    if (includeAi && s.aiBlob) {
+      files.push({ name: `parcel_ai_${s.az}deg_${s.pitch}deg.png`,
+                   data: new Uint8Array(await s.aiBlob.arrayBuffer()) });
+    }
+  }
+  // Pure-JS CRC32 (no dep). Cached table.
+  const crcTable = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    crcTable[i] = c;
+  }
+  const crc32 = (data) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < data.length; i++) c = crcTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  let offset = 0;
+  const localChunks = [];
+  const centralChunks = [];
+  for (const f of files) {
+    const nameBytes = enc.encode(f.name);
+    const crc = crc32(f.data);
+    const size = f.data.length;
+    // Local file header (30 bytes + name)
+    const lfh = new Uint8Array(30 + nameBytes.length);
+    const dv = new DataView(lfh.buffer);
+    dv.setUint32(0, 0x04034b50, true);
+    dv.setUint16(4, 20, true);          // version
+    dv.setUint16(6, 0, true);            // flags
+    dv.setUint16(8, 0, true);            // method = stored
+    dv.setUint16(10, 0, true);           // time
+    dv.setUint16(12, 0, true);           // date
+    dv.setUint32(14, crc, true);
+    dv.setUint32(18, size, true);
+    dv.setUint32(22, size, true);
+    dv.setUint16(26, nameBytes.length, true);
+    dv.setUint16(28, 0, true);
+    lfh.set(nameBytes, 30);
+    localChunks.push(lfh, f.data);
+    // Central directory entry (46 + name)
+    const cdh = new Uint8Array(46 + nameBytes.length);
+    const dvc = new DataView(cdh.buffer);
+    dvc.setUint32(0, 0x02014b50, true);
+    dvc.setUint16(4, 20, true);
+    dvc.setUint16(6, 20, true);
+    dvc.setUint16(8, 0, true);
+    dvc.setUint16(10, 0, true);
+    dvc.setUint16(12, 0, true); dvc.setUint16(14, 0, true);
+    dvc.setUint32(16, crc, true);
+    dvc.setUint32(20, size, true);
+    dvc.setUint32(24, size, true);
+    dvc.setUint16(28, nameBytes.length, true);
+    dvc.setUint16(30, 0, true); dvc.setUint16(32, 0, true);
+    dvc.setUint16(34, 0, true); dvc.setUint16(36, 0, true);
+    dvc.setUint32(38, 0, true);
+    dvc.setUint32(42, offset, true);
+    cdh.set(nameBytes, 46);
+    centralChunks.push(cdh);
+    offset += lfh.length + size;
+  }
+  const cdSize = centralChunks.reduce((s, c) => s + c.length, 0);
+  const cdOffset = offset;
+  // EOCD
+  const eocd = new Uint8Array(22);
+  const dve = new DataView(eocd.buffer);
+  dve.setUint32(0, 0x06054b50, true);
+  dve.setUint16(8, files.length, true);
+  dve.setUint16(10, files.length, true);
+  dve.setUint32(12, cdSize, true);
+  dve.setUint32(16, cdOffset, true);
+  return new Blob([...localChunks, ...centralChunks, eocd], { type: 'application/zip' });
+}
+
+document.getElementById('capture-zip').addEventListener('click', async () => {
+  const selected = _captureShots.filter(s => s.selected);
+  if (selected.length === 0) return;
+  const includeAi = selected.some(s => s.aiBlob);
+  const blob = await _buildCaptureZip(selected, includeAi);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `parcel_capture_${new Date().toISOString().slice(0,19).replace(/[:.]/g, '-')}.zip`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+});
+
+document.getElementById('parcels-capture').addEventListener('click', () => {
+  if (!_screenshotCapable) {
+    alert('Screenshoty nejsou dostupné — WebGL context musel být vytvořen bez ' +
+          'preserveDrawingBuffer kvůli limitu prohlížeče. Zavři ostatní 3D taby ' +
+          'a obnov stránku.');
+    return;
+  }
+  captureParcelAngles();
+});
+
+// Distance slider: live label, debounced localStorage write, button to
+// re-trigger capture once the user picks a value.
+const _distSlider = document.getElementById('capture-dist-mul');
+const _distValEl = document.getElementById('capture-dist-mul-val');
+const _distRecapBtn = document.getElementById('capture-recapture');
+if (_distSlider) {
+  _distSlider.value = _captureDistMul;
+  _distValEl.textContent = `${_captureDistMul}×`;
+  _distSlider.addEventListener('input', () => {
+    _captureDistMul = parseInt(_distSlider.value, 10);
+    _distValEl.textContent = `${_captureDistMul}×`;
+    localStorage.setItem('capture_dist_mul', String(_captureDistMul));
+    // Enable re-capture if we have a captured parcel — slider drag
+    // alone doesn't re-render the shots.
+    if (_captureCurrentParcel) _distRecapBtn.disabled = false;
+  });
+}
+if (_distRecapBtn) {
+  _distRecapBtn.addEventListener('click', () => {
+    if (!_captureCurrentParcel) return;
+    // Same lot, fresh capture with current multiplier.
+    captureParcelAngles();
+    _distRecapBtn.disabled = true;
+  });
+}
 
 // ── HUD ──
 const sizes = rings.map(r => `${r.slug}: ${(r.side_m/1000).toFixed(0)} km @ ${r.step} m`).join('<br>  ');

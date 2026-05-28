@@ -62,6 +62,10 @@ def refresh_one(slug: str, tiers: list[str]) -> tuple[bool, str]:
             tier_size = max(64, int(round(size * t["scale"])))
             tier_specs.append((tier_name, t, tier_size))
         tier_specs.sort(key=lambda s: -s[2])
+        # Pre-fetch any missing SM5 sheets — same recurring "one stripe
+        # didn't load" fix as gen_heightfield. Done once per ring before
+        # the tier loop touches build_ortho_composite.
+        g.ensure_sm5_cached(cx, cy, half, fetch_missing=True)
         base_composite = None
         base_size = None
         for tier_name, t, tier_size in tier_specs:

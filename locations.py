@@ -108,18 +108,30 @@ def _read_label(slug: str) -> str:
 
 def list_locations() -> list[dict]:
     """Scan working dir pro 'tiles_v2_*' adresáře, vrátí list s
-    {slug, label, status, has_panorama, has_outer, has_closeup, has_inner}."""
+    {slug, label, status, has_panorama, has_outer, has_closeup,
+    has_inner, has_heightfield, modified_ts}.
+
+    Sorted newest-first by `modified_ts` so the most recently generated
+    or touched location lands at the top of the list. mtime fallback
+    chain: heightfield/manifest.json → tile dir → 0 (never modified).
+    Frontend can also re-sort using `modified_ts` if it wants a
+    different order (oldest-first, etc.).
+    """
     out = []
-    for path in sorted(Path(".").glob(f"{TILES_DIR_PREFIX}*")):
+    for path in Path(".").glob(f"{TILES_DIR_PREFIX}*"):
         if not path.is_dir():
             continue
         slug = path.name[len(TILES_DIR_PREFIX):]
         if not slug:
             continue
-        # Heightfield viewer availability: sub-manifest must exist. We don't
-        # validate every LERC/WebP file — generator is atomic enough that a
-        # half-written heightfield/ dir is rare in practice.
         hf_manifest = path / "heightfield" / "manifest.json"
+        # mtime = best signal for "when generated". Prefer heightfield
+        # manifest (touched on every gen_heightfield run); fall back to
+        # the tile dir mtime (set when the first sub-step ran).
+        try:
+            ts = hf_manifest.stat().st_mtime if hf_manifest.is_file() else path.stat().st_mtime
+        except OSError:
+            ts = 0
         out.append({
             "slug": slug,
             "label": _read_label(slug),
@@ -129,7 +141,10 @@ def list_locations() -> list[dict]:
             "has_closeup":  expected_glb(slug, "closeup").exists(),
             "has_inner":    expected_glb(slug, "inner").exists(),
             "has_heightfield": hf_manifest.exists(),
+            "modified_ts": ts,
         })
+    # Newest first.
+    out.sort(key=lambda d: d["modified_ts"], reverse=True)
     return out
 
 

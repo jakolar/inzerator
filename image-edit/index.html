@@ -288,6 +288,14 @@ runBtn.addEventListener('click', async () => {
       let detail = '';
       try { const j = await r.json(); detail = j.error || ''; if (j.details) detail += ' — ' + j.details; }
       catch { detail = await r.text(); }
+      // Friendly Czech translations for common OpenAI billing/quota errors
+      // (raw JSON is intimidating and the user action is always the same).
+      if (detail.includes('billing_hard_limit_reached'))
+        throw new Error('OpenAI billing limit dosažen — zvyš hard limit na platform.openai.com/account/billing/limits nebo počkej na nový měsíc');
+      if (detail.includes('insufficient_quota') || detail.includes('quota'))
+        throw new Error('OpenAI quota vyčerpaná — zkontroluj billing dashboard');
+      if (detail.includes('rate_limit') || r.status === 429)
+        throw new Error('OpenAI rate limit — počkej chvíli a zkus znovu');
       throw new Error(`HTTP ${r.status}: ${detail}`);
     }
     const runId = r.headers.get('X-Run-Id') || '';

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sends SIGTERM to any running bulk_dmpok.py at 06:00. The script's
+  signal handler drains in-flight downloads, flushes sheets.json,
+  releases the lock dir, then exits. pkill matches the python invocation
+  by full path via the -f flag.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.inzerator.bulk-dmpok.stop</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/pkill</string>
+    <string>-TERM</string>
+    <string>-f</string>
+    <string>bulk_dmpok\.py</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Volumes/Elements/cuzk-bulk/launchd.stop.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Volumes/Elements/cuzk-bulk/launchd.stop.err.log</string>
+</dict>
+</plist>

@@ -356,6 +356,92 @@ Pro ČR pyramid se ten kód **rozšíří, ne přepíše**:
 
 Vertex + fragment shadery jsou identické. To je hlavní design win — renderování se nevymýšlí znovu, jen pivot tile addressing.
 
+## Jak se to celé servíruje (klient ↔ server flow)
+
+Server stranou je to triviální — **statika přes HTTP**. Žádný runtime kompilátor, žádný GIS proces, žádný TiTiler. Inteligence je v klientovi.
+
+### Server: prosté statické file serving
+
+`server.py` (nebo nginx/Caddy/CloudFront) servíruje obsah `tiles/` adresáře jako klasickou statiku:
+
+```python
+elif self.path.startswith("/tiles/"):
+    # files jsou immutable (versioning v cestě) → cache forever
+    self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+    self.send_header("Access-Control-Allow-Origin", "*")  # CORS pro CDN
+    super().do_GET()
+```
+
+Když přijde GET `/tiles/heightmap/14/9123/5678.lerc`, server najde fyzický soubor na disku, vrátí jeho ~2 KB byte. **0 ms CPU**, jen disk I/O. Žádný GDAL, žádný Three.js — server nemusí být ani Python.
+
+### URL struktura
+
+Standard XYZ Slippy schema. Tři paralelní pyramidy:
+
+```
+/tiles/manifest.json                  # globální deskriptor (bounds, zoom range)
+/tiles/heightmap/{z}/{x}/{y}.lerc     # výška (DMPOK)
+/tiles/ortho/{z}/{x}/{y}.ktx2         # ortofoto barva
+/tiles/bare/{z}/{x}/{y}.lerc          # bare-earth (DMR5G)
+```
+
+Multi-tier ortho per-zoom: `z=8..14` use `ortho_mid/`, `z=15..16` use `ortho_high/`, `z=17..18` use `ortho_ultra/`. Manifest řekne klientovi jakou variantu pro jaký zoom fetchovat.
+
+### Per-frame klient flow (60×/s)
+
+Co viewer dělá při každém pohybu kamery:
+
+1. **Spočítat viditelné tiles** — z kamery + frustum spočítat WGS84 bbox, vyjmenovat XYZ tile coords v aktuálním zoomu. Typicky 4–16 tiles aktivních.
+2. **Vyřadit už načtené** — LRU cache drží ~100 tiles v paměti, klíč `${z}/${x}/${y}/${layer}`.
+3. **Fetchnout nové paralelně** — `fetch('/tiles/heightmap/...')` + `fetch('/tiles/ortho/...')`. Priority queue: visible center first.
+4. **Dekódovat** — `LERC.decode(buffer)` → `Float32Array` → `THREE.DataTexture`. `KTX2Loader.parse(buffer)` → `CompressedTexture` (GPU-native ETC1S). ~5 ms per tile, lze Web Worker.
+5. **Vytvořit tile mesh** — `new THREE.Mesh(sharedGeo, material)` s heightmap + ortho uniforms, position podle tile bbox center, scale = tile size v metrech.
+6. **Render** — vertex shader displaceY pro každý tile, GPU < 5 ms na celkem ~16M vertexů.
+7. **Cleanup** — tiles co opustily frustum → `dispose()` textur, `scene.remove()`.
+
+Server v tomhle flow nic nedělá kromě posílání byte streamů. **Veškerá inteligence (které tiles? jak sestavit?) je v JS klientovi.**
+
+### Per-tile bandwidth realita
+
+Pro 16 současně viditelných tiles:
+
+| Layer | Per tile | × 16 tiles |
+|---|---|---|
+| heightmap LERC | ~2 KB | 32 KB |
+| ortho KTX2 ultra | ~10 KB | 160 KB |
+| bare LERC (opt) | ~1 KB | 16 KB |
+| **Initial load celé scény** | | **~210 KB** |
+
+Pohybem kamery ~50 KB/s v stabilním tempu (1–2 nové tiles/s). Mobilní 4G to dá s rezervou. Edge cache (CloudFront / Bunny.net) zkrátí cestu — tiles jsou immutable + `max-age=1y` → 100 % cache hit po prvním fetchu.
+
+### Srovnání s OGC 3D Tiles spec (Cesium)
+
+„3D Tiles" jako formální spec (`tileset.json` + `.b3dm` / `.pnts` content) má jiný design:
+
+| Aspekt | OGC 3D Tiles | Náš heightfield pyramid |
+|---|---|---|
+| Tile content | mesh přímo (binární glTF) | heightmap + ortho samostatně |
+| Server | statický | statický |
+| Tile hierarchy | quadtree v `tileset.json` | implicitní XYZ Slippy |
+| Geometry | per-tile vertex data | reconstructed klient-side |
+| Per-tile velikost | 1–10 MB (mesh) | 12 KB (heightmap+ortho) |
+| Storage ČR @ 0,5 m | ~200 GB (adaptivní) | ~370 GB |
+| Klient | Cesium / MapLibre 3D | THREE.js heightfield viewer |
+
+3D Tiles je menší pro ČR storage protože mesh adaptivně decimuje ploché plochy. Náš heightfield pyramid je jednodušší implementačně a **30× menší per-tile fetch** (12 KB vs 1 MB). Pro real-estate use-case kde uživatel zobrazí ~10 lokací za session: heightfield vyhrává bandwidth, 3D Tiles vyhrává storage.
+
+Třetí cesta — 3D Tiles s heightfield jako content — naruší spec a Cesium to neumí načíst. Lepší stay in-lane: vlastní formát, dobře zdokumentovaný, optimální pro náš stack.
+
+### Co server musí přidat oproti dnešnímu stavu
+
+V `server.py` jen:
+
+1. **Static handler na `/tiles/`** s `Cache-Control: public, max-age=31536000, immutable` (~10 řádků kódu)
+2. **CORS** pokud chcete budoucí CDN
+3. **`Accept-Encoding: br`** dá marginální zisk — LERC/KTX2 jsou už interně komprimované
+
+Žádný nový dependency, žádný runtime CPU, žádný state. **Tile pyramid je dataset, ne služba.**
+
 ## Klient-side úpravy
 
 `heightfield/index.html` momentálně načte 3 LOD ringy z `tiles_v2_<slug>/heightfield/manifest.json`. Refactor na pyramid:

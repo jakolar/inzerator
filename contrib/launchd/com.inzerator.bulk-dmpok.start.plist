@@ -36,9 +36,16 @@
   <key>RunAtLoad</key>
   <false/>
 
+  <!--
+    Logs go to ~/Library/Logs/ (which launchd user agents can always
+    write), NOT /Volumes/Elements — user agents lack Full Disk Access
+    to external volumes by default and silently fail with exit 78.
+    Note: the script's own per-sheet log still lands on Elements
+    (sheets.json + download.log) via BULK_OUT_DIR.
+  -->
   <key>StandardOutPath</key>
-  <string>/Volumes/Elements/cuzk-bulk/launchd.out.log</string>
+  <string>/Users/jan/Library/Logs/inzerator/bulk-dmpok-start.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Volumes/Elements/cuzk-bulk/launchd.err.log</string>
+  <string>/Users/jan/Library/Logs/inzerator/bulk-dmpok-start.err.log</string>
 </dict>
 </plist>

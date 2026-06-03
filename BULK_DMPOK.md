@@ -161,6 +161,7 @@ INZERATOR_CACHE=/Volumes/Elements/cuzk-bulk python3 gen_heightfield.py --slug <s
 | `sheets.json not found` | Run `bulk_dmpok_inventory.py` first. |
 | Many `failed` sheets with `ConnectionError` | ČÚZK is having a bad day. Wait a night, then `bulk_dmpok_status.py --retry-failed`. |
 | Many `missing` (404) | Expected for a fraction of sheets. ČÚZK doesn't publish DMPOK for every SM5. |
-| launchd plist doesn't fire | Check `launchctl list | grep bulk-dmpok`. If absent, re-run `launchctl load -w …`. Logs go to `<BULK_OUT_DIR>/launchd.{out,err}.log`. |
+| launchd `launchctl list` shows non-zero last exit | Check `~/Library/Logs/inzerator/bulk-dmpok-start.err.log`. If first install failed silently with exit 78, the plist's `StandardOutPath`/`StandardErrorPath` was pointing at `/Volumes/Elements/`; launchd user agents lack TCC permission to write there. Plists in this repo already log under `~/Library/Logs/`. |
+| launchd plist doesn't fire | Check `launchctl list | grep bulk-dmpok`. If absent, re-run `launchctl load -w …`. |
 | Disk full mid-run | SIGTERM the process, free space, restart. State is consistent — only `done` sheets are counted. |
 | Macbook sleeps at night | Either disable sleep during the campaign (`caffeinate -i` in tmux, or System Settings → Energy), or use Power Adapter schedule. launchd won't fire during sleep. |

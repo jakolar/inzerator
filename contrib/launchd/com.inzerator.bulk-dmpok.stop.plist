@@ -31,8 +31,8 @@
   <false/>
 
   <key>StandardOutPath</key>
-  <string>/Volumes/Elements/cuzk-bulk/launchd.stop.out.log</string>
+  <string>/Users/jan/Library/Logs/inzerator/bulk-dmpok-stop.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Volumes/Elements/cuzk-bulk/launchd.stop.err.log</string>
+  <string>/Users/jan/Library/Logs/inzerator/bulk-dmpok-stop.err.log</string>
 </dict>
 </plist>

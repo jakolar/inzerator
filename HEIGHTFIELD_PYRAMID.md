@@ -418,19 +418,21 @@ Pohybem kamery ~50 KB/s v stabilním tempu (1–2 nové tiles/s). Mobilní 4G to
 
 „3D Tiles" jako formální spec (`tileset.json` + `.b3dm` / `.pnts` content) má jiný design:
 
-| Aspekt | OGC 3D Tiles | Náš heightfield pyramid |
+| Aspekt | OGC 3D Tiles (Cesium) | Náš heightfield pyramid |
 |---|---|---|
 | Tile content | mesh přímo (binární glTF) | heightmap + ortho samostatně |
 | Server | statický | statický |
 | Tile hierarchy | quadtree v `tileset.json` | implicitní XYZ Slippy |
 | Geometry | per-tile vertex data | reconstructed klient-side |
 | Per-tile velikost | 1–10 MB (mesh) | 12 KB (heightmap+ortho) |
-| Storage ČR @ 0,5 m | ~200 GB (adaptivní) | ~370 GB |
+| Storage ČR @ 0,5 m (teoretická adaptive pipeline) | ~200 GB | ~370 GB |
+| Storage ČR @ 0,5 m (naivně z existujícího `gen_detail`) | ~1–5 TB | — |
 | Klient | Cesium / MapLibre 3D | THREE.js heightfield viewer |
+| Vývoj | nový pipeline od nuly (2–4 týdny) | extension `heightfield/index.html` (1–2 týdny) |
 
-3D Tiles je menší pro ČR storage protože mesh adaptivně decimuje ploché plochy. Náš heightfield pyramid je jednodušší implementačně a **30× menší per-tile fetch** (12 KB vs 1 MB). Pro real-estate use-case kde uživatel zobrazí ~10 lokací za session: heightfield vyhrává bandwidth, 3D Tiles vyhrává storage.
+Důležitý kontext: ten "~200 GB pro 3D Tiles" je **hypotetická** velikost pokud by se postavila adaptive mesh pipeline od nuly — to v inzeratoru neexistuje. Realistická mesh alternativa z existujícího `gen_detail.py` rozšířeného na ČR = **1–5 TB**. Heightmap pyramid je tedy **3–14× menší než realisticky dostupná mesh varianta**, ne větší. Větší vychází jen vs hypotetický adaptive mesh, který by stál 2–4 týdny vývoje navíc.
 
-Třetí cesta — 3D Tiles s heightfield jako content — naruší spec a Cesium to neumí načíst. Lepší stay in-lane: vlastní formát, dobře zdokumentovaný, optimální pro náš stack.
+Náš heightfield pyramid je **30× menší per-tile fetch** (12 KB vs 1 MB) než mesh-based. Pro real-estate use-case: heightfield vyhrává bandwidth + reuse existujícího kódu.
 
 ### Co server musí přidat oproti dnešnímu stavu
 
@@ -488,9 +490,9 @@ Honest list — co se za výhodu menší velikosti a jednoduššího serveru pla
 
 | Problém | Detail |
 |---|---|
-| Větší disk než mesh 3D Tiles | 370 GB vs ~200 GB pro adaptivní mesh pyramidu. Heightmap nemůže "smáčknout" rovné pole na 4 vertexy — 4M pixelů ukládá, i když je to pole. |
 | Plný rebuild při ČÚZK update | DMPOK má 2-letý cyklus. Když ČÚZK vydá novou generaci, znovu projet ~42 h compute + převrtat 370 GB. Mesh-based by zvládl per-tile diff. |
 | Atomic per-tile load | Klient potřebuje celý tile před dekódováním. Mesh 3D Tiles umí progresivní LOD (low-quality base + refinement). LERC je atomic. |
+| Větší disk než hypotetický adaptive mesh | 370 GB vs teoretických ~200 GB pro mesh-based 3D Tiles **s adaptivní edge-collapse decimací**. Heightmap nemůže "smáčknout" rovné pole na 4 vertexy. ALE: ten 200 GB mesh přístup vyžaduje novou pipeline od nuly (2–4 týdny vývoje); ve vašem **reálném rozhodovacím prostoru** byly mesh alternativy 1–5 TB (per-location `gen_detail` rozšířený na ČR). Heightmap je tedy 3–14× menší, ne větší, vs realistická konkurence. |
 
 ### B) Render fidelity strop
 

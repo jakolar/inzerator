@@ -2,13 +2,28 @@
 <html lang="cs">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Heightfield viewer</title>
 <style>
   html, body { margin: 0; height: 100%; background: #1a1a1a; color: #ddd; font-family: system-ui, sans-serif; }
   #info { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,.6);
           padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.5;
-          z-index: 10; max-width: 360px; }
+          z-index: 10; max-width: 360px; max-height: calc(100vh - 24px);
+          overflow-y: auto; }
   #info b { color: #6cf; }
+  #info .info-section { margin-top: 8px; border-top: 1px solid rgba(255,255,255,.08); }
+  #info .info-section > summary { cursor: pointer; padding: 6px 0 4px;
+          font-weight: 600; color: #6cf; font-size: 12px;
+          text-transform: uppercase; letter-spacing: .04em;
+          list-style: none; user-select: none; }
+  #info .info-section > summary::-webkit-details-marker { display: none; }
+  #info .info-section > summary::before {
+          content: '▸'; display: inline-block; margin-right: 6px;
+          transition: transform .12s; color: #889; font-size: 10px; }
+  #info .info-section[open] > summary::before { transform: rotate(90deg); }
+  #info .info-controls-hint { margin-top: 10px; padding-top: 8px;
+          border-top: 1px solid rgba(255,255,255,.08);
+          font-size: 11px; color: #889; }
   #stats { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,.6);
            padding: 10px 12px; border-radius: 6px; font-size: 12px; z-index: 10;
            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -40,86 +55,99 @@
 </div>
 <div id="info">
   <b id="loc-title">Heightfield</b><br>
-  <span id="data">načítám…</span><br>
-  <label style="display:block;margin-top:6px;cursor:pointer;">
-    <input id="cad-toggle" type="checkbox"> 🗺 Zobrazit katastr
-  </label>
-  <span id="cad-status" style="font-size:11px;color:#9c9;"></span><br>
-  <label style="display:block;cursor:pointer;">
-    <input id="wire-toggle" type="checkbox"> 🔲 Wireframe (bez ortho)
-  </label>
-  <label style="display:block;cursor:pointer;">
-    <input id="shade-toggle" type="checkbox"> 🎨 Flat shaded (by elevation)
-  </label>
-  <label style="display:block;cursor:pointer;">
-    <input id="bare-toggle" type="checkbox"> 🌳 Skrýt vegetaci & domy (DMR5G)
-  </label>
-  <label style="display:block;cursor:pointer;">
-    <input id="shadow-toggle" type="checkbox"> 🌑 Sluneční svit a stíny
-  </label>
-  <div id="sun-controls" style="display:none;font-size:11px;margin:2px 0 0 18px;color:#bbb;">
-    <label style="display:block;">Hodina <span id="sun-hour-val">14:00</span>
-      <input id="sun-hour" type="range" min="4" max="22" value="14" step="0.25"
-             style="width:140px;vertical-align:middle;">
+  <span id="data">načítám…</span>
+
+  <details open class="info-section">
+    <summary>Zobrazení</summary>
+    <label style="display:block;cursor:pointer;">
+      <input id="cad-toggle" type="checkbox"> 🗺 Zobrazit katastr
+      <span id="cad-status" style="font-size:11px;color:#9c9;"></span>
     </label>
-    <label style="display:block;">Den v roce <span id="sun-doy-val">172 (21.6.)</span>
-      <input id="sun-doy" type="range" min="1" max="365" value="172" step="1"
-             style="width:140px;vertical-align:middle;">
+    <label style="display:block;cursor:pointer;">
+      <input id="wire-toggle" type="checkbox"> 🔲 Wireframe (bez ortho)
     </label>
-    <div id="sun-readout" style="color:#888;margin-top:2px;">az 215° / el 45°</div>
-  </div>
-  <label style="display:block;cursor:pointer;">
-    <input id="osm-toggle" type="checkbox"> 🗺 OSM místo ortho
-  </label>
-  <label style="display:block;cursor:pointer;">
-    <input id="parcels-toggle" type="checkbox"> 🟦 Označit parcely
-    <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
-    <button id="parcels-capture" style="display:none;font-size:11px;padding:2px 8px;
-            cursor:pointer;margin-left:8px;background:#1a6a8e;color:#fff;border:0;
-            border-radius:3px;font-weight:600;">📸 Generovat náhledy</button>
-  </label>
-  <div style="margin-left:18px;font-size:11px;">
-    <label style="color:#9c9;">Styl:
-      <select id="parcel-style" style="font-size:11px;padding:1px 4px;">
-        <option value="auto" selected>Auto (dle podkladu)</option>
-        <optgroup label="Obrys">
-          <option value="classic">Klasik (bílá + glow)</option>
-          <option value="hero">Hero (žlutá výplň)</option>
-          <option value="neon">Neon (tyrkysová HDR)</option>
-          <option value="print">Print (tmavá, bez glow)</option>
-          <option value="cadastre">Katastr (žluto-černá)</option>
-        </optgroup>
-        <optgroup label="Speciální">
-          <option value="bare">Bare-earth (skrz vegetaci)</option>
-          <option value="pin">📍 Pin (špendlík nad parcelou)</option>
-          <option value="beam">💡 Beam (světelný kužel)</option>
-          <option value="label">🔢 Číslo (parcelní označení)</option>
-        </optgroup>
-      </select>
+    <label style="display:block;cursor:pointer;">
+      <input id="shade-toggle" type="checkbox"> 🎨 Flat shaded (by elevation)
     </label>
-    <button id="parcels-clear" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:8px;">Zrušit výběr</button>
-  </div>
-  <label style="display:block;cursor:pointer;">
-    <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
-    <span id="poi-status" style="font-size:11px;color:#9c9;"></span>
-  </label>
-  <div id="ortho-quality" style="margin-top:6px;display:none;font-size:12px;">
-    Ortho kvalita:
-    <span style="display:inline-flex;gap:2px;margin-left:4px;">
-      <button class="oq" data-tier="low"   style="padding:2px 6px;font-size:11px;cursor:pointer;">Low</button>
-      <button class="oq" data-tier="mid"   style="padding:2px 6px;font-size:11px;cursor:pointer;">Mid</button>
-      <button class="oq" data-tier="high"  style="padding:2px 6px;font-size:11px;cursor:pointer;">High</button>
-      <button class="oq" data-tier="ultra" style="padding:2px 6px;font-size:11px;cursor:pointer;">Ultra</button>
-      <button class="oq" data-tier="super" style="padding:2px 6px;font-size:11px;cursor:pointer;">Super</button>
-    </span>
-    <span id="ortho-quality-status" style="font-size:10px;color:#888;margin-left:4px;"></span>
-  </div>
-  <div style="margin-top:8px;">
-    <button id="screenshot-btn" style="padding:4px 10px;font-size:12px;cursor:pointer;
+    <label style="display:block;cursor:pointer;">
+      <input id="bare-toggle" type="checkbox"> 🌳 Skrýt vegetaci & domy (DMR5G)
+    </label>
+    <label style="display:block;cursor:pointer;">
+      <input id="osm-toggle" type="checkbox"> 🗺 OSM místo ortho
+    </label>
+  </details>
+
+  <details open class="info-section">
+    <summary>Slunce a stíny</summary>
+    <label style="display:block;cursor:pointer;">
+      <input id="shadow-toggle" type="checkbox"> 🌑 Sluneční svit a stíny
+    </label>
+    <div id="sun-controls" style="display:none;font-size:11px;margin:2px 0 0 18px;color:#bbb;">
+      <label style="display:block;">Hodina <span id="sun-hour-val">14:00</span>
+        <input id="sun-hour" type="range" min="4" max="22" value="14" step="0.25"
+               style="width:140px;vertical-align:middle;">
+      </label>
+      <label style="display:block;">Den v roce <span id="sun-doy-val">172 (21.6.)</span>
+        <input id="sun-doy" type="range" min="1" max="365" value="172" step="1"
+               style="width:140px;vertical-align:middle;">
+      </label>
+      <div id="sun-readout" style="color:#888;margin-top:2px;">az 215° / el 45°</div>
+    </div>
+  </details>
+
+  <details open class="info-section">
+    <summary>Parcely a POI</summary>
+    <label style="display:block;cursor:pointer;">
+      <input id="parcels-toggle" type="checkbox"> 🟦 Označit parcely
+      <span id="parcels-count" style="font-size:11px;color:#9c9;"></span>
+      <button id="parcels-capture" style="display:none;font-size:11px;padding:2px 8px;
+              cursor:pointer;margin-left:8px;background:#1a6a8e;color:#fff;border:0;
+              border-radius:3px;font-weight:600;">📸 Generovat náhledy</button>
+    </label>
+    <div style="margin-left:18px;font-size:11px;">
+      <label style="color:#9c9;">Styl:
+        <select id="parcel-style" style="font-size:11px;padding:1px 4px;">
+          <option value="auto" selected>Auto (dle podkladu)</option>
+          <optgroup label="Obrys">
+            <option value="classic">Klasik (bílá + glow)</option>
+            <option value="hero">Hero (žlutá výplň)</option>
+            <option value="neon">Neon (tyrkysová HDR)</option>
+            <option value="print">Print (tmavá, bez glow)</option>
+            <option value="cadastre">Katastr (žluto-černá)</option>
+          </optgroup>
+          <optgroup label="Speciální">
+            <option value="bare">Bare-earth (skrz vegetaci)</option>
+            <option value="pin">📍 Pin (špendlík nad parcelou)</option>
+            <option value="beam">💡 Beam (světelný kužel)</option>
+            <option value="label">🔢 Číslo (parcelní označení)</option>
+          </optgroup>
+        </select>
+      </label>
+      <button id="parcels-clear" style="display:none;font-size:11px;padding:1px 6px;cursor:pointer;margin-left:8px;">Zrušit výběr</button>
+    </div>
+    <label style="display:block;cursor:pointer;margin-top:4px;">
+      <input id="poi-toggle" type="checkbox"> 📍 POI v okolí
+      <span id="poi-status" style="font-size:11px;color:#9c9;"></span>
+    </label>
+  </details>
+
+  <details id="ortho-quality" class="info-section" style="display:none;">
+    <summary>Ortho kvalita <span id="ortho-quality-status" style="font-size:10px;color:#888;font-weight:400;text-transform:none;letter-spacing:0;"></span></summary>
+    <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
+      <button class="oq" data-tier="low"   style="padding:4px 10px;font-size:12px;cursor:pointer;">Low</button>
+      <button class="oq" data-tier="mid"   style="padding:4px 10px;font-size:12px;cursor:pointer;">Mid</button>
+      <button class="oq" data-tier="high"  style="padding:4px 10px;font-size:12px;cursor:pointer;">High</button>
+      <button class="oq" data-tier="ultra" style="padding:4px 10px;font-size:12px;cursor:pointer;">Ultra</button>
+      <button class="oq" data-tier="super" style="padding:4px 10px;font-size:12px;cursor:pointer;">Super</button>
+    </div>
+  </details>
+
+  <div style="margin-top:10px;">
+    <button id="screenshot-btn" style="padding:6px 12px;font-size:13px;cursor:pointer;
             background:#1a6a8e;color:#fff;border:0;border-radius:4px;">📸 Screenshot</button>
     <span style="font-size:10px;color:#888;margin-left:6px;">P = klávesa</span>
   </div>
-  Drag = orbit · Scroll = zoom · Right-drag = pan
+  <div class="info-controls-hint">Drag = orbit · Scroll = zoom · Right-drag = pan</div>
 </div>
 <div id="stats"></div>
 
@@ -1674,15 +1702,21 @@ function redrawOutlines() {
   }
   const onOsm = osmToggle?.checked === true;
   const style = _resolveStyle(_parcelStyle, onOsm);
-  // Bare-earth drape needs CPU-side bare data for sampleBareAt. Kick
-  // off the load now; the drape pass below falls back to DSM if the
-  // bare data isn't ready yet, then a re-trigger redraws cleanly.
-  if (style.useBareDrape) {
-    if (!_bareDataPromise && !_bareDataReady()) {
-      _bareDataPromise = ensureBareDataLoaded().then(() => {
-        if (selectedParcels.size > 0 && _parcelStyle === 'bare') redrawOutlines();
-      }).finally(() => { _bareDataPromise = null; });
-    }
+  // DSM drape stays the default — bare-earth drape "amputates" the
+  // outline at houses (the line sits on the ground while the building
+  // looms 5-10 m above it, looks unnatural). DSM follows roofs and
+  // canopy, which reads as the parcel boundary "wrapping" features
+  // on it. The 'bare' style is the explicit opt-in for the line
+  // shining through canopy on actual ground.
+  //
+  // The zigzag we used to see on DSM-draped lines was per-sample
+  // noise from canopy / mesh artefacts, not the wrap itself. That's
+  // tackled below by a 3-sample median smoothing in drapeEdge.
+  const useBareDrape = !!style.useBareDrape;
+  if (useBareDrape && !_bareDataPromise && !_bareDataReady()) {
+    _bareDataPromise = ensureBareDataLoaded().then(() => {
+      if (selectedParcels.size > 0) redrawOutlines();
+    }).finally(() => { _bareDataPromise = null; });
   }
   // Lazy-create the material trio. Settings are tuned per-style on each
   // redraw (cheap — just colour + linewidth swaps).
@@ -1764,7 +1798,7 @@ function redrawOutlines() {
       const a = ring[i];
       const b = ring[(i + 1) % ring.length];
       if (edgeCount.get(_parcelEdgeKey(a, b)) !== 1) continue;
-      const pts = drapeEdge(a, b, !!style.useBareDrape);
+      const pts = drapeEdge(a, b, useBareDrape);
       for (let j = 0; j < pts.length - 1; j++) {
         const A = pts[j], B = pts[j + 1];
         positions.push(A.x, A.y, A.z, B.x, B.y, B.z);
@@ -2024,26 +2058,52 @@ function buildParcelFillMesh(ring) {
 // heightfield. Split off from drapeRing so the edge-dedup loop above
 // can emit per-edge tubes without having to subdivide entire rings.
 function drapeEdge(a, b, useBare) {
-  const SUB_M = 1.5;
-  // LIFT defaults to 0.8 above DSM (kills z-fight twinkle vs shader
-  // displacement). With bare-earth drape we sit ~tree height below the
-  // DSM mesh — the outline is intentionally "buried" under vegetation,
-  // depthTest:false in the style lets it shine through canopy. Small
-  // lift just keeps it off the bare ground itself.
-  const LIFT = useBare ? 0.3 : 0.8;
+  // 3 m sub-step on DSM is enough to follow roofs / canopy without
+  // sampling every individual tree-tip noise spike. Bare-earth is
+  // smoother so we can go even coarser there.
+  const SUB_M = useBare ? 4.0 : 3.0;
+  const LIFT = useBare ? 0.6 : 0.8;
   const sampler = useBare ? sampleBareAt : sampleAt;
-  const pts = [];
   const dx = b[0] - a[0];
   const dz = b[1] - a[1];
   const dist = Math.hypot(dx, dz);
   const steps = Math.max(1, Math.ceil(dist / SUB_M));
+
+  // Pass 1: raw height samples along the edge. Fallback to the linear
+  // server-provided ring-vertex Y for samples that miss (outside ring,
+  // bare not yet loaded).
+  const raw = new Array(steps + 1);
   for (let s = 0; s <= steps; s++) {
     const t = s / steps;
     const x = a[0] + dx * t;
     const z = a[1] + dz * t;
     const absY = sampler(x, z);
-    const ySource = absY !== null ? absY : (a[2] + (b[2] - a[2]) * t);
-    pts.push(new THREE.Vector3(x, ySource - yMid + LIFT, z));
+    raw[s] = absY !== null ? absY : (a[2] + (b[2] - a[2]) * t);
+  }
+
+  // Pass 2: 3-sample sliding median to kill isolated spikes (single
+  // tree poking through the perimeter, mesh artefact, roof corner).
+  // The median preserves real cliffs / building edges while removing
+  // 1-cell outliers — exactly what produced the "zigzag teeth" we
+  // were seeing along straight lot boundaries through vegetation.
+  // Pinned endpoints so the outline still meets the ring vertices.
+  const med = new Array(steps + 1);
+  med[0] = raw[0];
+  med[steps] = raw[steps];
+  for (let s = 1; s < steps; s++) {
+    const a_ = raw[s - 1], b_ = raw[s], c_ = raw[s + 1];
+    // 3-element median via two comparisons
+    med[s] = (a_ <= b_)
+      ? (b_ <= c_ ? b_ : (a_ <= c_ ? c_ : a_))
+      : (a_ <= c_ ? a_ : (b_ <= c_ ? c_ : b_));
+  }
+
+  const pts = new Array(steps + 1);
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    pts[s] = new THREE.Vector3(
+      a[0] + dx * t, med[s] - yMid + LIFT, a[1] + dz * t
+    );
   }
   return pts;
 }

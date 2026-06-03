@@ -2,6 +2,7 @@
 <html lang="cs">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Hnojice v2</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -18,24 +19,28 @@
     font-family: system-ui, sans-serif;
     white-space: nowrap;
   }
-  #atmo-toggle, #shot-btn, #hires-toggle {
-    position: absolute; top: 14px; z-index: 25;
+  #toolbar {
+    position: absolute; top: 14px; right: 14px; z-index: 25;
+    display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
+    max-width: calc(100% - 28px);
+  }
+  #toolbar button {
     background: rgba(255,255,255,0.92); border: 1px solid #ccc;
     border-radius: 6px; padding: 6px 10px; font-size: 13px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
     font-family: system-ui, sans-serif;
   }
-  #atmo-toggle  { right: 14px; }
-  #shot-btn     { right: 174px; }
-  #hires-toggle { right: 314px; }
-  #atmo-toggle:hover, #shot-btn:hover, #hires-toggle:hover { background: rgba(255,255,255,1); }
+  #toolbar button:hover { background: rgba(255,255,255,1); }
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
-<button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Zapnout HD</button>
-<button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
-<button id="atmo-toggle" type="button">🌫 Zapnout atmosféru</button>
+<div id="toolbar">
+  <button id="grade-toggle" type="button" title="Presentation grading: saturace + kontrast + neutral tone-map. Real-estate look vs RAW GIS look.">🎨 Zapnout grading</button>
+  <button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Zapnout HD</button>
+  <button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
+  <button id="atmo-toggle" type="button">🌫 Zapnout atmosféru</button>
+</div>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
 <script type="importmap">
 {
@@ -59,6 +64,7 @@ import { SSAARenderPass } from 'three/addons/postprocessing/SSAARenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 // mp4-muxer: in-memory MP4 muxer fed by WebCodecs `VideoEncoder` output.
 // Used for the deterministic frame-by-frame recording path so a slow
 // GPU doesn't produce a stuttery video. Lazy-imported in the record
@@ -230,6 +236,47 @@ composer.addPass(bloomPass);
 //   focus: 200, aperture: 5e-6, maxblur: 0.002,
 // });
 // composer.addPass(bokehPass);
+// Presentation grading — runs AFTER bloom in linear HDR so highlights aren't
+// double-bloomed by a brightness lift. Toggled at runtime by #grade-toggle.
+// Disabled by default → RAW GIS look matches existing screenshots/recordings.
+const gradePass = new ShaderPass({
+  uniforms: {
+    tDiffuse:    { value: null },
+    uSaturation: { value: 1.18 },
+    uContrast:   { value: 1.08 },
+    uBrightness: { value: 1.03 },
+    uGamma:      { value: 0.97 },
+    uWarmTint:   { value: new THREE.Vector3(1.02, 1.00, 0.98) },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uSaturation;
+    uniform float uContrast;
+    uniform float uBrightness;
+    uniform float uGamma;
+    uniform vec3  uWarmTint;
+    varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      vec3 rgb = c.rgb * uBrightness;
+      rgb = (rgb - 0.18) * uContrast + 0.18;
+      float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+      rgb = mix(vec3(luma), rgb, uSaturation);
+      rgb *= uWarmTint;
+      rgb = pow(max(rgb, 0.0), vec3(uGamma));
+      gl_FragColor = vec4(rgb, c.a);
+    }
+  `,
+});
+gradePass.enabled = false;
+composer.addPass(gradePass);
 // OutputPass does the final tone-map + linear→sRGB conversion. Must be last.
 composer.addPass(new OutputPass());
 
@@ -424,6 +471,24 @@ document.getElementById('hires-toggle').textContent =
 // label matches before loadV2 finishes.
 document.getElementById('atmo-toggle').textContent =
   ATMOSPHERE ? '🌤 Vypnout atmosféru' : '🌫 Zapnout atmosféru';
+
+// ─── Presentation grading toggle ─────────────────────────────────────────
+// Bundles two things: (1) saturation/contrast/brightness/gamma/warm-tint
+// shader pass, (2) renderer tone-mapping switch Linear → Neutral (Khronos
+// PBR neutral, no warm tint like ACES). State persisted in localStorage so
+// the choice survives reload; `?grade=1` URL override wins on first load.
+let GRADE = params.get('grade') === '1' || localStorage.getItem('v2-grade') === '1';
+function setGrade(on) {
+  GRADE = on;
+  gradePass.enabled = on;
+  renderer.toneMapping = on ? THREE.NeutralToneMapping : THREE.LinearToneMapping;
+  document.getElementById('grade-toggle').textContent =
+    on ? '🎨 Vypnout grading' : '🎨 Zapnout grading';
+  if (on) localStorage.setItem('v2-grade', '1');
+  else    localStorage.removeItem('v2-grade');
+}
+document.getElementById('grade-toggle').addEventListener('click', () => setGrade(!GRADE));
+setGrade(GRADE);
 
 // ─── Screenshot ──────────────────────────────────────────────────────────
 // renderer.preserveDrawingBuffer is already true (recording path needs it),
@@ -1809,8 +1874,35 @@ loadV2().catch(e => {
     msg = `${e.type} on ${(e.target && e.target.src) || '?'}`;
   else if (typeof e === 'string') msg = e;
   else msg = String(e);
-  status.textContent = `ERROR: ${msg}`;
-  status.style.color = 'red';
+  // 404 on manifest = wrong/missing region slug. Show a usable error
+  // card (not just a red status line that the user might scroll past)
+  // with the offending slug + a link back to the dashboard.
+  const isMissing = /HTTP 404/.test(msg) || /manifest/i.test(msg);
+  const card = document.createElement('div');
+  Object.assign(card.style, {
+    position: 'absolute', top: '50%', left: '50%',
+    transform: 'translate(-50%, -50%)', zIndex: '50',
+    background: '#fff', color: '#1d1d1f',
+    padding: '20px 24px', borderRadius: '10px',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.25)',
+    fontFamily: 'system-ui, sans-serif', fontSize: '14px',
+    maxWidth: 'min(420px, calc(100% - 32px))', lineHeight: '1.5',
+    textAlign: 'center',
+  });
+  card.innerHTML = isMissing
+    ? `<div style="font-size:32px;margin-bottom:8px;">📍</div>
+       <div style="font-weight:600;font-size:16px;margin-bottom:6px;">Lokace nenalezena</div>
+       <div style="color:#666;margin-bottom:14px;">
+         <code style="background:#f0f0f0;padding:2px 6px;border-radius:3px;">${REGION}</code>
+         neexistuje, nebo nemá manifest.json.
+       </div>
+       <a href="/" style="display:inline-block;padding:8px 16px;background:#1a73e8;color:#fff;border-radius:6px;text-decoration:none;font-weight:500;">← Zpět na lokace</a>`
+    : `<div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+       <div style="font-weight:600;font-size:16px;margin-bottom:6px;">Chyba při načítání</div>
+       <div style="color:#c30;margin-bottom:14px;font-family:ui-monospace,monospace;font-size:12px;word-break:break-word;">${msg}</div>
+       <a href="/" style="display:inline-block;padding:8px 16px;background:#1a73e8;color:#fff;border-radius:6px;text-decoration:none;font-weight:500;">← Zpět na lokace</a>`;
+  document.body.appendChild(card);
+  status.style.display = 'none';
 });
 </script>
 </body>

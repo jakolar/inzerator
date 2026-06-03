@@ -28,16 +28,31 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+import argparse
 import requests
 
 OUT_ROOT = Path(os.environ.get("BULK_OUT_DIR", "/Volumes/Elements/cuzk-bulk"))
 STATE_FILE = OUT_ROOT / "sheets.json"
 LOG_FILE = OUT_ROOT / "download.log"
-LOCK_DIR = OUT_ROOT / ".lock"
+# Lock dir lives on the internal disk — launchd user agents can't always
+# mkdir new paths under /Volumes/* (TCC restriction on external volumes
+# silently blocks `mkdir` with `PermissionError [Errno 1] Operation not
+# permitted` even when file writes inside existing subdirs succeed).
+# Hashing OUT_ROOT into the path lets multiple BULK_OUT_DIRs coexist.
+import hashlib as _hashlib
+_LOCK_PARENT = Path.home() / "Library" / "Caches" / "inzerator"
+LOCK_DIR = _LOCK_PARENT / (
+    f"bulk_dmpok-{_hashlib.sha1(str(OUT_ROOT).encode()).hexdigest()[:8]}.lock"
+)
 
 DMPOK_BASE = "https://openzu.cuzk.gov.cz/opendata/DMPOK-TIFF/epsg-5514"
 UA = "inzerator/1.0; alacremex@gmail.com"
-WORKERS = 3
+# 4 workers picked after profiling: download dominates (~99 % of per-sheet
+# time), per-stream throughput varies 1.8–16.5 MB/s, so a 4th worker
+# amortises slow streams. Disk + CPU sit idle, so going higher buys
+# little and starts crowding ČÚZK's politeness budget. See
+# BULK_DMPOK_PROFILE.md for the measurements.
+WORKERS = 4
 # Inter-sheet jitter per worker — caps aggregate rate even on a fast
 # uplink and matches the email's "0.5–2 s pause" promise.
 SLEEP_MIN, SLEEP_MAX = 0.5, 1.5
@@ -97,6 +112,7 @@ def _mark(code: str, status: str, **extra) -> None:
 def _acquire_lock() -> bool:
     """mkdir is atomic on POSIX → use the dir as a lockfile. Returns
     False if another instance already holds it."""
+    _LOCK_PARENT.mkdir(parents=True, exist_ok=True)
     try:
         LOCK_DIR.mkdir(parents=False, exist_ok=False)
     except FileExistsError:
@@ -235,6 +251,12 @@ def _progress_reporter(total: int) -> None:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--workers", type=int, default=WORKERS,
+                    help=f"parallel download workers (default {WORKERS})")
+    args = ap.parse_args()
+    workers = max(1, args.workers)
+
     if not STATE_FILE.exists():
         raise SystemExit(
             f"{STATE_FILE} not found — run bulk_dmpok_inventory.py first.")
@@ -266,15 +288,15 @@ def main() -> int:
         if not pending:
             print(f"Nothing pending. ({STATE_FILE} has no 'pending' entries.)")
             return 0
-        print(f"[{_now()}] starting: {WORKERS} workers, {len(pending)} pending sheets")
-        _log(f"START workers={WORKERS} pending={len(pending)}")
+        print(f"[{_now()}] starting: {workers} workers, {len(pending)} pending sheets")
+        _log(f"START workers={workers} pending={len(pending)}")
 
         reporter = threading.Thread(target=_progress_reporter,
                                     args=(len(pending),), daemon=True)
         reporter.start()
 
-        with ThreadPoolExecutor(max_workers=WORKERS) as exe:
-            for wid in range(WORKERS):
+        with ThreadPoolExecutor(max_workers=workers) as exe:
+            for wid in range(workers):
                 exe.submit(_worker_loop, pending, wid)
         _persist_state()
 

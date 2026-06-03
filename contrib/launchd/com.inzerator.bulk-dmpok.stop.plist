@@ -16,7 +16,7 @@
     <string>/usr/bin/pkill</string>
     <string>-TERM</string>
     <string>-f</string>
-    <string>bulk_dmpok\.py</string>
+    <string>bulk_dmpok.py</string>
   </array>
 
   <key>StartCalendarInterval</key>

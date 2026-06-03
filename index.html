@@ -31,6 +31,36 @@
     .empty { padding: 24px; text-align: center; color: #999; }
     .error { color: #c30; padding: 12px; background: #fff0f0;
              border-radius: 6px; margin: 8px 0; }
+    /* Toast container — replaces alert() for non-blocking errors. */
+    #toasts { position: fixed; top: 16px; right: 16px; z-index: 100;
+              display: flex; flex-direction: column; gap: 8px;
+              max-width: min(380px, calc(100% - 32px)); }
+    .toast { padding: 12px 14px; border-radius: 8px;
+             box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+             font-size: 13px; line-height: 1.5; color: #fff;
+             display: flex; gap: 10px; align-items: flex-start;
+             animation: toast-in 0.18s ease-out; }
+    .toast.error { background: #c0392b; }
+    .toast.info { background: #1a73e8; }
+    .toast.ok { background: #2a8a2a; }
+    .toast .close { cursor: pointer; opacity: 0.7; font-size: 16px;
+                    line-height: 1; padding: 0 4px; user-select: none; }
+    .toast .close:hover { opacity: 1; }
+    @keyframes toast-in { from { transform: translateX(20px); opacity: 0; } }
+    /* Job-row progress: compact label "krok N/M (název) ⇣ 42 %" + bar. */
+    .job-progress { font-size: 12px; display: flex; flex-direction: column;
+                    gap: 3px; flex: 1; max-width: 280px; }
+    .job-progress .text { color: #1a73e8; }
+    .job-progress .text.fail { color: #c30; }
+    .job-progress .bar { height: 4px; background: #e8eef9; border-radius: 2px;
+                         overflow: hidden; }
+    .job-progress .bar > i { display: block; height: 100%; background: #1a73e8;
+                             transition: width 0.25s; }
+    .job-progress .bar > i.fail { background: #c30; }
+    @media (prefers-reduced-motion: reduce) {
+      .toast { animation: none; }
+      .job-progress .bar > i { transition: none; }
+    }
   </style>
 </head>
 <body>
@@ -45,6 +75,7 @@
   </h1>
   <div id="locations"><div class="empty">Načítám…</div></div>
   <div id="form-container"></div>
+  <div id="toasts"></div>
 
   <script>
   // === Renders ===
@@ -94,7 +125,7 @@
     });
     const data = await r.json();
     if (r.status !== 200) {
-      alert(`Selhal (${r.status}): ${data.error || 'unknown'}`);
+      showToast(`Selhalo (${r.status}): ${data.error || 'unknown'}`, 'error');
       return;
     }
     startPolling();
@@ -116,6 +147,18 @@
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g,
       c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // Non-blocking notification. Auto-dismiss after 6 s for ok/info,
+  // sticky for errors so the user has time to read + copy if needed.
+  function showToast(msg, kind = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast ${kind}`;
+    el.innerHTML = `<div style="flex:1">${escapeHtml(msg)}</div>
+                    <span class="close" title="Zavřít">×</span>`;
+    el.querySelector('.close').onclick = () => el.remove();
+    document.getElementById('toasts').appendChild(el);
+    if (kind !== 'error') setTimeout(() => el.remove(), 6000);
   }
 
   let SELECTED_HIT = null;
@@ -244,11 +287,11 @@
           document.getElementById('manual-ok-btn')?.addEventListener('click', async () => {
             const cx = parseFloat(document.getElementById('manual-cx').value);
             const cy = parseFloat(document.getElementById('manual-cy').value);
-            if (isNaN(cx) || isNaN(cy)) { alert('Zadej platná čísla'); return; }
+            if (isNaN(cx) || isNaN(cy)) { showToast('Zadej platná čísla', 'error'); return; }
             // Server-side SJTSK→WGS so the verify map has marker coords
             // without bundling proj4 in the page.
             const ll = await fetch(`/api/sjtsk2wgs?cx=${cx}&cy=${cy}`).then(r => r.json());
-            if (typeof ll.lat !== 'number') { alert('Konverze selhala'); return; }
+            if (typeof ll.lat !== 'number') { showToast('Konverze S-JTSK→WGS selhala', 'error'); return; }
             selectHit({label: `Manual ${cx}, ${cy}`, sjtsk_cx: cx, sjtsk_cy: cy,
                        wgs_lat: ll.lat, wgs_lon: ll.lon, obec: 'lokace'});
           });
@@ -359,8 +402,8 @@
     });
     const data = await r.json();
     if (r.status !== 200) {
-      alert(`Chyba ${r.status}: ${data.error || 'unknown'}` +
-            (data.suggestion ? `\nZkus slug: ${data.suggestion}` : ''));
+      const suggestion = data.suggestion ? ` — zkus slug: ${data.suggestion}` : '';
+      showToast(`Chyba ${r.status}: ${data.error || 'unknown'}${suggestion}`, 'error');
       return;
     }
     renderForm(false);
@@ -411,28 +454,42 @@
     div.className = 'location-row';
     div.dataset.slug = job.slug;
     div.dataset.jobId = job.job_id;
-    const stepIcons = job.steps.map(s => {
-      const icon = {
-        pending: '⏳', running: '⏳', ok: '✓', fail: '✗',
-        skipped: '↷', cancelled: '⊘',
-      }[s.state] || '?';
-      const color = (s.state === 'fail' || s.state === 'cancelled') ? '#c30'
-                  : (s.state === 'running') ? '#1a73e8' : '#666';
-      return `<span style="color:${color}">${icon} ${s.name}</span>`;
-    }).join(' · ');
     const failedStep = job.steps.find(s => s.state === 'fail');
     const isDone = job.steps.every(s =>
       ['ok','fail','cancelled','skipped'].includes(s.state));
     const hasFail = !!failedStep;
 
+    // Compact progress: just the current step name + N/M + a bar.
+    // The 7-icon dump (⏳ ⏳ ✓ ✗ ↷ ⊘) overflowed on mobile and made
+    // every step indistinguishable. The full step list is still in
+    // `div.title` for the curious.
+    const total = job.steps.length;
+    const finishedCount = job.steps.filter(s =>
+      ['ok','skipped'].includes(s.state)).length;
+    const running = job.steps.find(s => s.state === 'running');
+    const current = failedStep || running ||
+                    job.steps.find(s => s.state === 'pending');
+    const pct = Math.round((finishedCount / total) * 100);
+    let label;
+    if (hasFail) label = `✗ ${failedStep.name} selhal`;
+    else if (isDone) label = `Hotovo (${finishedCount}/${total})`;
+    else if (current) label = `${finishedCount + 1}/${total} · ${current.name}`;
+    else label = 'čeká';
+
     div.innerHTML = `
       <span class="label">${escapeHtml(job.label || job.slug)}</span>
-      <span class="status status-generating" style="font-size:12px">${stepIcons}</span>
+      <div class="job-progress">
+        <span class="text${hasFail ? ' fail' : ''}">${escapeHtml(label)}</span>
+        <span class="bar"><i class="${hasFail ? 'fail' : ''}" style="width:${pct}%"></i></span>
+      </div>
       ${hasFail ? `<button class="btn" data-action="retry">Retry</button>` : ''}
       ${!isDone ? `<button class="btn btn-secondary" data-action="cancel">Cancel</button>` : ''}
     `;
+    // Hover/long-press surfaces the full step trace so the detail is
+    // still discoverable, just not in the always-visible row.
+    div.title = job.steps.map(s => `${s.name}: ${s.state}`).join('\n');
     if (failedStep) {
-      div.title = `${failedStep.name}: ${failedStep.error || 'unknown error'}`;
+      div.title += `\n\nERROR (${failedStep.name}): ${failedStep.error || 'unknown'}`;
     }
     div.querySelector('[data-action="retry"]')?.addEventListener('click',
       () => doRetry(job.job_id));

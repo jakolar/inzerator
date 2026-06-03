@@ -45,6 +45,11 @@
   #loading .title { font-weight: 600; margin-bottom: 4px; color: #6cf; }
   #loading .stage { font-size: 13px; color: #aaa; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    #loading { transition: none; }
+    #info .info-section > summary::before { transition: none; }
+    #loading .spin { animation-duration: 3s; }
+  }
 </style>
 </head>
 <body>
@@ -73,7 +78,7 @@
       <input id="bare-toggle" type="checkbox"> 🌳 Skrýt vegetaci & domy (DMR5G)
     </label>
     <label style="display:block;cursor:pointer;">
-      <input id="osm-toggle" type="checkbox"> 🗺 OSM místo ortho
+      <input id="osm-toggle" type="checkbox"> 🌍 OSM místo ortho
     </label>
   </details>
 
@@ -193,6 +198,9 @@
   .cap-btn:disabled { opacity:0.4;cursor:not-allowed; }
   .cap-thumb { position:relative;border-radius:6px;overflow:hidden;cursor:pointer;
                border:2px solid transparent;background:#000;transition:border-color 0.15s; }
+  @media (prefers-reduced-motion: reduce) {
+    .cap-thumb { transition: none; }
+  }
   .cap-thumb img { width:100%;display:block;aspect-ratio:3/2;object-fit:cover; }
   .cap-thumb.sel { border-color:#4aa3d9; }
   .cap-thumb .badge { position:absolute;top:6px;left:6px;background:rgba(0,0,0,0.7);

@@ -30,8 +30,22 @@
     min-height: 44px; min-width: 44px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
     font-family: system-ui, sans-serif;
+    transition: background 0.12s, border-color 0.12s;
   }
   #toolbar button:hover { background: rgba(255,255,255,1); }
+  /* aria-pressed=true → tinted background, dark border. Replaces the
+     old textContent swap (Zapnout/Vypnout) which made the label change
+     identity every click. */
+  #toolbar button[aria-pressed="true"] {
+    background: #1a73e8; color: #fff; border-color: #1a5fc4;
+  }
+  #toolbar button[aria-pressed="true"]:hover { background: #1668d4; }
+  #toolbar button:focus-visible {
+    outline: 2px solid #1a73e8; outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #toolbar button { transition: none; }
+  }
   /* Hide-UI mode (H key): every floating panel is a direct body child div
      with absolute positioning. Canvas stays visible. */
   body.ui-hidden > div { display: none !important; }
@@ -40,10 +54,10 @@
 <body>
 <div id="status">Loading…</div>
 <div id="toolbar">
-  <button id="grade-toggle" type="button" title="Presentation grading: saturace + kontrast + neutral tone-map. Real-estate look vs RAW GIS look.">🎨 Zapnout grading</button>
-  <button id="hires-toggle" type="button" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 Zapnout HD</button>
+  <button id="grade-toggle" type="button" aria-pressed="false" title="Presentation grading: saturace + kontrast + neutral tone-map. Real-estate look vs RAW GIS look.">🎨 Grading</button>
+  <button id="hires-toggle" type="button" aria-pressed="false" title="Přepne inner texturu na 0.125 m/px ČÚZK WMS source (vs cached 0.25 m). První načtení trvá ~30-60s.">🔍 HD</button>
   <button id="shot-btn" type="button" title="Stáhne aktuální záběr jako PNG (Cmd-S taky funguje)">📸 Screenshot</button>
-  <button id="atmo-toggle" type="button">🌫 Zapnout atmosféru</button>
+  <button id="atmo-toggle" type="button" aria-pressed="false" title="Sky HDR + horizont fog + 15 km panorama mesh">🌫 Atmosféra</button>
 </div>
 <script src="https://unpkg.com/proj4@2.9.2/dist/proj4.js"></script>
 <script type="importmap">
@@ -431,7 +445,7 @@ async function setAtmosphere(on) {
   ATMOSPHERE = on;
   const btn = document.getElementById('atmo-toggle');
   if (btn) {
-    btn.textContent = on ? '🌤 Vypnout atmosféru' : '🌫 Zapnout atmosféru';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     btn.disabled = true;
   }
   try {
@@ -466,15 +480,19 @@ function _setHiresUrlAndReload(on) {
   if (on) p.set('hires', '1'); else p.delete('hires');
   location.search = p.toString();
 }
-document.getElementById('hires-toggle').addEventListener('click', () => {
+document.getElementById('hires-toggle').addEventListener('click', (e) => {
+  // Page reload is instant in URL terms but the browser still spends
+  // a moment unloading + re-parsing — give the user visual confirmation
+  // that the click registered so they don't double-tap.
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = HIRES ? '… vypínám HD' : '… načítám HD';
   _setHiresUrlAndReload(!HIRES);
 });
-document.getElementById('hires-toggle').textContent =
-  HIRES ? '🔬 Vypnout HD' : '🔍 Zapnout HD';
-// Reflect initial state from `?atmosphere=1` immediately so the button
-// label matches before loadV2 finishes.
-document.getElementById('atmo-toggle').textContent =
-  ATMOSPHERE ? '🌤 Vypnout atmosféru' : '🌫 Zapnout atmosféru';
+document.getElementById('hires-toggle').setAttribute('aria-pressed', HIRES ? 'true' : 'false');
+// Reflect initial state from `?atmosphere=1` immediately so the toggle
+// pressed-state matches before loadV2 finishes.
+document.getElementById('atmo-toggle').setAttribute('aria-pressed', ATMOSPHERE ? 'true' : 'false');
 
 // ─── Presentation grading toggle ─────────────────────────────────────────
 // Bundles two things: (1) saturation/contrast/brightness/gamma/warm-tint
@@ -486,8 +504,7 @@ function setGrade(on) {
   GRADE = on;
   gradePass.enabled = on;
   renderer.toneMapping = on ? THREE.NeutralToneMapping : THREE.LinearToneMapping;
-  document.getElementById('grade-toggle').textContent =
-    on ? '🎨 Vypnout grading' : '🎨 Zapnout grading';
+  document.getElementById('grade-toggle').setAttribute('aria-pressed', on ? 'true' : 'false');
   if (on) localStorage.setItem('v2-grade', '1');
   else    localStorage.removeItem('v2-grade');
 }

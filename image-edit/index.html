@@ -74,6 +74,10 @@
     animation: spin 0.9s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    button.primary.busy::before { animation-duration: 2s; }
+    .drop, button.primary { transition: none; }
+  }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border);
                  padding: 6px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; }
   button.ghost:hover { color: var(--fg); border-color: var(--accent); }
@@ -152,7 +156,7 @@
       <span class="status" id="status">Načítám stav serveru…</span>
 
       <div class="panel" style="margin-top:14px">
-        <details>
+        <details id="prompt-details">
           <summary>Server-side prompt (jen na náhled)</summary>
           <pre class="prompt" id="prompt-preview">…</pre>
         </details>
@@ -204,6 +208,14 @@ async function loadPrompt() {
     const r = await fetch('/api/image-edit/prompt');
     $('prompt-preview').textContent = await r.text();
   } catch { $('prompt-preview').textContent = '(prompt fetch failed)'; }
+}
+// On first visit, expand the prompt details so the user can see what
+// the model is being asked to do. After they've opened the app once
+// (any session), respect their last collapsed/expanded choice — which
+// for <details> is the markup default (collapsed).
+if (!localStorage.getItem('image-edit-visited')) {
+  $('prompt-details').open = true;
+  localStorage.setItem('image-edit-visited', '1');
 }
 refreshStatus();
 loadPrompt();

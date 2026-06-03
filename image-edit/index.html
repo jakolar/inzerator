@@ -33,10 +33,11 @@
   .drop { border: 2px dashed var(--border); border-radius: 8px; padding: 24px;
           text-align: center; cursor: pointer; transition: all 0.15s;
           color: var(--muted); font-size: 13px; background: rgba(0,0,0,0.15); }
-  .drop:hover, .drop.over { border-color: var(--accent); color: var(--fg);
+  .drop:hover, .drop.over, .drop:focus-within { border-color: var(--accent); color: var(--fg);
                             background: rgba(74,163,217,0.08); }
   .drop.has-file { border-style: solid; border-color: var(--ok); color: var(--fg); }
-  .drop input { display: none; }
+  .drop input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .drop { position: relative; }
 
   .ref-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
               gap: 8px; margin-top: 10px; }
@@ -61,10 +62,18 @@
     border-radius: 4px; padding: 5px 8px; font-size: 13px; font-family: inherit;
   }
   button.primary { background: var(--accent); color: #fff; border: 0;
-                   padding: 10px 18px; border-radius: 6px; font-size: 14px;
-                   font-weight: 600; cursor: pointer; }
+                   padding: 12px 22px; border-radius: 6px; font-size: 14px;
+                   font-weight: 600; cursor: pointer; min-height: 44px;
+                   display: inline-flex; align-items: center; gap: 8px; }
   button.primary:hover { background: var(--accent-hi); }
   button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary.busy { background: var(--accent); opacity: 0.85; cursor: progress; }
+  button.primary.busy::before {
+    content: ''; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border);
                  padding: 6px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; }
   button.ghost:hover { color: var(--fg); border-color: var(--accent); }
@@ -267,6 +276,11 @@ function updateRunButton() {
 runBtn.addEventListener('click', async () => {
   if (!imageA) return;
   runBtn.disabled = true;
+  // Surface progress on the button itself — the result panel is in the
+  // other column and is easy to miss when the user is staring at the
+  // button they just clicked.
+  runBtn.classList.add('busy');
+  runBtn.textContent = 'Odesílám…';
   outStatusEl.className = 'status busy';
   outStatusEl.textContent = 'Odesílám na OpenAI… (high quality typicky 20–60 s)';
   $('prev-out').style.display = 'none';
@@ -313,6 +327,8 @@ runBtn.addEventListener('click', async () => {
     outStatusEl.className = 'status error';
     outStatusEl.textContent = `Chyba: ${e.message}`;
   } finally {
+    runBtn.classList.remove('busy');
+    runBtn.textContent = 'Vylepšit';
     updateRunButton();
   }
 });

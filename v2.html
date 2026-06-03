@@ -26,11 +26,15 @@
   }
   #toolbar button {
     background: rgba(255,255,255,0.92); border: 1px solid #ccc;
-    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+    border-radius: 6px; padding: 10px 14px; font-size: 13px;
+    min-height: 44px; min-width: 44px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer;
     font-family: system-ui, sans-serif;
   }
   #toolbar button:hover { background: rgba(255,255,255,1); }
+  /* Hide-UI mode (H key): every floating panel is a direct body child div
+     with absolute positioning. Canvas stays visible. */
+  body.ui-hidden > div { display: none !important; }
 </style>
 </head>
 <body>
@@ -546,6 +550,17 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
     e.preventDefault();
     downloadScreenshot();
+    return;
+  }
+  // Don't hijack typing inside form elements (selects in the recording
+  // panel, etc.). 'H' toggles every floating overlay so the user can
+  // frame an unobstructed shot or run a clean presentation.
+  if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) return;
+  if (e.key === 'h' || e.key === 'H') {
+    e.preventDefault();
+    const hidden = document.body.classList.toggle('ui-hidden');
+    // Class-only — every floating overlay uses absolute positioning, so
+    // a single rule in the stylesheet hides them all. See `.ui-hidden …`.
   }
 });
 

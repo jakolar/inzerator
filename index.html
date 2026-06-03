@@ -22,9 +22,10 @@
     .status-ready { color: #2a8a2a; }
     .status-partial { color: #c08000; }
     .status-generating { color: #1a73e8; }
-    .btn { padding: 6px 12px; border: 0; border-radius: 6px;
+    .btn { padding: 10px 16px; border: 0; border-radius: 6px;
            background: #1a73e8; color: white; cursor: pointer;
-           font-size: 13px; }
+           font-size: 13px; min-height: 40px; }
+    .btn:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
     .btn-secondary { background: #e0e0e0; color: #333; }
     .btn:disabled { opacity: 0.4; cursor: default; }
     .empty { padding: 24px; text-align: center; color: #999; }
@@ -100,8 +101,15 @@
   }
 
   function statusLabel(loc) {
-    if (loc.status === 'ready') return '✓ ready';
-    if (loc.status === 'partial') return '⚠ partial';
+    if (loc.status === 'ready') return '✓ připraveno';
+    // `partial` means one of two things — distinguish so user knows
+    // whether the location is usable (missing only Draco compress) or
+    // truly broken (pipeline stopped mid-way). The presence of inner
+    // is the practical signal: viewer can open with non-compressed
+    // GLBs, just slower.
+    if (loc.status === 'partial') {
+      return loc.has_inner ? '⚠ nezkomprimováno' : '⚠ rozdělané';
+    }
     return loc.status;
   }
 
@@ -127,6 +135,10 @@
   function renderForm(show) {
     const el = document.getElementById('form-container');
     if (!show) { el.innerHTML = ''; return; }
+    // Auto-scroll so the form is visible even after dozens of locations
+    // have pushed it below the fold. Done after the next tick so the
+    // browser has laid out the new content before scrolling to it.
+    setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
     el.innerHTML = `
       <div style="background:white; padding:16px; border-radius:8px; margin-top:16px;
                   box-shadow:0 1px 2px rgba(0,0,0,0.06);">
@@ -280,8 +292,10 @@
       <div style="margin-bottom:6px;"><b>${escapeHtml(hit.label)}</b></div>
       <div id="verify-map" style="width:100%; height:280px; border-radius:6px;
            border:1px solid #ddd; margin-bottom:8px;"></div>
-      <button class="btn" id="confirm-hit-btn">Potvrdit ✓</button>
-      <button class="btn btn-secondary" id="back-to-results-btn">Zpět</button>
+      <div style="display:flex; flex-wrap:wrap; gap:8px;">
+        <button class="btn" id="confirm-hit-btn" style="flex:1; min-width:140px;">Potvrdit ✓</button>
+        <button class="btn btn-secondary" id="back-to-results-btn" style="min-width:80px;">Zpět</button>
+      </div>
     `;
     // Tear down previous map (Leaflet hates re-init on the same div)
     if (VERIFY_MAP) { try { VERIFY_MAP.remove(); } catch (_) {} VERIFY_MAP = null; }

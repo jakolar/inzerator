@@ -108,18 +108,18 @@
       <label style="color:#9c9;">Styl:
         <select id="parcel-style" style="font-size:11px;padding:1px 4px;">
           <option value="auto" selected>Auto (dle podkladu)</option>
-          <optgroup label="Obrys">
-            <option value="classic">Klasik (bílá + glow)</option>
-            <option value="hero">Hero (žlutá výplň)</option>
-            <option value="neon">Neon (tyrkysová HDR)</option>
-            <option value="print">Print (tmavá, bez glow)</option>
-            <option value="cadastre">Katastr (žluto-černá)</option>
+          <optgroup label="Obrys parcely">
+            <option value="classic">Realitka — světlá</option>
+            <option value="hero">Realitka — žlutá výplň</option>
+            <option value="neon">Realitka — neonová</option>
+            <option value="print">Tisk / dokument</option>
+            <option value="cadastre">Jako katastr</option>
           </optgroup>
-          <optgroup label="Speciální">
-            <option value="bare">Bare-earth (skrz vegetaci)</option>
-            <option value="pin">📍 Pin (špendlík nad parcelou)</option>
-            <option value="beam">💡 Beam (světelný kužel)</option>
-            <option value="label">🔢 Číslo (parcelní označení)</option>
+          <optgroup label="Označení">
+            <option value="bare">Obrys skrz vegetaci</option>
+            <option value="pin">📍 Špendlík</option>
+            <option value="beam">💡 Světelný kužel</option>
+            <option value="label">🔢 Pouze číslo parcely</option>
           </optgroup>
         </select>
       </label>
@@ -134,20 +134,20 @@
   <details id="ortho-quality" class="info-section" style="display:none;">
     <summary>Ortho kvalita <span id="ortho-quality-status" style="font-size:10px;color:#888;font-weight:400;text-transform:none;letter-spacing:0;"></span></summary>
     <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">
-      <button class="oq" data-tier="low"   style="padding:4px 10px;font-size:12px;cursor:pointer;">Low</button>
-      <button class="oq" data-tier="mid"   style="padding:4px 10px;font-size:12px;cursor:pointer;">Mid</button>
-      <button class="oq" data-tier="high"  style="padding:4px 10px;font-size:12px;cursor:pointer;">High</button>
-      <button class="oq" data-tier="ultra" style="padding:4px 10px;font-size:12px;cursor:pointer;">Ultra</button>
-      <button class="oq" data-tier="super" style="padding:4px 10px;font-size:12px;cursor:pointer;">Super</button>
+      <button class="oq" data-tier="low"   style="padding:8px 14px;font-size:12px;min-height:36px;cursor:pointer;">Low</button>
+      <button class="oq" data-tier="mid"   style="padding:8px 14px;font-size:12px;min-height:36px;cursor:pointer;">Mid</button>
+      <button class="oq" data-tier="high"  style="padding:8px 14px;font-size:12px;min-height:36px;cursor:pointer;">High</button>
+      <button class="oq" data-tier="ultra" style="padding:8px 14px;font-size:12px;min-height:36px;cursor:pointer;">Ultra</button>
+      <button class="oq" data-tier="super" style="padding:8px 14px;font-size:12px;min-height:36px;cursor:pointer;">Super</button>
     </div>
   </details>
 
   <div style="margin-top:10px;">
-    <button id="screenshot-btn" style="padding:6px 12px;font-size:13px;cursor:pointer;
+    <button id="screenshot-btn" style="padding:10px 16px;font-size:13px;min-height:40px;cursor:pointer;
             background:#1a6a8e;color:#fff;border:0;border-radius:4px;">📸 Screenshot</button>
     <span style="font-size:10px;color:#888;margin-left:6px;">P = klávesa</span>
   </div>
-  <div class="info-controls-hint">Drag = orbit · Scroll = zoom · Right-drag = pan</div>
+  <div class="info-controls-hint">Drag = orbit · Scroll = zoom · Right-drag = pan · H = skrýt UI</div>
 </div>
 <div id="stats"></div>
 
@@ -2612,12 +2612,25 @@ function captureScreenshot() {
 }
 document.getElementById('screenshot-btn').addEventListener('click', captureScreenshot);
 document.addEventListener('keydown', (e) => {
-  // 'P' for photo — only when no form input has focus (don't steal
-  // keystrokes from the OSM/cad toggle label tabbing, etc.)
-  if ((e.key === 'p' || e.key === 'P') &&
-      !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) {
+  // Skip when a form element has focus so we don't steal keystrokes
+  // from the OSM/cad toggle label tabbing, range sliders, selects, etc.
+  if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) return;
+  // 'P' for photo.
+  if (e.key === 'p' || e.key === 'P') {
     e.preventDefault();
     captureScreenshot();
+    return;
+  }
+  // 'H' toggles the overlays (info panel + stats) so the user can
+  // see the full scene unobstructed — useful before taking a
+  // composition screenshot or for presentation mode.
+  if (e.key === 'h' || e.key === 'H') {
+    e.preventDefault();
+    const info = document.getElementById('info');
+    const stats = document.getElementById('stats');
+    const hidden = info.style.visibility === 'hidden';
+    info.style.visibility = hidden ? '' : 'hidden';
+    stats.style.visibility = hidden ? '' : 'hidden';
   }
 });
 
@@ -3218,6 +3231,15 @@ document.getElementById('capture-select-none').addEventListener('click', () => {
     div.querySelector('.check').textContent = '';
   }
   _refreshCaptureButtons();
+});
+// Esc closes capture modal (when no lightbox is open above it).
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('capture-modal');
+  const lightboxOpen = _lightboxEl && _lightboxEl.style.display !== 'none';
+  if (modal.style.display !== 'none' && !lightboxOpen) {
+    modal.style.display = 'none';
+  }
 });
 document.getElementById('capture-close').addEventListener('click', () => {
   document.getElementById('capture-modal').style.display = 'none';

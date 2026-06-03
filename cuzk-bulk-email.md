@@ -21,9 +21,11 @@ výškové informace.
 
 | Datová sada | Endpoint | Předpokládaný objem |
 |---|---|---|
-| DMPOK TIFF | `openzu.cuzk.gov.cz/opendata/DMPOK-TIFF/epsg-5514/` | ~880 GB (~12 600 mapových listů) |
+| DMPOK TIFF | `openzu.cuzk.gov.cz/opendata/DMPOK-TIFF/epsg-5514/` | ~1,14 TB (16 299 mapových listů dle `KladyMapovychListu/25`) |
 
-Celkový download ~880 GB, předpokládaná doba 1–3 dny.
+Celkový download ~1,14 TB. Stahování plánuji rozložit do nočních oken
+**22:00–06:00** přibližně **5–7 nocí**, abych minimalizoval zatížení v
+pracovních hodinách.
 
 ## Technické ohledy
 

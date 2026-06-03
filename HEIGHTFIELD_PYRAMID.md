@@ -480,6 +480,82 @@ V mapovém portálu (Leaflet/MapLibre 2D) bude link „3D pohled" co předá `la
 5. **Fáze E — POI + adresy z RÚIAN**:
    - Vector tiles (MVT) s populated areas, POI, adresami pro klick-to-info funkci
 
+## Nevýhody přístupu
+
+Honest list — co se za výhodu menší velikosti a jednoduššího serveru platí.
+
+### A) Storage a regeneration cost
+
+| Problém | Detail |
+|---|---|
+| Větší disk než mesh 3D Tiles | 370 GB vs ~200 GB pro adaptivní mesh pyramidu. Heightmap nemůže "smáčknout" rovné pole na 4 vertexy — 4M pixelů ukládá, i když je to pole. |
+| Plný rebuild při ČÚZK update | DMPOK má 2-letý cyklus. Když ČÚZK vydá novou generaci, znovu projet ~42 h compute + převrtat 370 GB. Mesh-based by zvládl per-tile diff. |
+| Atomic per-tile load | Klient potřebuje celý tile před dekódováním. Mesh 3D Tiles umí progresivní LOD (low-quality base + refinement). LERC je atomic. |
+
+### B) Render fidelity strop
+
+| Problém | Detail |
+|---|---|
+| Pouze Y-displacement | Heightmap = 1 výška per XY = jeden vertex nad každým bodem. **Žádné jeskyně, převisy, vertikální zdi, mosty, balkony.** Mesh zvládá protože může mít víc vertexů na stejné XY. Pro real-estate OK, pro urban architekturu (ulice pod podloubím) problém. |
+| Tile boundary seams | LERC ztrátová s `max_z_error=0.10 m`. Hraniční pixel jednoho tilu může být reprezentován jinak než hraniční pixel souseda → ~10 cm rozdíl na hraně. Při z=18 viditelné jako jemná čára. Mesh formáty mohou explicitně sdílet hraniční vertexy. |
+| Normály z fragment shader = noisy edges | 4-sample gradient na ostrých hranách (rohy budov, lomy terénu) vrátí prudké normály které z různých vzdáleností renderují různě. Mesh má baked per-vertex normály = stabilní. |
+| Static texture lock-in | Ortho je zapečené do KTX2. Nelze přebarvit podle výšky / sklonu / use-typu bez kompletního rebuilds. Mesh 3D Tiles s per-vertex attributes umí runtime recolor. |
+
+### C) Ecosystem / interoperability
+
+| Problém | Detail |
+|---|---|
+| Custom formát, není OGC | Náš pyramid neumí Cesium, MapLibre 3D, QGIS, ArcGIS. Renderuje jen náš JS klient. Pro distribuci jako otevřená data všichni musí použít náš viewer. |
+| Žádná vector layer support | Parcely, adresy, POI, road network — nic z toho na heightmap pyramid neexistuje. Buď samostatný vector tile pyramid (MVT), nebo cadastre jako rastr PNG (~126 GB), nebo runtime fetch z ČÚZK WMS. |
+| Single-vendor data dep | Vstup je ČÚZK DMPOK. Pokud ČÚZK změní formát / endpoint / licenci, pyramid je mrtvý. 3D Tiles dataset jde generovat z více zdrojů. |
+| Žádné feature picking | Klik na pixel vrátí `(x, z, y_height)`. **Ne "budova #1234"**, ne "parcela 350/2". Pro to potřebujeme runtime spatial query proti `KladyMapovychListu` nebo lokální parcel raster. |
+
+### D) Operační / engineering overhead
+
+| Problém | Detail |
+|---|---|
+| Per-frame vertex shader cost | GPU každý frame přepočítá Y displacement pro každý vertex každého tilu. 16 tiles × 1M vertexů = 16M sample-and-multiply per frame. Moderní GPU dá, ale mobil tier 1 pojede 30 FPS místo 60. Mesh čte hotový vertex buffer = 0 výpočet per frame. |
+| Žádný "base layer" trik | Mapbox / Cesium mají world-wide low-res s domain-specific high-res přepisem. Heightmap-pyramid tuhle warstvu nemá — mimo ČR (Slovensko, Polsko) hranice = sráz na 0. |
+| Vendor JS knihovny | LERC přes `lerc.wasm`, KTX2 přes `BasisU.wasm`. Závislost na verzích, breaking changes při upgradech. Mesh-based tahá jen `gltf-loader` ze standardních specs. |
+| Tile generation single-machine | 42 h compute na jedné mašině. Pokud kdy chcete týdenní re-pull, potřebujete cluster nebo akceptovat 2-denní stagnaci. |
+
+### E) UX / aplikační overhead
+
+| Problém | Detail |
+|---|---|
+| Bandwidth není zdarma | 50 KB/s při panningu = 30 MB / 10 min session. Na mobilu (5 GB měsíční plán) reálná položka. CDN pomůže, ale prvním uživatelům každého tilu z origin pořád stojí. |
+| Latence mimo cache | První fetch z origin = ~100 ms (RTT + decode). Pro user-facing 60 FPS pan viditelná díra. Mesh-based s `tileset.json` může prefetchovat agresivněji, heightmap-pyramid musí klient hádat. |
+| Žádné offline mode | Pro mobilní viewer offline cache potřebuje stažení celé regionální pyramidy (~5 GB / kraj). Mesh by mohl streamovat menší celky. |
+
+### Shrnutí kompromisů
+
+| Preferuje heightmap-pyramid | Preferuje mesh-based 3D Tiles |
+|---|---|
+| Real-estate session 5–10 lokací | Globální exploration mapou |
+| Krajinné terény, vesnice | Urban architektura s podloubími |
+| Vlastní viewer stack (Three.js) | Standard tooling (Cesium, MapLibre, ArcGIS) |
+| Per-tile bandwidth | Storage efficiency |
+| Implementační jednoduchost | Render flexibilita |
+| Single source of truth (ČÚZK only) | Multi-source layering |
+
+### Realistický verdikt pro inzerator
+
+Pro náš use-case (real-estate listings, krajinné scény, sessions 5–10 míst) jsou nevýhody přijatelné:
+
+- Caves / overhangs neřešíme (uživatelé nebydlí v jeskyni)
+- Custom viewer je už náš asset
+- 370 GB se vejde na Elements 22×
+- Single-vendor data je realita českého trhu
+- Per-frame vertex cost je zanedbatelný na cílovém HW
+
+Hlavní reálné slabiny:
+
+1. **Tile boundary seams při z=18** — viditelné při high-zoom screenshot. Řešitelné přes overlap (1–2 pixel) v generator skriptu.
+2. **2-letý re-bake cyklus** — řešitelné přes incremental diff od ČÚZK (potřeba extra tooling).
+3. **Žádné feature picking** — řeší se runtime ArcGIS query nebo separátní RUIAN raster (přidat do pyramidy jako 4. layer).
+
+Nic z toho není „nepřípustné", ale je dobré to mít vědomě.
+
 ## Open questions
 
 1. **Web Mercator vs S-JTSK pyramid?** Většina map portálů jede 3857. Tile pyramid v 5514 by se vyhnul reprojekci ale klient by potřeboval pyproj-equivalent v JS (proj4js).

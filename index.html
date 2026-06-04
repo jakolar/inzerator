@@ -12,7 +12,8 @@
     body { font-family: -apple-system, "Helvetica Neue", sans-serif;
            background: #f5f5f7; color: #1d1d1f; max-width: 800px;
            margin: 24px auto; padding: 0 16px; }
-    h1 { font-size: 22px; margin: 0 0 16px 0; }
+    h1 { font-size: 32px; font-weight: 700; letter-spacing: -0.02em;
+         margin: 0 0 16px 0; }
     .location-row { display: flex; align-items: center; gap: 12px;
                     padding: 12px 14px; background: white;
                     border-radius: 8px; margin-bottom: 8px;
@@ -67,10 +68,10 @@
   <h1 style="display:flex;align-items:center;gap:12px;">
     <span>Lokace</span>
     <button class="btn" id="new-location-btn"
-            style="font-size:14px;padding:6px 12px;font-weight:600;">+ Nová lokace</button>
+            style="font-size:14px;padding:8px 14px;font-weight:600;min-height:auto;">+ Nová lokace</button>
     <a href="/image-edit/"
        style="margin-left:auto;font-size:14px;font-weight:normal;
-       padding:6px 12px;background:#1a6a8e;color:#fff;border-radius:4px;
+       padding:8px 14px;background:#1a6a8e;color:#fff;border-radius:4px;
        text-decoration:none;">🖼 Image Edit</a>
   </h1>
   <div id="locations"><div class="empty">Načítám…</div></div>

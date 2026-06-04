@@ -98,23 +98,13 @@
         ${loc.status === 'partial'
           ? `<button class="btn" data-action="retry-from-disk" data-slug="${loc.slug}">Retry</button>`
           : ''}
-        ${loc.status === 'ready'
-          ? `<a class="btn" href="/v2.html?region=${loc.slug}">Otevřít</a>
-             <button class="btn btn-secondary" data-action="force-recompress" data-slug="${loc.slug}" title="Re-Draco s aktuálním quant presetem (outer/closeup=12, inner=14)">Recompress</button>`
-          : ''}
         ${loc.has_heightfield
-          ? `<a class="btn btn-secondary" href="/heightfield/?slug=${loc.slug}" title="Heightfield viewer (LERC + WebP, ~10 MB)">HF</a>`
+          ? `<a class="btn" href="/heightfield/?slug=${loc.slug}">Otevřít</a>`
           : ''}
       </div>
     `).join('');
     el.querySelectorAll('[data-action="retry-from-disk"]').forEach(btn => {
       btn.onclick = () => postJob(btn.dataset.slug, {resume_from_disk: true});
-    });
-    el.querySelectorAll('[data-action="force-recompress"]').forEach(btn => {
-      btn.onclick = () => {
-        if (!confirm(`Re-Draco ${btn.dataset.slug}? Zabere ~1 min, mezitím je viewer offline pro tuhle lokaci.`)) return;
-        postJob(btn.dataset.slug, {resume_from_disk: true, force_recompress: true});
-      };
     });
   }
 
@@ -134,14 +124,7 @@
 
   function statusLabel(loc) {
     if (loc.status === 'ready') return '✓ připraveno';
-    // `partial` means one of two things — distinguish so user knows
-    // whether the location is usable (missing only Draco compress) or
-    // truly broken (pipeline stopped mid-way). The presence of inner
-    // is the practical signal: viewer can open with non-compressed
-    // GLBs, just slower.
-    if (loc.status === 'partial') {
-      return loc.has_inner ? '⚠ nezkomprimováno' : '⚠ rozdělané';
-    }
+    if (loc.status === 'partial') return '⚠ rozdělané';
     return loc.status;
   }
 

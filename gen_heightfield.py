@@ -664,38 +664,72 @@ def save_ortho_webp(composite, out_path, quality):
 TILES_DIR_PREFIX = "tiles_v2_"
 
 
-def resolve_slug_paths(slug):
-    """Read existing tiles_v2_<slug>/manifest.json for centre, return
-    (cx, cy, out_dir). Out dir is `tiles_v2_<slug>/heightfield/`.
+def resolve_slug_paths(slug, cli_cx=None, cli_cy=None):
+    """Resolve (cx, cy, out_dir) for a slug. Out dir is
+    `tiles_v2_<slug>/heightfield/`.
 
-    The V2 manifest stores per-ring centres under details[].center_sjtsk;
-    all three rings share the same centre, so we just take details[0].
+    Centre lookup order (after v2 viewer was retired in 2026-06):
+      1. CLI --cx/--cy if both provided — primary path for new locations
+         driven by locations.py (which knows cx/cy from the job spec).
+      2. Existing heightfield sub-manifest at heightfield/manifest.json —
+         the path for re-generating an existing heightfield without
+         passing coords again.
+      3. Legacy v2 top-level manifest at tiles_v2_<slug>/manifest.json —
+         pre-v2-retirement lokace whose top-manifest hasn't been moved
+         to TOBEDELETED/ yet. Allows `gen_heightfield.py --slug X` on
+         legacy locations without breakage.
+
+    If none of the three sources have coords, SystemExit.
     """
     loc_dir = Path(f"{TILES_DIR_PREFIX}{slug}")
-    if not loc_dir.is_dir():
-        raise SystemExit(f"--slug {slug!r}: directory {loc_dir} not found")
-    manifest_path = loc_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise SystemExit(f"--slug {slug!r}: {manifest_path} missing")
-    m = json.loads(manifest_path.read_text())
-    details = m.get("details") or []
-    if not details:
-        raise SystemExit(f"--slug {slug!r}: manifest has no details[]")
-    cx, cy = details[0]["center_sjtsk"]
     out_dir = loc_dir / "heightfield"
-    return float(cx), float(cy), out_dir
+
+    # Path 1: explicit CLI coords. Most authoritative; no disk read.
+    if cli_cx is not None and cli_cy is not None:
+        return float(cli_cx), float(cli_cy), out_dir
+
+    if not loc_dir.is_dir():
+        raise SystemExit(
+            f"--slug {slug!r}: directory {loc_dir} not found and no "
+            f"--cx/--cy provided")
+
+    # Path 2: heightfield sub-manifest (re-gen case).
+    hf_manifest = out_dir / "manifest.json"
+    if hf_manifest.is_file():
+        m = json.loads(hf_manifest.read_text())
+        cx, cy = m.get("cx"), m.get("cy")
+        if cx is not None and cy is not None:
+            return float(cx), float(cy), out_dir
+
+    # Path 3: legacy v2 top-level manifest.
+    legacy = loc_dir / "manifest.json"
+    if legacy.is_file():
+        m = json.loads(legacy.read_text())
+        details = m.get("details") or []
+        if details and "center_sjtsk" in details[0]:
+            cx, cy = details[0]["center_sjtsk"]
+            return float(cx), float(cy), out_dir
+
+    raise SystemExit(
+        f"--slug {slug!r}: no centre found. Pass --cx and --cy, or run "
+        f"after the heightfield step has produced "
+        f"{hf_manifest}, or have the legacy v2 manifest at {legacy}.")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--slug", default=None,
-                   help="location slug (reads tiles_v2_<slug>/manifest.json "
-                        "for centre, writes to tiles_v2_<slug>/heightfield/). "
-                        "Overrides --cx/--cy/--out.")
-    p.add_argument("--cx", type=float, default=-624842.99,
-                   help="S-JTSK X centre (default = Borová u Poličky)")
-    p.add_argument("--cy", type=float, default=-1095333.84,
-                   help="S-JTSK Y centre")
+                   help="location slug. Writes to tiles_v2_<slug>/heightfield/. "
+                        "Centre resolved from --cx/--cy if both given; "
+                        "otherwise from heightfield/manifest.json (re-gen) "
+                        "or the legacy v2 top-level manifest.json. "
+                        "Overrides --out.")
+    p.add_argument("--cx", type=float, default=None,
+                   help="S-JTSK X centre. Required unless --slug points to "
+                        "an existing location with a heightfield or legacy "
+                        "v2 manifest from which centre can be recovered.")
+    p.add_argument("--cy", type=float, default=None,
+                   help="S-JTSK Y centre. See --cx.")
     p.add_argument("--out", default=".",
                    help="output directory (default = cwd)")
     p.add_argument("--cache-dir", default=None,
@@ -747,11 +781,13 @@ def main():
                         "32 MB GPU cost acceptable on most devices).")
     args = p.parse_args()
     if args.slug:
-        cx, cy, out_dir = resolve_slug_paths(args.slug)
+        cx, cy, out_dir = resolve_slug_paths(args.slug, args.cx, args.cy)
         args.cx, args.cy = cx, cy
         args.out = str(out_dir)
         print(f"Slug {args.slug!r}: centre=({cx:.2f}, {cy:.2f}) "
               f"→ {out_dir}/")
+    elif args.cx is None or args.cy is None:
+        raise SystemExit("Need --slug, or --cx + --cy + --out.")
     tiers = [t.strip() for t in args.ortho_tiers.split(",") if t.strip()]
     for t in tiers:
         if t not in ORTHO_TIERS:

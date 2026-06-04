@@ -15,7 +15,10 @@ def _reset_ku_cache():
 
 
 def test_module_imports():
-    assert locations.STEP_NAMES == ("panorama", "sm5", "outer", "closeup", "inner", "compress")
+    # After v2 viewer retirement (2026-06), pipeline trimmed to two steps.
+    # Heightfield viewer is the only consumer; sm5 stays separate so a flaky
+    # ČÚZK download can be retried without re-encoding the heightfield.
+    assert locations.STEP_NAMES == ("sm5", "heightfield")
     assert locations.TILES_DIR_PREFIX == "tiles_v2_"
 
 
@@ -73,11 +76,14 @@ def test_parse_obec(adresa, obec):
 
 def test_expected_glb_paths():
     from pathlib import Path
-    assert locations.expected_glb("hnojice", "panorama") == Path("tiles_v2_hnojice/panorama.glb")
     assert locations.expected_glb("hnojice", "sm5") == Path("tiles_v2_hnojice/.sm5_ok")
-    assert locations.expected_glb("hnojice", "outer") == Path("tiles_v2_hnojice/details/outer.glb")
-    assert locations.expected_glb("hnojice", "closeup") == Path("tiles_v2_hnojice/details/closeup.glb")
-    assert locations.expected_glb("hnojice", "inner") == Path("tiles_v2_hnojice/details/inner.glb")
+    assert locations.expected_glb("hnojice", "heightfield") == \
+        Path("tiles_v2_hnojice/heightfield/manifest.json")
+    # Steps from the retired v2 pipeline raise — guard against accidental
+    # re-introduction without updating STEP_NAMES.
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        locations.expected_glb("hnojice", "panorama")
 
 
 def test_location_status_missing(tmp_path, monkeypatch):
@@ -86,61 +92,65 @@ def test_location_status_missing(tmp_path, monkeypatch):
 
 
 def test_location_status_partial(tmp_path, monkeypatch):
+    """Directory exists but heightfield manifest doesn't → partial
+    (in-flight or interrupted gen)."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "tiles_v2_foo").mkdir()
-    (tmp_path / "tiles_v2_foo" / "panorama.glb").touch()
-    (tmp_path / "tiles_v2_foo" / "details").mkdir()
-    (tmp_path / "tiles_v2_foo" / "details" / "outer.glb").touch()
-    # closeup + inner chybí
+    (tmp_path / "tiles_v2_foo" / ".sm5_ok").touch()
     assert locations.location_status("foo") == "partial"
 
 
 def test_location_status_ready(tmp_path, monkeypatch):
+    """heightfield/manifest.json present → ready, regardless of sm5 sentinel."""
     monkeypatch.chdir(tmp_path)
     base = tmp_path / "tiles_v2_foo"
-    (base / "details").mkdir(parents=True)
-    (base / "panorama.glb").touch()
-    for s in ("outer", "closeup", "inner"):
-        (base / "details" / f"{s}.glb").touch()
-    (base / ".compress_ok").touch()
+    (base / "heightfield").mkdir(parents=True)
+    (base / "heightfield" / "manifest.json").write_text("{}")
     assert locations.location_status("foo") == "ready"
 
 
-def test_location_status_partial_when_compress_missing(tmp_path, monkeypatch):
-    """All 4 glb present but no .compress_ok → still partial."""
-    monkeypatch.chdir(tmp_path)
-    base = tmp_path / "tiles_v2_foo"
-    (base / "details").mkdir(parents=True)
-    (base / "panorama.glb").touch()
-    for s in ("outer", "closeup", "inner"):
-        (base / "details" / f"{s}.glb").touch()
-    assert locations.location_status("foo") == "partial"
-
-
 def test_list_locations_scan(tmp_path, monkeypatch):
+    """Two locations: alpha ready (heightfield manifest exists), beta partial.
+    label resolved from location.json (current) or legacy v2 manifest."""
     monkeypatch.chdir(tmp_path)
-    # Dvě lokace: jedna ready, jedna partial
-    for slug in ("alpha", "beta"):
-        (tmp_path / f"tiles_v2_{slug}" / "details").mkdir(parents=True)
-        (tmp_path / f"tiles_v2_{slug}" / "panorama.glb").touch()
-    (tmp_path / "tiles_v2_alpha" / "details" / "outer.glb").touch()
-    (tmp_path / "tiles_v2_alpha" / "details" / "closeup.glb").touch()
-    (tmp_path / "tiles_v2_alpha" / "details" / "inner.glb").touch()
-    (tmp_path / "tiles_v2_alpha" / ".compress_ok").touch()
-    # Manifest s label pro alpha
     import json as _json
-    (tmp_path / "tiles_v2_alpha" / "manifest.json").write_text(
-        _json.dumps({"region": {"slug": "alpha", "label": "Alpha Village"}}))
+    for slug in ("alpha", "beta"):
+        (tmp_path / f"tiles_v2_{slug}").mkdir(parents=True)
+    # alpha: ready + label via location.json (current persistence path)
+    (tmp_path / "tiles_v2_alpha" / "heightfield").mkdir()
+    (tmp_path / "tiles_v2_alpha" / "heightfield" / "manifest.json").write_text("{}")
+    (tmp_path / "tiles_v2_alpha" / "location.json").write_text(
+        _json.dumps({"slug": "alpha", "label": "Alpha Village",
+                     "cx": -547700, "cy": -1107700}))
+    # beta: partial + label via legacy v2 manifest fallback
+    (tmp_path / "tiles_v2_beta" / "manifest.json").write_text(
+        _json.dumps({"region": {"slug": "beta", "label": "Beta Hamlet"}}))
 
     result = locations.list_locations()
     by_slug = {r["slug"]: r for r in result}
     assert set(by_slug) == {"alpha", "beta"}
     assert by_slug["alpha"]["status"] == "ready"
     assert by_slug["alpha"]["label"] == "Alpha Village"
+    assert by_slug["alpha"]["has_heightfield"] is True
     assert by_slug["beta"]["status"] == "partial"
-    assert by_slug["beta"]["label"] == "beta"   # fallback = slug
-    assert by_slug["alpha"]["has_panorama"] is True
-    assert by_slug["beta"]["has_outer"] is False
+    assert by_slug["beta"]["label"] == "Beta Hamlet"
+    assert by_slug["beta"]["has_heightfield"] is False
+
+
+def test_persist_location_meta_writes_label(tmp_path, monkeypatch):
+    """enqueue path: location.json with {slug, label, cx, cy, created_at}
+    after _persist_location_meta. Atomic via .tmp + replace."""
+    monkeypatch.chdir(tmp_path)
+    locations._persist_location_meta("foo", "Foo Village", -100.0, -200.0)
+    meta_path = tmp_path / "tiles_v2_foo" / "location.json"
+    assert meta_path.is_file()
+    import json as _json
+    data = _json.loads(meta_path.read_text())
+    assert data["slug"] == "foo"
+    assert data["label"] == "Foo Village"
+    assert data["cx"] == -100.0
+    assert data["cy"] == -200.0
+    assert "created_at" in data
 
 
 def _mock_ruian_response(features):
@@ -345,6 +355,7 @@ def test_enqueue_job_default_force_recompress_false():
     locations.JOBS.clear(); locations.JOB_QUEUE.clear()
 
 
+@pytest.mark.skip(reason="v2 compress step retired 2026-06; _do_compress dead")
 def test_do_compress_force_re_dracos_from_orig(tmp_path, monkeypatch):
     """force_recompress=True ignores `orig_path already exists` skip;
     re-Dracos from _orig_uncompressed/ and overwrites details/."""
@@ -377,6 +388,7 @@ def test_do_compress_force_re_dracos_from_orig(tmp_path, monkeypatch):
         assert (region / "details" / f"{name}.glb").read_bytes() == b"NEW-MESHOPT-ORIG-" + name.encode()
 
 
+@pytest.mark.skip(reason="v2 compress step retired 2026-06")
 def test_do_compress_force_encode_crash_keeps_orig(tmp_path, monkeypatch):
     """force_recompress: meshopt encode raises. The except path must NOT
     rename `_orig_uncompressed/<slug>.glb` away (it's the only lossless
@@ -404,6 +416,7 @@ def test_do_compress_force_encode_crash_keeps_orig(tmp_path, monkeypatch):
     assert (region / "_orig_uncompressed" / "outer.glb").read_bytes() == b"LOSSLESS-ORIG"
 
 
+@pytest.mark.skip(reason="v2 compress step retired 2026-06")
 def test_do_compress_force_fails_without_orig(tmp_path, monkeypatch):
     """force_recompress with no _orig_uncompressed file: deployed glb stays
     intact (no data destruction). Step soft-skips that target rather than
@@ -540,7 +553,7 @@ def clean_jobs():
         locations.CURRENT_JOB = None
 
 
-def test_enqueue_creates_job_with_5_steps(clean_jobs):
+def test_enqueue_creates_job_with_step_set(clean_jobs):
     job_id = locations.enqueue_job("test1", "Test Village", -500000.0, -1100000.0)
     assert job_id in locations.JOBS
     job = locations.JOBS[job_id]
@@ -584,23 +597,21 @@ def test_list_active_jobs_queued(clean_jobs):
 
 
 def test_retry_resets_failed_steps(clean_jobs):
-    """Retry odebere `fail` stepy zpět na `pending` a vrátí job_id do fronty."""
+    """retry_job flips `fail` steps back to `pending` and re-enqueues the job.
+    `ok` steps stay `ok` (the worker will skip them via the on-disk
+    sentinel / manifest existence check)."""
     job_id = locations.enqueue_job("t", "T", 0.0, 0.0)
-    # Simuluj že job už proběhl a closeup selhal:
     locations.JOB_QUEUE.clear()
     job = locations.JOBS[job_id]
-    job["steps"][0]["state"] = "ok"      # panorama
-    job["steps"][1]["state"] = "ok"      # sm5 (NEW)
-    job["steps"][2]["state"] = "ok"      # outer
-    job["steps"][3]["state"] = "fail"    # closeup
-    job["steps"][3]["error"] = "test error"
-    job["steps"][4]["state"] = "pending" # inner stayed
+    # STEP_NAMES = ("sm5", "heightfield") after the v2 retirement.
+    job["steps"][0]["state"] = "ok"        # sm5
+    job["steps"][1]["state"] = "fail"      # heightfield
+    job["steps"][1]["error"] = "test error"
     assert locations.retry_job(job_id) is True
     assert locations.JOB_QUEUE == [job_id]
-    # Failed se reset; ok zůstane (worker je preskočí přes existenci .glb)
-    assert job["steps"][3]["state"] == "pending"
-    assert job["steps"][3]["error"] is None
-    assert job["steps"][0]["state"] == "ok"   # ok zůstane
+    assert job["steps"][1]["state"] == "pending"
+    assert job["steps"][1]["error"] is None
+    assert job["steps"][0]["state"] == "ok"
 
 
 def test_retry_unknown_job_returns_false(clean_jobs):
@@ -626,6 +637,8 @@ def test_cancel_already_done_returns_false(clean_jobs):
 import os
 
 
+@pytest.mark.skip(reason="v2 pipeline retired 2026-06; tests live until "
+                         "cmd_for branches + gen_panorama.py move to TOBEDELETED")
 def test_cmd_for_panorama():
     cmd = locations.cmd_for("panorama", "test", -547700.0, -1107700.0)
     assert cmd[0] == "python3"
@@ -636,6 +649,7 @@ def test_cmd_for_panorama():
     assert any(arg.startswith("--center-sjtsk=") for arg in cmd)
 
 
+@pytest.mark.skip(reason="v2 pipeline retired 2026-06")
 def test_cmd_for_inner_has_step_0_5():
     """Inner detail = --step 0.5 (jemnější než stávající Hnojice manifest)."""
     cmd = locations.cmd_for("inner", "test", -547700.0, -1107700.0)
@@ -646,6 +660,7 @@ def test_cmd_for_inner_has_step_0_5():
     assert "--fade-to closeup" in cmd_str
 
 
+@pytest.mark.skip(reason="v2 pipeline retired 2026-06")
 def test_cmd_for_outer_closeup_steps():
     outer = " ".join(locations.cmd_for("outer", "x", 0.0, 0.0))
     closeup = " ".join(locations.cmd_for("closeup", "x", 0.0, 0.0))
@@ -653,11 +668,8 @@ def test_cmd_for_outer_closeup_steps():
     assert "--half 1500" in closeup and "--step 1.5" in closeup and "--fade-to outer" in closeup
 
 
-def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
-    """Mock subprocess.Popen, aby vytvořil expected .glb. Worker projde
-    všech 5 stepů → state ok pro každý."""
-    monkeypatch.chdir(tmp_path)
-
+def _patch_sm5_sentinel(monkeypatch):
+    """Helper: stub the in-proc SM5 step so it just writes .sm5_ok."""
     def fake_sm5(job, log_path):
         sentinel = locations.expected_glb(job["slug"], "sm5")
         sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -665,167 +677,94 @@ def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
         return True
     monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
 
-    def fake_compress(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "compress")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_compress", fake_compress)
 
-    class FakeProc:
+def _fake_heightfield_proc(success: bool, write_partial: bool = False):
+    """Build a fake subprocess.Popen class that, when invoked with
+    gen_heightfield.py args (--slug X), writes heightfield/manifest.json
+    (or not) and returns the configured exit code."""
+    class Proc:
         def __init__(self, cmd, **kw):
             self.cmd = cmd
-            self.returncode = 0
+            self.returncode = 0 if success else 1
         def communicate(self, timeout=None):
-            # Najdi --region a --slug v cmd, vytvoř expected .glb
             args = self.cmd
-            region = args[args.index("--region") + 1]
-            slug_step = "panorama"
             if "--slug" in args:
-                slug_step = args[args.index("--slug") + 1]
-            out_path = locations.expected_glb(region, slug_step)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.touch()
-            return "fake stdout", ""
+                slug = args[args.index("--slug") + 1]
+                if success or write_partial:
+                    out = locations.expected_glb(slug, "heightfield")
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.touch()
+            if success:
+                return "fake stdout", ""
+            return "", "Traceback (most recent call last):\nValueError: bad"
         def terminate(self): pass
         def kill(self): pass
         def wait(self, timeout=None): pass
+    return Proc
 
-    monkeypatch.setattr(locations.subprocess, "Popen", FakeProc)
+
+def test_worker_runs_job_to_completion(tmp_path, monkeypatch, clean_jobs):
+    """Worker walks all STEP_NAMES → ok. After v2 retirement the chain is
+    sm5 (in-proc) → heightfield (subprocess gen_heightfield.py)."""
+    monkeypatch.chdir(tmp_path)
+    _patch_sm5_sentinel(monkeypatch)
+    monkeypatch.setattr(locations.subprocess, "Popen",
+                        _fake_heightfield_proc(success=True))
 
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
-    # Spustit worker jednou (single-iteration helper)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
     assert all(s["state"] == "ok" for s in job["steps"]), \
         f"states: {[(s['name'], s['state']) for s in job['steps']]}"
 
 
-def test_worker_skips_existing_glb(tmp_path, monkeypatch, clean_jobs):
-    """Pokud panorama.glb + .sm5_ok už existují, oba stepy → skipped."""
+def test_worker_skips_existing_artifacts(tmp_path, monkeypatch, clean_jobs):
+    """If sentinels/manifests already exist on disk, the worker skips both
+    steps (resume-from-disk semantics)."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "tiles_v2_test").mkdir()
-    (tmp_path / "tiles_v2_test" / "panorama.glb").touch()
-    (tmp_path / "tiles_v2_test" / ".sm5_ok").touch()
+    base = tmp_path / "tiles_v2_test"
+    (base / "heightfield").mkdir(parents=True)
+    (base / ".sm5_ok").touch()
+    (base / "heightfield" / "manifest.json").write_text("{}")
 
-    def fake_sm5(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "sm5")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
+    _patch_sm5_sentinel(monkeypatch)
+    monkeypatch.setattr(locations.subprocess, "Popen",
+                        _fake_heightfield_proc(success=True))
 
-    def fake_compress(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "compress")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_compress", fake_compress)
-
-    class FakeProc:
-        def __init__(self, cmd, **kw):
-            self.cmd = cmd
-            self.returncode = 0
-        def communicate(self, timeout=None):
-            args = self.cmd
-            region = args[args.index("--region") + 1]
-            slug_step = args[args.index("--slug") + 1] if "--slug" in args else "panorama"
-            out_path = locations.expected_glb(region, slug_step)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.touch()
-            return "", ""
-        def terminate(self): pass
-        def kill(self): pass
-        def wait(self, timeout=None): pass
-
-    monkeypatch.setattr(locations.subprocess, "Popen", FakeProc)
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
-    assert job["steps"][0]["state"] == "skipped"   # panorama
-    assert job["steps"][1]["state"] == "skipped"   # sm5
-    assert all(s["state"] == "ok" for s in job["steps"][2:])
+    assert [s["state"] for s in job["steps"]] == ["skipped", "skipped"]
 
 
 def test_worker_failure_stops_loop(tmp_path, monkeypatch, clean_jobs):
-    """Pokud subprocess vrátí non-zero, step → fail, loop break,
-    zbývající stepy zůstanou pending."""
+    """heightfield step returns non-zero → step fail. sm5 already ran ok."""
     monkeypatch.chdir(tmp_path)
+    _patch_sm5_sentinel(monkeypatch)
+    monkeypatch.setattr(locations.subprocess, "Popen",
+                        _fake_heightfield_proc(success=False))
 
-    def fake_sm5(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "sm5")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
-
-    def fake_compress(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "compress")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_compress", fake_compress)
-
-    class FailingProc:
-        def __init__(self, cmd, **kw):
-            self.cmd = cmd
-            self.returncode = 1
-        def communicate(self, timeout=None):
-            return "", "Traceback (most recent call last):\n  File 'foo'\nValueError: bad"
-        def terminate(self): pass
-        def kill(self): pass
-        def wait(self, timeout=None): pass
-
-    monkeypatch.setattr(locations.subprocess, "Popen", FailingProc)
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
-    # panorama (step[0]) fails first — sm5 mock never invoked since panorama
-    # is the first step and FailingProc fires on it
-    assert job["steps"][0]["state"] == "fail"
-    assert "ValueError" in job["steps"][0]["error"]
-    assert all(s["state"] == "pending" for s in job["steps"][1:])
+    # sm5 ok, heightfield fail.
+    assert job["steps"][0]["state"] == "ok"
+    assert job["steps"][1]["state"] == "fail"
+    assert "ValueError" in job["steps"][1]["error"]
 
 
-def test_worker_unlinks_partial_glb_on_failure(tmp_path, monkeypatch, clean_jobs):
-    """Subprocess fails AFTER writing partial .glb → file must be deleted so
-    retry doesn't see it as skipped."""
+def test_worker_unlinks_partial_manifest_on_failure(tmp_path, monkeypatch, clean_jobs):
+    """Subprocess writes the heightfield manifest, then crashes. Worker must
+    delete the partial manifest so retry sees the step as not-yet-done
+    (otherwise the resume-skip check would treat it as skipped/done)."""
     monkeypatch.chdir(tmp_path)
+    _patch_sm5_sentinel(monkeypatch)
+    monkeypatch.setattr(locations.subprocess, "Popen",
+                        _fake_heightfield_proc(success=False, write_partial=True))
 
-    def fake_sm5(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "sm5")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_sm5_download", fake_sm5)
-
-    def fake_compress(job, log_path):
-        sentinel = locations.expected_glb(job["slug"], "compress")
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.touch()
-        return True
-    monkeypatch.setattr(locations, "_do_compress", fake_compress)
-
-    class PartialThenFailProc:
-        def __init__(self, cmd, **kw):
-            self.cmd = cmd
-            self.returncode = 1
-        def communicate(self, timeout=None):
-            args = self.cmd
-            region = args[args.index("--region") + 1]
-            slug_step = args[args.index("--slug") + 1] if "--slug" in args else "panorama"
-            out_path = locations.expected_glb(region, slug_step)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.touch()  # partial write before crash
-            return "", "ValueError: simulated crash"
-        def terminate(self): pass
-        def kill(self): pass
-        def wait(self, timeout=None): pass
-
-    monkeypatch.setattr(locations.subprocess, "Popen", PartialThenFailProc)
     job_id = locations.enqueue_job("test", "T", 0.0, 0.0)
     locations._run_one_job_for_test()
     job = locations.JOBS[job_id]
-    assert job["steps"][0]["state"] == "fail"
-    assert not locations.expected_glb("test", "panorama").exists(), \
-        "partial .glb must be deleted on failure so retry redoes the step"
+    assert job["steps"][1]["state"] == "fail"
+    assert not locations.expected_glb("test", "heightfield").exists(), \
+        "partial heightfield manifest must be deleted on failure"

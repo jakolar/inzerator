@@ -16,7 +16,7 @@ from urllib.error import URLError, HTTPError
 TILES_DIR_PREFIX = "tiles_v2_"
 JOB_LOG_DIR = Path("cache/jobs")
 STEP_TIMEOUT_SECS = 60 * 60   # 60 min: cold ČÚZK DMR5G cache can take 10–30 min
-STEP_NAMES = ("panorama", "sm5", "outer", "closeup", "inner", "compress", "heightfield")
+STEP_NAMES = ("sm5", "heightfield")
 
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: list[str] = []
@@ -62,60 +62,75 @@ def parse_obec(adresa: str) -> str:
 
 
 def expected_glb(slug: str, step: str) -> Path:
-    """For 'sm5' and 'compress' returns a sentinel marker (no actual GLB).
-    Worker's resume-skip uses .exists() on this so the sentinel-vs-glb
-    distinction is transparent to the loop."""
+    """Sentinel/artifact path used by run_step's resume-skip to .exists()-
+    check whether the step is already done. Two steps in the heightfield-
+    only pipeline:
+      - sm5:        zero-byte `.sm5_ok` sentinel under the slug dir
+      - heightfield: real heightfield manifest at heightfield/manifest.json
+    """
     base = Path(f"{TILES_DIR_PREFIX}{slug}")
-    if step == "panorama":
-        return base / "panorama.glb"
     if step == "sm5":
         return base / ".sm5_ok"
-    if step == "compress":
-        return base / ".compress_ok"
     if step == "heightfield":
         return base / "heightfield" / "manifest.json"
-    return base / "details" / f"{step}.glb"
+    raise ValueError(f"unknown step: {step!r}")
 
 
 def location_status(slug: str) -> str:
-    """'missing' = adresář nebo panorama.glb chybí.
-    'partial' = panorama.glb existuje ale chybí alespoň jeden detail
-                NEBO .compress_ok sentinel chybí (detaily ještě nejsou
-                Draco-encoded, viewer by tahal 5× větší soubory).
-    'ready'   = všechny 4 .glb existují + .compress_ok sentinel."""
-    pano = expected_glb(slug, "panorama")
-    if not pano.exists():
-        return "missing" if not pano.parent.exists() else "partial"
-    for step in ("outer", "closeup", "inner"):
-        if not expected_glb(slug, step).exists():
-            return "partial"
-    if not expected_glb(slug, "compress").exists():
-        return "partial"
-    return "ready"
+    """missing = slug directory absent.
+    partial = directory present but heightfield manifest not (yet) written
+              (either generation in flight or interrupted mid-pipeline).
+    ready   = heightfield manifest on disk → viewer can open the location."""
+    base = Path(f"{TILES_DIR_PREFIX}{slug}")
+    if not base.is_dir():
+        return "missing"
+    if expected_glb(slug, "heightfield").exists():
+        return "ready"
+    return "partial"
+
+
+def _persist_location_meta(slug: str, label: str, cx: float, cy: float) -> None:
+    """Write tiles_v2_<slug>/location.json with {slug, label, cx, cy} so
+    the label survives the only on-disk persistence path we have now that
+    the v2 top-level manifest is no longer written. Called at job enqueue
+    so the dashboard sees the right label even before sm5 finishes."""
+    base = Path(f"{TILES_DIR_PREFIX}{slug}")
+    base.mkdir(parents=True, exist_ok=True)
+    meta = {"slug": slug, "label": label, "cx": cx, "cy": cy,
+            "created_at": time.time()}
+    out = base / "location.json"
+    tmp = out.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, indent=2))
+    tmp.replace(out)
 
 
 def _read_label(slug: str) -> str:
-    """Zkusit přečíst manifest.json a vrátit region.label. Fallback = slug."""
-    manifest = Path(f"{TILES_DIR_PREFIX}{slug}") / "manifest.json"
-    if not manifest.exists():
-        return slug
-    try:
-        data = json.loads(manifest.read_text())
-        return data.get("region", {}).get("label") or slug
-    except (json.JSONDecodeError, OSError):
-        return slug
+    """Read label for a slug. Order:
+      1. tiles_v2_<slug>/location.json (current path, written by
+         _persist_location_meta at job enqueue).
+      2. tiles_v2_<slug>/manifest.json (legacy v2 manifest;
+         region.label was set by gen_panorama.py before v2 retirement).
+      3. fallback to slug itself."""
+    base = Path(f"{TILES_DIR_PREFIX}{slug}")
+    for path, extract in (
+        (base / "location.json", lambda d: d.get("label")),
+        (base / "manifest.json", lambda d: (d.get("region") or {}).get("label")),
+    ):
+        if path.is_file():
+            try:
+                lbl = extract(json.loads(path.read_text())) or None
+                if lbl:
+                    return lbl
+            except (json.JSONDecodeError, OSError):
+                pass
+    return slug
 
 
 def list_locations() -> list[dict]:
-    """Scan working dir pro 'tiles_v2_*' adresáře, vrátí list s
-    {slug, label, status, has_panorama, has_outer, has_closeup,
-    has_inner, has_heightfield, modified_ts}.
-
-    Sorted newest-first by `modified_ts` so the most recently generated
-    or touched location lands at the top of the list. mtime fallback
-    chain: heightfield/manifest.json → tile dir → 0 (never modified).
-    Frontend can also re-sort using `modified_ts` if it wants a
-    different order (oldest-first, etc.).
+    """Scan working dir for `tiles_v2_*` directories. Returns a list of
+    {slug, label, status, has_heightfield, modified_ts}, sorted newest-
+    first by modified_ts. mtime fallback chain:
+    heightfield/manifest.json → tile dir → 0.
     """
     out = []
     for path in Path(".").glob(f"{TILES_DIR_PREFIX}*"):
@@ -125,9 +140,6 @@ def list_locations() -> list[dict]:
         if not slug:
             continue
         hf_manifest = path / "heightfield" / "manifest.json"
-        # mtime = best signal for "when generated". Prefer heightfield
-        # manifest (touched on every gen_heightfield run); fall back to
-        # the tile dir mtime (set when the first sub-step ran).
         try:
             ts = hf_manifest.stat().st_mtime if hf_manifest.is_file() else path.stat().st_mtime
         except OSError:
@@ -136,14 +148,9 @@ def list_locations() -> list[dict]:
             "slug": slug,
             "label": _read_label(slug),
             "status": location_status(slug),
-            "has_panorama": expected_glb(slug, "panorama").exists(),
-            "has_outer":    expected_glb(slug, "outer").exists(),
-            "has_closeup":  expected_glb(slug, "closeup").exists(),
-            "has_inner":    expected_glb(slug, "inner").exists(),
             "has_heightfield": hf_manifest.exists(),
             "modified_ts": ts,
         })
-    # Newest first.
     out.sort(key=lambda d: d["modified_ts"], reverse=True)
     return out
 
@@ -746,6 +753,13 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
         JOBS[job["job_id"]] = job
         JOB_QUEUE.append(job["job_id"])
         JOB_CV.notify()   # vzbudí worker
+    # Persist label outside the lock — pure filesystem write, no shared
+    # state contention. Failure is non-fatal: dashboard would just show
+    # the slug instead of the human-readable label until next gen.
+    try:
+        _persist_location_meta(slug, label, cx, cy)
+    except OSError as e:
+        print(f"[enqueue_job] persist meta failed for {slug!r}: {e}")
     return job["job_id"]
 
 
@@ -855,9 +869,14 @@ def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
     if step == "panorama":
         return base + ["gen_panorama.py", "--region", slug, center]
     if step == "heightfield":
-        # gen_heightfield reads centre + ring layout from tiles_v2_<slug>/manifest.json
-        # (produced by the panorama step), so we don't need to pass --center-sjtsk.
-        return base + ["gen_heightfield.py", "--slug", slug]
+        # Pass centre explicitly: v2 panorama step (which used to write the
+        # top-level manifest gen_heightfield read from) is retired. gen_
+        # heightfield will fall back to disk manifests only for legacy lokace
+        # that already have one — new ones rely on these CLI args.
+        return base + [
+            "gen_heightfield.py", "--slug", slug,
+            f"--cx={cx}", f"--cy={cy}",
+        ]
     p = _LOD_PRESET[step]
     return base + [
         "gen_detail.py",

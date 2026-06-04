@@ -3395,26 +3395,53 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         slug = body.get("slug", "").strip()
         label = body.get("label", slug).strip() or slug
 
-        # Resume-from-disk: cx/cy read from manifest.json. Used when the
-        # original job_id is lost (server restart) and a partial location
-        # has the panorama.glb step done — manifest.json has region.center_sjtsk.
+        # Resume-from-disk: cx/cy + label recovered from on-disk metadata.
+        # Used when the original job_id was lost (server restart) and the
+        # caller wants to relaunch the pipeline for an existing partial
+        # location. Lookup order:
+        #   1. tiles_v2_<slug>/location.json (current persistence path,
+        #      written by locations._persist_location_meta at enqueue).
+        #   2. tiles_v2_<slug>/heightfield/manifest.json (re-gen of an
+        #      already-encoded location).
+        #   3. tiles_v2_<slug>/manifest.json (legacy v2 manifest — pre-
+        #      retirement lokace whose top-manifest is still on disk).
         if body.get("resume_from_disk"):
-            manifest_path = Path(f"tiles_v2_{slug}") / "manifest.json"
-            if not manifest_path.exists():
-                self._send_json(400, {"error": "no manifest.json — partial location must have panorama.glb step done"})
-                return
-            try:
-                manifest = json.loads(manifest_path.read_text())
-            except (json.JSONDecodeError, OSError) as e:
-                self._send_json(400, {"error": f"manifest unreadable: {e}"})
-                return
-            region = manifest.get("region", {})
-            center = region.get("center_sjtsk") or [None, None]
-            cx, cy = center[0], center[1]
-            label = region.get("label") or slug
+            base = Path(f"tiles_v2_{slug}")
+            cx = cy = None
+            resume_label = None
+            sources = [
+                (base / "location.json",
+                 lambda m: (m.get("cx"), m.get("cy"), m.get("label"))),
+                (base / "heightfield" / "manifest.json",
+                 lambda m: (m.get("cx"), m.get("cy"), None)),
+                (base / "manifest.json",
+                 lambda m: (
+                     (m.get("region") or {}).get("center_sjtsk", [None, None])[0],
+                     (m.get("region") or {}).get("center_sjtsk", [None, None])[1],
+                     (m.get("region") or {}).get("label"),
+                 )),
+            ]
+            for path, extract in sources:
+                if not path.is_file():
+                    continue
+                try:
+                    m = json.loads(path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                _cx, _cy, _lbl = extract(m)
+                if _cx is not None and _cy is not None:
+                    cx, cy = _cx, _cy
+                    if _lbl:
+                        resume_label = _lbl
+                    break
             if cx is None or cy is None:
-                self._send_json(400, {"error": "manifest missing region.center_sjtsk"})
+                self._send_json(400, {
+                    "error": "no recoverable centre on disk — partial "
+                             "location must have location.json or a heightfield "
+                             "or legacy v2 manifest"})
                 return
+            if resume_label:
+                label = resume_label
         else:
             cx = body.get("cx")
             cy = body.get("cy")

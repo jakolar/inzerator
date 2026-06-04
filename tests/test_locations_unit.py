@@ -14,6 +14,15 @@ def _reset_ku_cache():
     locations._KU_CACHE = None
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path, monkeypatch):
+    """Chdir to a per-test temp dir so enqueue_job → _persist_location_meta
+    can't pollute the project root with tiles_v2_<slug>/location.json
+    files. Tests that need their own monkeypatch.chdir override this
+    (last chdir wins)."""
+    monkeypatch.chdir(tmp_path)
+
+
 def test_module_imports():
     # After v2 viewer retirement (2026-06), pipeline trimmed to two steps.
     # Heightfield viewer is the only consumer; sm5 stays separate so a flaky

@@ -582,3 +582,68 @@ Plus 3 nová bulk download skripty (DMR5G, ortofoto, případně cadastre) — k
 - **Per-location parcel overlay** — současný `tiles_v2_<slug>` workflow s drone video tool a realtor presentation **zůstává jak je**. Pyramid je samostatný kanál pro „prohlédnout libovolnou adresu na ČR". Per-listing detailní vizualizace se generuje per-request jak dosud.
 - **3D budovy z RÚIAN** — extrúze z polygonů (LOD 1) je separátní feature, ne součást heightmap pyramidy.
 - **Globální tree/canopy heightmap** — DMPOK obsahuje vegetaci, ale samostatný „canopy height model" = DMPOK − DMR5G je odvozený dataset, ne primární vrstva.
+
+---
+
+## Revize plánu — 2026-06-05
+
+Pět dnů po napsání původního návrhu jsme dohotovili bulk DMPOK pull (944 GB, 16 299 listů, 0 fail / 0 missing) a začali stavět MVP tile generator. Při review plánu vyplulo několik věcí, které se mění oproti původnímu znění:
+
+### Co se mění
+
+| # | Změna | Důvod |
+|---|---|---|
+| **1** | **MVP před scale-up** — postavit `build_pyramid_tile.py` (single tile, single thread, single format) a otestovat na jednom tile (Stříbrnice z=14), pak teprve scale-up. | Původní doc mluvil rovnou o bulk run + multi-tier. Riziko: vychytáme chyby v reprojekci/mosaickování/LERC encode až na 870 000 tiles, kde každý fix znamená re-bake. Levnější mít MVP první. |
+| **2** | **Bare-earth (DMR5G) odloženo na později.** Pyramid v MVP a první bulk runu = jen DMPOK. | Nemáme bulk DMR5G na disku — vyžadovalo by další ~3-noční pull stejný jako DMPOK právě skončený. Pyramid bez bare-Y toggle je stále plně funkční — toggle je hezký bonus, ne core feature. Vrátíme se k němu po DMPOK pyramidě. |
+| **3** | **Phase 3 effort revidován z „2-3 dny" na „1-2 týdny".** | Současný `heightfield/index.html` (3,9k řádků) je per-location s fixed camera orbit. CR-wide viewer potřebuje pan/zoom controls, tile loading queue, tile eviction, LOD transitions, skybox at infinity. To je téměř nový viewer, ne refactor existujícího. |
+| **4** | **Sheet seam test jako separátní fáze (1.5) před scale-up.** | ČÚZK SM5 listy jsou zachyceny v různých fly-overs ČÚZK, výškové hodnoty na hranici se mohou lišit o 5-30 cm. LERC `max_z_error=0.10 m` to neuhladí. Pokud je seam viditelný, řešitelné feathering nebo větší overlap v generator skriptu — ale **musíme to vědět před** bulk runem. |
+| **5** | **Failure recovery pattern okopírovaný z `bulk_dmpok.py`.** Per-tile state v `pyramid.json`, lock dir v `~/Library/Caches/inzerator/`, SIGTERM-safe resume. | Bulk DMPOK nás naučil 3 chyby (StandardOutPath na `/Volumes/`, lock dir TCC restrictions, escaped `\.` v pkill pattern). Pyramid bulk run je stejně dlouhý a bere stejné riziko — repassem ten pattern, ne re-discoveruju ty samé chyby znovu. |
+| **6** | **Web Mercator projekce potvrzena** (ne S-JTSK). | Při review jsem se sám sobě protiřečil a navrhl S-JTSK. Doc už zvolil 3857 pro Leaflet/OSM kompatibilitu — beru zpět. Reprojection cost v generatoru je jednorázový; klient kód v 3857 je triviální. |
+| **7** | **Storage est. 190 GB heightmap** (z původního doc) platí jen pro DMPOK + DMR5G + bare. **Jen DMPOK** v MVP = **~95 GB** finest level + downsampled lower levels = **~125 GB**. Plus ortho odloženo. | Skutečné disk budget pro MVP fáze 1-3: ~150 GB. To je realistický „zaplaceno za vydat MVP" číslo. |
+
+### Co zůstává z původního doc
+
+- Heightmap pyramid (ne mesh pyramid) — argument o 15× méně místa drží.
+- Web Mercator z=8..18 — finest level = DMPOK 0,5 m při z=18, lower zoomy downsamplnutím.
+- 256×256 LERC tiles + viewer dekóduje WASM lerc package (už používáme).
+- Vertex shader displace Y per pixel — viewer pattern existuje v `heightfield/index.html`.
+- Per-location pipeline (`gen_heightfield.py` + `tiles_v2_<slug>/`) **zůstává netknutá** — pyramid je separátní kanál.
+
+### Revidované fáze + odhady
+
+```
+Fáze 1   — MVP single-tile builder              ✓ DONE (build_pyramid_tile.py, 2026-06-05)
+Fáze 1.5 — Sheet seam test                      ½ dne — vybrat 2-sheet crossing tile, vizuálně ověřit
+Fáze 2   — Bulk pyramid build (DMPOK only)      1 noc běh — z=18 → z=17 → … → z=8, ~125 GB output
+Fáze 3   — Pyramid viewer (heightfield-cr/)     1-2 týdny — nový viewer, ne refactor
+Fáze 4   — Bare-earth DMR5G                     1-2 noci pull + 1 noc bulk build — odloženo až po viewru
+Fáze 5   — Ortho pyramid                        1-2 noci pull + 1-2 dny code + 1 noc build — odloženo
+```
+
+### MVP first tile — konkrétní příkaz
+
+Test region: Stříbrnice, Olomoucký kraj. RÚIAN střed cca lat=49.5879, lon=17.4083.
+
+```bash
+# (1) Build inventory (one-shot, ~16 s pro 16 299 listů).
+python3 build_pyramid_tile.py --inventory --bulk-dir /Volumes/Elements/cuzk-bulk
+
+# (2) Build the test tile at z=14.
+python3 build_pyramid_tile.py --z 14 --lat 49.5879 --lon 17.4083 \
+    --bulk-dir /Volumes/Elements/cuzk-bulk \
+    --out /Volumes/Elements/cuzk-pyramid
+
+# (3) Inspect.
+ls -la /Volumes/Elements/cuzk-pyramid/dmpok/14/
+```
+
+Výstup: `dmpok/<z>/<x>/<y>.lerc` (asi 30-80 KB jeden tile, podle terénní variace).
+
+### Co je v MVP úmyslně vynecháno (ne bug, feature scope)
+
+- **Multi-worker.** Single-thread. Bulk run dostane workers v samostatném `bulk_pyramid.py`.
+- **LOD aggregation.** MVP generuje jeden tile z DMPOK native. Lower zooms = downsample z higher zooms = bulk script.
+- **State machine** pro failure recovery. Bulk script přidá `pyramid.json` + lock dir + sigterm-safe.
+- **Ortho channel.** Pyramid output je `dmpok/<z>/<x>/<y>.lerc` (jednomístně). Ortho dostane vlastní path prefix v separátním scriptu.
+- **Bare-earth (DMR5G).** Viz důvod #2.
+- **Tile manifest.** Jeden tile = jeden soubor. Globální manifest s available tiles per z přidá bulk run.

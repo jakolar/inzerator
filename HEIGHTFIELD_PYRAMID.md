@@ -647,3 +647,78 @@ Výstup: `dmpok/<z>/<x>/<y>.lerc` (asi 30-80 KB jeden tile, podle terénní vari
 - **Ortho channel.** Pyramid output je `dmpok/<z>/<x>/<y>.lerc` (jednomístně). Ortho dostane vlastní path prefix v separátním scriptu.
 - **Bare-earth (DMR5G).** Viz důvod #2.
 - **Tile manifest.** Jeden tile = jeden soubor. Globální manifest s available tiles per z přidá bulk run.
+
+---
+
+## MVP results 2026-06-05
+
+První běh `build_pyramid_tile.py` přes diverzní terén ČR. Validuje pipeline (mosaic → reproject → LERC) na real-world datech a dává reálné LERC size data pro pyramid budget odhad.
+
+### Inventory build
+
+- 16 299 SM5 listů v `/Volumes/Elements/cuzk-bulk/`
+- `rasterio.open()` per file přes USB → 197 s wall-clock (= ~12 ms/list)
+- Output: `inventory.json` ~5 MB, jednorázová cena, znovu načtená všemi následujícími tile buildy
+
+### Per-tile benchmarks @ z=14
+
+| Region | Lokace | Reliéf | SM5 listů | Coverage | LERC velikost | B/px |
+|---|---|---|---|---|---|---|
+| **Stříbrnice** | 49,5879° / 17,4083° | 52,6 m (rolling) | 4 | 100 % | 48,8 KB | 0,74 |
+| **Krkonoše** (Sněžka) | 50,7363° / 15,7406° | **567,5 m** (alpine) | 4 | 100 % | **66,3 KB** | 1,01 |
+| **Polabí** (Pardubice) | 50,0451° / 15,7781° | 49,5 m (plain) | 2 | 100 % | 55,7 KB | 0,85 |
+| **Šumava** (Plechý) | 48,7765° / 13,8511° | 289,7 m (mtn forest) | 4 | 59 %\* | 37,6 KB | 0,57 |
+
+\* Šumava tile zasahuje za hranici do Rakouska, proto neúplné pokrytí.
+
+**Wall-clock per tile:** ~4-6 s (USB-bound — disk čtení 4 SM5 listů × 70 MB = 280 MB stažených dat z `/Volumes/Elements/`).
+
+### Sheet seam analysis
+
+Pro každý tile spočítán per-row a per-col gradient. „Spike" = max gradient > 5× 99-perc, indikuje neviditelně-zarovnaný SM5 sheet seam.
+
+| Region | p50 grad | p99 grad | max grad | spike? |
+|---|---|---|---|---|
+| Stříbrnice | 0,20 m | 8,16 m | 16,0 m | ne |
+| Krkonoše | 1,60 m | 7,80 m | 19,2 m | ne |
+| Polabí | 0,60 m | 10,20 m | 27,6 m | ne (industrial buildings) |
+| Šumava | 0,20 m | 6,20 m | 31,2 m | ano\* |
+
+\* Šumava „spike" je artefakt nodata edge (partial coverage), ne ČÚZK sheet seam.
+
+**Závěr:** ČÚZK DMPOK seams nejsou viditelné v gradientní analýze tří full-coverage tiles. **Pro bulk run NETŘEBA seam feathering** — můžeme přímo na scale-up.
+
+### Realistický pyramid storage odhad
+
+Z reálných z=14 měření (avg 56,9 KB / full-coverage tile) projekce na celý LOD pyramid:
+
+| Zoom | Tile size @ 49°N | # tiles ČR | Avg LERC/tile | Celkem |
+|---|---|---|---|---|
+| z=18 | 100 × 100 m | ~7,9 M | ~25 KB (méně variance / tile) | **~190 GB** |
+| z=17 | 200 × 200 m | ~2,0 M | ~32 KB | ~60 GB |
+| z=16 | 400 × 400 m | ~493 k | ~40 KB | ~19 GB |
+| z=15 | 800 × 800 m | ~123 k | ~50 KB | ~6 GB |
+| z=14 | 1,6 × 1,6 km | ~30,7 k | **57 KB (měřeno)** | ~1,7 GB |
+| z=13 | 3,2 × 3,2 km | ~7 700 | ~60 KB | ~0,5 GB |
+| z=12 | 6,4 × 6,4 km | ~1 900 | ~65 KB | ~0,1 GB |
+| z=8..11 | … | ~640 | … | ~0,1 GB |
+| **Total DMPOK heightmap pyramid** | | | | **~280 GB** |
+
+> **Pozn.:** odhad **280 GB** je revize oproti původním `190 GB` v doc a `125 GB` ve fázi-revizi nahoře. Důvod: reálná měřená komprese LERC (~57 KB / 256² na rolling terén z=14) je vyšší než původní odhad. Z=18 odhad (25 KB/tile) je extrapolace — méně variace per smaller tile typicky → lepší LERC ratio, ale potřeba ověřit jedním z=18 tile před bulk runem.
+
+Když přidáme:
+- Bare-earth DMR5G pyramid: + ~95 GB (per původní doc, neměřeno)
+- Ortho KTX2 multi-tier: + ~150 GB (per původní doc)
+
+**Celkem všechny tři vrstvy: ~525 GB.** Pořád pohodlně do `/Volumes/Elements/` 10 TB (zbude ~8 TB free).
+
+### Co je hotovo, co dál
+
+- [x] `build_pyramid_tile.py` MVP — funkční, ověřeno na 4 real tiles
+- [x] Inventory cache pattern — jednorázová cena, dále už chytrá
+- [x] Sheet seam confidence — žádné feathering needed
+- [x] Realistický storage budget — ~280 GB pro DMPOK pyramid only
+- [ ] Z=18 single-tile sanity check (kvůli `25 KB/tile` extrapolaci)
+- [ ] Modify `heightfield/index.html` na load external tile (end-to-end viewer test)
+- [ ] `bulk_pyramid.py` (workers + state machine + LOD aggregation)
+- [ ] Bulk run (1 noc, ~280 GB output)

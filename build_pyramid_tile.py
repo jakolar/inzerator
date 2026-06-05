@@ -236,7 +236,12 @@ def build_tile(
     code, nbytes, buf = lerc.encode(arr, 1, False, None, max_z_error, hint)
     if code != 0:
         raise SystemExit(f"LERC encode failed (code {code})")
-    out_path.write_bytes(bytes(buf[:nbytes]))
+    # Atomic write: dump to .tmp, then rename. Without this, a SIGTERM
+    # in the middle of write leaves a partial .lerc on disk and the
+    # resume-skip loop in bulk_pyramid.py would treat it as done.
+    tmp_path = out_path.with_suffix(".lerc.tmp")
+    tmp_path.write_bytes(bytes(buf[:nbytes]))
+    tmp_path.replace(out_path)
     print(f"[tile] wrote {out_path} ({nbytes} bytes, max_z_error={max_z_error})")
     return True
 

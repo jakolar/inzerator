@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pyramid tile test viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1a22; color: #ddd;
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #info { position: absolute; top: 12px; left: 12px;
+          background: rgba(0,0,0,.7); padding: 10px 14px;
+          border-radius: 6px; font-size: 12px; line-height: 1.5; z-index: 10; }
+  #info b { color: #6cf; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="info">
+  <b id="title">Pyramid tile</b><br>
+  <span id="meta">načítám…</span>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as Lerc from 'https://cdn.jsdelivr.net/npm/lerc@4/+esm';
+
+const params = new URLSearchParams(location.search);
+const Z = parseInt(params.get('z') ?? '14', 10);
+const X = parseInt(params.get('x') ?? '8984', 10);   // default Stříbrnice
+const Y = parseInt(params.get('y') ?? '5585', 10);
+const URL_TILE = `/cuzk-pyramid/dmpok/${Z}/${X}/${Y}.lerc`;
+
+const titleEl = document.getElementById('title');
+const metaEl  = document.getElementById('meta');
+titleEl.textContent = `dmpok z=${Z} x=${X} y=${Y}`;
+metaEl.textContent  = `fetch ${URL_TILE}…`;
+
+await Lerc.load();
+const t0 = performance.now();
+const buf = await fetch(URL_TILE).then(r => r.arrayBuffer());
+const decoded = Lerc.decode(new Uint8Array(buf));
+const heights = new Float32Array(decoded.pixels[0]);
+const w = decoded.width, h = decoded.height;
+let yMin = Infinity, yMax = -Infinity;
+for (let i = 0; i < heights.length; i++) {
+  const v = heights[i];
+  if (v > -9000 && v < yMin) yMin = v;
+  if (v > -9000 && v > yMax) yMax = v;
+}
+const yMid = (yMin + yMax) / 2;
+const dt = (performance.now() - t0).toFixed(0);
+metaEl.innerHTML = `${w}×${h} LERC ${(buf.byteLength/1024).toFixed(1)} KB · ` +
+                   `Y range <b>${yMin.toFixed(1)} – ${yMax.toFixed(1)} m</b> ` +
+                   `(Δ ${(yMax - yMin).toFixed(1)} m)<br>` +
+                   `decoded in ${dt} ms · drag to orbit`;
+
+// Web Mercator tile side at z (metres). At z=14 in CR latitude ≈ 1600 m.
+const WMERC_EXTENT_M = 20037508.342789244;
+const sideMeters = (2 * WMERC_EXTENT_M) / 2 ** Z;
+// Scale Y exaggeration: terrain looks flat at 1:1 because viewport is
+// much wider than terrain Y range. 2× exaggeration is the cartographic
+// default for relief models.
+const Y_EXAGGERATION = 2.0;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a22);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight,
+                                           0.1, sideMeters * 10);
+camera.position.set(sideMeters * 0.6, sideMeters * 0.5, sideMeters * 0.6);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+// PlaneGeometry → vertex shader displaces Y from LERC heightmap.
+const geo = new THREE.PlaneGeometry(1, 1, w - 1, h - 1);
+geo.rotateX(-Math.PI / 2);
+geo.deleteAttribute('normal');
+
+const heightTex = new THREE.DataTexture(heights, w, h,
+                                        THREE.RedFormat, THREE.FloatType);
+heightTex.minFilter = heightTex.magFilter = THREE.LinearFilter;
+heightTex.wrapS = heightTex.wrapT = THREE.ClampToEdgeWrapping;
+heightTex.flipY = false;
+heightTex.needsUpdate = true;
+
+const mat = new THREE.ShaderMaterial({
+  uniforms: {
+    uHeight: { value: heightTex },
+    uYBase:  { value: yMid },
+    uYRange: { value: yMax - yMin },
+    uYMin:   { value: yMin },
+    uExag:   { value: Y_EXAGGERATION },
+  },
+  vertexShader: `
+    uniform sampler2D uHeight;
+    uniform float uYBase;
+    uniform float uExag;
+    varying float vH;
+    void main() {
+      vec2 hmUv = vec2(uv.x, 1.0 - uv.y);
+      float absY = texture2D(uHeight, hmUv).r;
+      vec3 pos = position;
+      pos.y = (absY - uYBase) * uExag;
+      vH = absY;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform float uYMin;
+    uniform float uYRange;
+    varying float vH;
+    // Stripey cartographic hypsometric ramp: low = blue, mid = green,
+    // high = brown/white. Cheap & cheerful for sanity check.
+    vec3 ramp(float t) {
+      vec3 a = vec3(0.20, 0.40, 0.60);   // low: cool blue-grey
+      vec3 b = vec3(0.40, 0.60, 0.30);   // mid: olive green
+      vec3 c = vec3(0.65, 0.50, 0.30);   // high: brown
+      vec3 d = vec3(0.95, 0.95, 0.95);   // peak: snow
+      if (t < 0.33) return mix(a, b, t / 0.33);
+      if (t < 0.66) return mix(b, c, (t - 0.33) / 0.33);
+      return mix(c, d, (t - 0.66) / 0.34);
+    }
+    void main() {
+      float t = clamp((vH - uYMin) / uYRange, 0.0, 1.0);
+      gl_FragColor = vec4(ramp(t), 1.0);
+    }
+  `,
+  side: THREE.DoubleSide,
+});
+const mesh = new THREE.Mesh(geo, mat);
+mesh.scale.set(sideMeters, 1, sideMeters);
+scene.add(mesh);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

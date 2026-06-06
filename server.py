@@ -794,8 +794,27 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
         bbox_str = query.get("BBOX", [""])[0]
         if not bbox_str:
-            self.send_error(400, "Missing BBOX")
-            return
+            # Derive the S-JTSK fetch bbox from WBBOX (WGS84) when no explicit
+            # S-JTSK BBOX is given. Lets clients that only know a WGS84 / XYZ
+            # tile extent (e.g. the pyramid viewer) hit this endpoint with just
+            # WBBOX; the WGS reproject branch below then aligns output to it.
+            wbbox_q = query.get("WBBOX", [""])[0]
+            if not wbbox_q:
+                self.send_error(400, "Missing BBOX (or WBBOX)")
+                return
+            try:
+                w, s, e, n = (float(x) for x in wbbox_q.split(","))
+            except ValueError:
+                self.send_error(400, "WBBOX must be west,south,east,north")
+                return
+            from pyproj import Transformer
+            to_sjtsk = Transformer.from_crs(
+                "EPSG:4326", "EPSG:5514", always_xy=True)
+            corners = [to_sjtsk.transform(lon, lat)
+                       for lon in (w, e) for lat in (s, n)]
+            xs = [c[0] for c in corners]
+            ys = [c[1] for c in corners]
+            bbox_str = f"{min(xs)},{min(ys)},{max(xs)},{max(ys)}"
         try:
             sjtsk_xmin, sjtsk_ymin, sjtsk_xmax, sjtsk_ymax = (
                 float(x) for x in bbox_str.split(","))
@@ -962,9 +981,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             import subprocess, tempfile, uuid
             ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
             try:
-                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+                q_val = max(1, min(255, int(query.get("quality", ["220"])[0])))
             except ValueError:
-                q_val = 128
+                q_val = 220
             tmpdir = Path(tempfile.gettempdir())
             stem = f"orto_vhr_{uuid.uuid4().hex}"
             tmp_jpg = tmpdir / f"{stem}.jpg"
@@ -1241,15 +1260,15 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         elif out_format == "ktx2":
             # basisu doesn't take stdin → write JPEG, run encoder, read KTX2.
             # Mode/quality from query: ?ktx2=etc1s|uastc, ?quality=1..255 (ETC1S
-            # only; lower = better quality, default 128). UASTC mode ignores -q
+            # only; lower = better quality, default 220). UASTC mode ignores -q
             # and produces ~5× larger files at near-original quality.
             cropped.save(buf, "JPEG", quality=95, optimize=True, subsampling=0)
             import subprocess, tempfile, uuid
             ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
             try:
-                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+                q_val = max(1, min(255, int(query.get("quality", ["220"])[0])))
             except ValueError:
-                q_val = 128
+                q_val = 220
             tmpdir = Path(tempfile.gettempdir())
             stem = f"orto_{uuid.uuid4().hex}"
             tmp_jpg = tmpdir / f"{stem}.jpg"
@@ -1597,9 +1616,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             import subprocess, tempfile, uuid
             ktx2_mode = query.get("ktx2", ["etc1s"])[0].lower()
             try:
-                q_val = max(1, min(255, int(query.get("quality", ["128"])[0])))
+                q_val = max(1, min(255, int(query.get("quality", ["220"])[0])))
             except ValueError:
-                q_val = 128
+                q_val = 220
             tmpdir = Path(tempfile.gettempdir())
             stem = f"orto_{uuid.uuid4().hex}"
             tmp_jpg = tmpdir / f"{stem}.jpg"

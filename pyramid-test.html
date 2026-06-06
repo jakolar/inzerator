@@ -38,6 +38,18 @@ const X = parseInt(params.get('x') ?? '8984', 10);   // default Stříbrnice
 const Y = parseInt(params.get('y') ?? '5585', 10);
 const URL_TILE = `/cuzk-pyramid/dmpok/${Z}/${X}/${Y}.lerc`;
 
+// WGS84 bbox of the XYZ tile (slippy-map inverse). Drives the ortho fetch.
+const tileLon = (x, z) => x / 2 ** z * 360 - 180;
+const tileLat = (y, z) => {
+  const n = Math.PI * (1 - 2 * y / 2 ** z);
+  return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+};
+const west  = tileLon(X, Z),     east  = tileLon(X + 1, Z);
+const north = tileLat(Y, Z),     south = tileLat(Y + 1, Z);
+// hires=1 → ČÚZK ortofoto WMS @ 0.125 m/px, reprojected to this WGS bbox.
+const URL_ORTHO = `/proxy/ortofoto?hires=1&WBBOX=${west},${south},${east},${north}` +
+                  `&size=1024&format=jpeg`;
+
 const titleEl = document.getElementById('title');
 const metaEl  = document.getElementById('meta');
 titleEl.textContent = `dmpok z=${Z} x=${X} y=${Y}`;
@@ -100,30 +112,37 @@ heightTex.needsUpdate = true;
 
 const mat = new THREE.ShaderMaterial({
   uniforms: {
-    uHeight: { value: heightTex },
-    uYBase:  { value: yMid },
-    uYRange: { value: yMax - yMin },
-    uYMin:   { value: yMin },
-    uExag:   { value: Y_EXAGGERATION },
+    uHeight:   { value: heightTex },
+    uYBase:    { value: yMid },
+    uYRange:   { value: yMax - yMin },
+    uYMin:     { value: yMin },
+    uExag:     { value: Y_EXAGGERATION },
+    uOrtho:    { value: null },   // ČÚZK ortofoto, set once fetched
+    uUseOrtho: { value: 0.0 },    // 0 = hypsometric ramp, 1 = ortho drape
   },
   vertexShader: `
     uniform sampler2D uHeight;
     uniform float uYBase;
     uniform float uExag;
     varying float vH;
+    varying vec2 vUv;
     void main() {
       vec2 hmUv = vec2(uv.x, 1.0 - uv.y);
       float absY = texture2D(uHeight, hmUv).r;
       vec3 pos = position;
       pos.y = (absY - uYBase) * uExag;
       vH = absY;
+      vUv = uv;
       gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
     }
   `,
   fragmentShader: `
     uniform float uYMin;
     uniform float uYRange;
+    uniform sampler2D uOrtho;
+    uniform float uUseOrtho;
     varying float vH;
+    varying vec2 vUv;
     // Stripey cartographic hypsometric ramp: low = blue, mid = green,
     // high = brown/white. Cheap & cheerful for sanity check.
     vec3 ramp(float t) {
@@ -136,8 +155,13 @@ const mat = new THREE.ShaderMaterial({
       return mix(c, d, (t - 0.66) / 0.34);
     }
     void main() {
-      float t = clamp((vH - uYMin) / uYRange, 0.0, 1.0);
-      gl_FragColor = vec4(ramp(t), 1.0);
+      if (uUseOrtho > 0.5) {
+        // Texture is WGS-aligned to the tile bbox; uv matches the heightmap.
+        gl_FragColor = vec4(texture2D(uOrtho, vUv).rgb, 1.0);
+      } else {
+        float t = clamp((vH - uYMin) / uYRange, 0.0, 1.0);
+        gl_FragColor = vec4(ramp(t), 1.0);
+      }
     }
   `,
   side: THREE.DoubleSide,
@@ -145,6 +169,38 @@ const mat = new THREE.ShaderMaterial({
 const mesh = new THREE.Mesh(geo, mat);
 mesh.scale.set(sideMeters, 1, sideMeters);
 scene.add(mesh);
+
+// ─── Ortofoto drape ────────────────────────────────────────────────────
+// Fetch ČÚZK ortofoto for the tile bbox, drape it, auto-switch when ready.
+// Key "o" toggles ramp ⇄ ortho. JPEG is sRGB — sampled raw in the shader
+// and written straight to the (sRGB) framebuffer, so no extra conversion.
+let orthoTex = null;
+const orthoStatus = document.createElement('span');
+metaEl.parentElement.appendChild(document.createElement('br'));
+metaEl.parentElement.appendChild(orthoStatus);
+orthoStatus.innerHTML = `<b>orto</b> načítám z ČÚZK…`;
+
+new THREE.TextureLoader().load(URL_ORTHO,
+  tex => {
+    tex.colorSpace = THREE.NoColorSpace;     // pass sRGB texels through as-is
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = true;
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    orthoTex = tex;
+    mat.uniforms.uOrtho.value = tex;
+    mat.uniforms.uUseOrtho.value = 1.0;       // auto-show ortho once ready
+    orthoStatus.innerHTML = `<b>orto</b> ČÚZK 0.125 m/px · klávesa <b>o</b> přepíná relief`;
+  },
+  undefined,
+  () => { orthoStatus.innerHTML = `<b>orto</b> selhalo (ČÚZK WMS) — viz konzole`; }
+);
+
+addEventListener('keydown', e => {
+  if (e.key === 'o' && orthoTex) {
+    mat.uniforms.uUseOrtho.value = mat.uniforms.uUseOrtho.value > 0.5 ? 0.0 : 1.0;
+  }
+});
 
 addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);

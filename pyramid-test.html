@@ -97,6 +97,13 @@ document.body.appendChild(renderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.enableDamping = true;
+// Bound the orbit radius. Without this, prolonged zoom is multiplicative and
+// unbounded: zoom-in collapses the distance toward 0 (camera ends up inside the
+// near plane → nothing renders, and motion is imperceptible at nm scale → looks
+// frozen), zoom-out explodes it past the far plane → black. Tie the bounds to
+// the tile size so they scale across zoom levels.
+controls.minDistance = Math.max(camera.near * 5, sideMeters * 0.02);
+controls.maxDistance = sideMeters * 4;
 
 // PlaneGeometry → vertex shader displaces Y from LERC heightmap.
 const geo = new THREE.PlaneGeometry(1, 1, w - 1, h - 1);

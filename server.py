@@ -32,6 +32,59 @@ _CUZK_SEM = threading.Semaphore(6)
 # multiple regions are fetched concurrently.
 _OSM_SEM = threading.Semaphore(2)
 
+# On-demand heightmap pyramid tiles (/cuzk-pyramid/dmpok/z/x/y.lerc). A missing
+# tile at z>=14 is built from DMPOK on first request and written to disk, so
+# subsequent hits are plain static serves. Cap concurrent builds (CPU+USB-disk
+# bound) and dedupe identical concurrent requests with a per-tile lock.
+_PYRAMID_BUILD_SEM = threading.Semaphore(3)
+_PYRAMID_TILE_LOCKS: dict = {}
+_PYRAMID_TILE_LOCKS_GUARD = threading.Lock()
+_PYRAMID_MOD = None
+_PYRAMID_MOD_GUARD = threading.Lock()
+# z<14 tiles can't be built live (a low-zoom tile would merge a multi-GB DMPOK
+# mosaic); they must be pre-baked. z>=14 builds a small mosaic (~100 MB at z14,
+# tiny above). Cap the top to keep oversampled junk out.
+_PYRAMID_ONDEMAND_ZMIN = 14
+_PYRAMID_ONDEMAND_ZMAX = 20
+
+
+def _pyramid_module():
+    """Lazy singleton: import build_pyramid_tile, load the DMPOK inventory once,
+    and silence its per-tile prints. Returns the module."""
+    global _PYRAMID_MOD
+    if _PYRAMID_MOD is None:
+        with _PYRAMID_MOD_GUARD:
+            if _PYRAMID_MOD is None:
+                import build_pyramid_tile as bpt
+                inv = bpt.load_or_build_inventory(bpt.BULK_OUT_DIR)
+                bpt.load_or_build_inventory = lambda _b: inv
+                bpt.print = lambda *a, **k: None
+                _PYRAMID_MOD = bpt
+    return _PYRAMID_MOD
+
+
+def _pyramid_tile_lock(key):
+    with _PYRAMID_TILE_LOCKS_GUARD:
+        lk = _PYRAMID_TILE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _PYRAMID_TILE_LOCKS[key] = lk
+        return lk
+
+
+# Whole-ČR raw ortofoto bulk (the bulk_ortofoto pull). The raw-crop path prefers
+# these local 12.5 cm sheets over the WMS. Override root with INZERATOR_ORTHO_BULK.
+ORTHO_BULK_DIR = Path(os.environ.get("INZERATOR_ORTHO_BULK",
+                                     "/Volumes/Elements/cuzk-bulk"))
+
+
+def _dmpok_inventory():
+    """MAPNOM → {path,left,bottom,right,top} for every DMPOK sheet, memoized via
+    the pyramid module. DMPOK + ortho share the SM5 grid, so these sheet bboxes
+    double as the ortho coverage index — no separate 16k-file scan needed."""
+    bpt = _pyramid_module()
+    return bpt.load_or_build_inventory(bpt.BULK_OUT_DIR)
+
 # Czech labels for unnamed POIs — Overpass returns lots of un-named amenity
 # nodes (especially leisure tags like swimming_pool / playground). For
 # real-estate context "Hřiště" is more useful than "(bez názvu)".
@@ -1316,6 +1369,35 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
 
+    def _query_sjtsk_bbox(self, query):
+        """S-JTSK (xmin,ymin,xmax,ymax) for the request — from BBOX when it is
+        already S-JTSK, else by reprojecting the WBBOX corners. None if neither
+        is usable. Used to test local raw coverage before hitting the WMS."""
+        bbox_str = query.get("BBOX", [""])[0]
+        if bbox_str:
+            try:
+                p = [float(x) for x in bbox_str.split(",")]
+            except ValueError:
+                p = []
+            if len(p) == 4 and p[0] < 0 and p[1] < 0:   # S-JTSK is negative E,N in CZ
+                return (p[0], p[1], p[2], p[3])
+        wbbox_q = query.get("WBBOX", [""])[0]
+        if wbbox_q:
+            try:
+                wp = [float(x) for x in wbbox_q.split(",")]
+            except ValueError:
+                return None
+            if len(wp) == 4:
+                from pyproj import Transformer
+                to_sjtsk = Transformer.from_crs("EPSG:4326", "EPSG:5514",
+                                                always_xy=True)
+                c = [to_sjtsk.transform(lon, lat)
+                     for lon in (wp[0], wp[2]) for lat in (wp[1], wp[3])]
+                xs = [q[0] for q in c]
+                ys = [q[1] for q in c]
+                return (min(xs), min(ys), max(xs), max(ys))
+        return None
+
     def _find_raw_ortofotos_covering(self, xmin, ymin, xmax, ymax):
         """Return a list of (jpg_path, jgw_vals) for cached raw SM5 orthos
         that COLLECTIVELY cover the given S-JTSK bbox. Empty list if not
@@ -1328,31 +1410,53 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         from PIL import Image
         from pathlib import Path
         Image.MAX_IMAGE_PIXELS = None
+
+        # Candidate sheets via the in-memory DMPOK inventory bboxes (same SM5
+        # grid as ortho) — microseconds, no disk. Then touch disk only for the
+        # handful that intersect, reading each one's real JGW (authoritative
+        # pixel scale; the inventory bbox is only accurate enough to filter).
+        try:
+            inv = _dmpok_inventory()
+        except Exception:
+            inv = {}
+        cand_mapnoms = [
+            m for m, b in inv.items()
+            if b["left"] < xmax and b["right"] > xmin
+            and b["bottom"] < ymax and b["top"] > ymin
+        ]
+        roots = [Path("cache"), ORTHO_BULK_DIR]
         candidates = []  # (jpg, vals, (lo_x, lo_y, hi_x, hi_y))
-        for d in sorted(Path("cache").glob("ortofoto_*")):
-            for jpg in d.glob("*.jpg"):
-                jgw_path = jpg.with_suffix(".jgw")
-                if not jgw_path.exists():
+        for mapnom in cand_mapnoms:
+            jpg = jgw_path = None
+            for root in roots:
+                d = root / f"ortofoto_{mapnom}"
+                if d.is_dir():
+                    for j in d.glob("*.jpg"):
+                        if j.with_suffix(".jgw").exists():
+                            jpg, jgw_path = j, j.with_suffix(".jgw")
+                            break
+                if jpg:
+                    break
+            if not jpg:
+                continue
+            try:
+                with open(jgw_path) as f:
+                    vals = [float(line.strip()) for line in f if line.strip()]
+                if len(vals) != 6:
                     continue
-                try:
-                    with open(jgw_path) as f:
-                        vals = [float(line.strip()) for line in f if line.strip()]
-                    if len(vals) != 6:
-                        continue
-                    px_x, _, _, px_y, x0, y0 = vals
-                    with Image.open(jpg) as probe:
-                        w, h = probe.size
-                except Exception:
-                    continue
-                vals_full = (px_x, px_y, x0, y0, w, h)
-                left, right = x0, x0 + w * px_x
-                top, bottom = y0, y0 + h * px_y
-                lo_x, hi_x = min(left, right), max(left, right)
-                lo_y, hi_y = min(top, bottom), max(top, bottom)
-                # Skip sheets that don't intersect the bbox at all
-                if hi_x <= xmin or lo_x >= xmax or hi_y <= ymin or lo_y >= ymax:
-                    continue
-                candidates.append((jpg, vals_full, (lo_x, lo_y, hi_x, hi_y)))
+                px_x, _, _, px_y, x0, y0 = vals
+                with Image.open(jpg) as probe:
+                    w, h = probe.size
+            except Exception:
+                continue
+            vals_full = (px_x, px_y, x0, y0, w, h)
+            left, right = x0, x0 + w * px_x
+            top, bottom = y0, y0 + h * px_y
+            lo_x, hi_x = min(left, right), max(left, right)
+            lo_y, hi_y = min(top, bottom), max(top, bottom)
+            if hi_x <= xmin or lo_x >= xmax or hi_y <= ymin or lo_y >= ymax:
+                continue
+            candidates.append((jpg, vals_full, (lo_x, lo_y, hi_x, hi_y)))
 
         if not candidates:
             return []
@@ -1368,10 +1472,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         """Compose ČÚZK ortofoto from tiles matching S-JTSK bbox."""
         import math
         query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
-        # ?hires=1 — fetch from ČÚZK public WMS at 0.125 m/px native (2× the
-        # cached SM5 source). Tiled into 4000×4000 sub-requests because the
-        # WMS server caps WIDTH/HEIGHT around 4096. Free / no auth.
+        # ?hires=1 — 0.125 m/px native ortho. Prefer the local raw SM5 sheets
+        # (the bulk_ortofoto pull) over the WMS: same ČÚZK source, but no double
+        # JPEG re-encode and no network round-trip. Fall back to the public WMS
+        # only when the bbox isn't fully covered by local sheets.
         if query.get("hires", [""])[0] == "1":
+            try:
+                sj = self._query_sjtsk_bbox(query)
+                if sj and self._find_raw_ortofotos_covering(*sj):
+                    return self._proxy_ortofoto_raw(query)
+            except Exception as e:
+                print(f"[ortofoto] hires raw-route failed, using WMS: {e}")
             return self._proxy_ortofoto_vhr(query)
         # ?source=raw — crop directly from the locally cached raw SM5 JPEG
         # (ČÚZK 0.25 m/px). Eliminates tile-service upscaling + our
@@ -1813,10 +1924,45 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._api_wiki()
         elif self.path.startswith("/api/building-detail?"):
             self._api_building_detail()
+        elif _path.startswith("/cuzk-pyramid/dmpok/") and _path.endswith(".lerc"):
+            self._serve_pyramid_tile(_path)
         elif self.path.endswith(".glb"):
             self._serve_glb_gzipped()
         else:
             super().do_GET()
+
+    def _serve_pyramid_tile(self, path):
+        """Serve a heightmap pyramid tile, building it on demand from DMPOK when
+        the static .lerc is missing (z>=14). Built tiles are written to disk so
+        the next request is a plain static serve."""
+        import re
+        m = re.match(r"^/cuzk-pyramid/dmpok/(\d+)/(\d+)/(\d+)\.lerc$", path)
+        if not m:
+            self.send_error(404)
+            return
+        z, x, y = (int(g) for g in m.groups())
+        bpt = _pyramid_module()
+        out_path = bpt.OUT_DIR / "dmpok" / str(z) / str(x) / f"{y}.lerc"
+        if not out_path.exists():
+            if not (_PYRAMID_ONDEMAND_ZMIN <= z <= _PYRAMID_ONDEMAND_ZMAX):
+                self.send_error(
+                    404, f"tile not pre-baked (on-demand only z="
+                         f"{_PYRAMID_ONDEMAND_ZMIN}..{_PYRAMID_ONDEMAND_ZMAX})")
+                return
+            with _PYRAMID_BUILD_SEM, _pyramid_tile_lock((z, x, y)):
+                if not out_path.exists():                 # another thread may have built it
+                    try:
+                        ok = bpt.build_tile(z, x, y, bpt.BULK_OUT_DIR, bpt.OUT_DIR,
+                                            max_z_error=0.10, overwrite=False)
+                    except Exception as e:                # noqa: BLE001
+                        self.send_error(500, f"pyramid tile build failed: {e}")
+                        return
+                    if not ok:
+                        self.send_error(404, "no DMPOK coverage for this tile")
+                        return
+        # File exists now (pre-baked or just built) — let the static handler
+        # serve it through the cuzk-pyramid symlink.
+        super().do_GET()
 
     def _api_buildings(self):
         """Fetch RÚIAN building footprints, return in local coords relative to gcx,gcy."""

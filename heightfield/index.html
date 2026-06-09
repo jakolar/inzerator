@@ -499,8 +499,13 @@ controls.dampingFactor = 0.1;
 // Bounds are derived from the outermost ring half so the limits scale
 // with whatever rings the manifest carries.
 const _outerHalf = Math.max(...rings.map(r => r.half));   // m, biggest ring
-controls.minDistance = 30;                   // 30 m — close enough for roof detail
+controls.minDistance = 3;                    // 3 m — get right down onto roof/detail (near plane is 1 m)
 controls.maxDistance = _outerHalf * 4;       // 4× outer half ≈ ring fills ~25% of screen at fully zoomed-out
+// Dolly toward the cursor instead of the orbit centre. Without this, zoom
+// only ever closes on controls.target (scene centre), so reaching detail at
+// the periphery means orbiting it to the middle first. zoomToCursor walks the
+// target under the pointer as you wheel in — you can dive into any spot.
+controls.zoomToCursor = true;
 // Stop just shy of horizontal so the user can't dip below the terrain
 // (where backface culling would show black or the orthophoto from below).
 // 88° leaves a tiny margin so the camera doesn't get stuck flat at the

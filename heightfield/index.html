@@ -145,6 +145,11 @@
       <button class="oq" data-tier="ultra" style="padding:8px 14px;font-size:12px;min-height:40px;cursor:pointer;">Ultra</button>
       <button class="oq" data-tier="super" style="padding:8px 14px;font-size:12px;min-height:40px;cursor:pointer;">Super</button>
     </div>
+    <div style="display:flex;align-items:center;gap:4px;margin-top:6px;">
+      <span style="font-size:11px;color:#9c9;">Formát:</span>
+      <button class="of" data-fmt="auto" style="padding:6px 12px;font-size:12px;min-height:36px;cursor:pointer;">Auto&nbsp;(KTX2)</button>
+      <button class="of" data-fmt="jpg"  style="padding:6px 12px;font-size:12px;min-height:36px;cursor:pointer;">JPEG</button>
+    </div>
   </details>
 
   <div style="margin-top:10px;">
@@ -571,10 +576,20 @@ const webpSupport = new Promise(resolve => {
 });
 let _canWebP = false;
 webpSupport.then(v => { _canWebP = v; console.log('WebP support:', v); });
-// Picker: prefer KTX2 (4–6× less VRAM via GPU-side compression), then
-// WebP, then JPEG. `tierEntry` is r.ortho_tiers[name], with .file (jpg),
-// optional .webp_file, optional .ktx2_file. Returns an absolute URL.
+// Ortho format override. Default 'auto' = KTX2 → WebP → JPEG (best VRAM).
+// Force a format via ?fmt=jpg|webp|ktx2 or the UI toggle — handy for eyeing
+// KTX2 (ETC1S, lossy GPU compression) vs the source JPEG q95 side by side.
+let _orthoFmt = (() => {
+  const f = (URL_PARAMS.get('fmt') || '').toLowerCase();
+  return ({ jpeg: 'jpg', jpg: 'jpg', webp: 'webp', ktx2: 'ktx2' })[f] || 'auto';
+})();
+// Picker: honours _orthoFmt, else prefers KTX2 (4–6× less VRAM via GPU-side
+// compression), then WebP, then JPEG. `tierEntry` is r.ortho_tiers[name], with
+// .file (jpg), optional .webp_file, optional .ktx2_file. Returns an absolute URL.
 const pickTierUrl = (tierEntry) => {
+  if (_orthoFmt === 'jpg')  return asset(tierEntry.file);
+  if (_orthoFmt === 'webp') return asset(tierEntry.webp_file || tierEntry.file);
+  if (_orthoFmt === 'ktx2') return asset(tierEntry.ktx2_file || tierEntry.file);
   if (tierEntry.ktx2_file) return asset(tierEntry.ktx2_file);
   if (_canWebP && tierEntry.webp_file) return asset(tierEntry.webp_file);
   return asset(tierEntry.file);
@@ -1039,6 +1054,264 @@ for (let i = 0; i < rings.length; i++) {
 }
 setStage('hotovo');
 hideLoader();
+
+// ── Block diagram base + ground shadow ──
+// Cartographic "podstavec": extrudes the outermost ring extent downward
+// into a solid block with stone-coloured vertical walls and a darker
+// bottom. Removes the "floating coin in the sky" feel and reads as a
+// 3D-printed relief model — classic block-diagram convention since the
+// 19th century, used in atlas inserts and museum reliefs.
+//
+// Sized to the widest ring (rings[0].side_m). Block top sits 10 cm
+// below globalYmin so the terrain edge meets the wall cleanly; the
+// resulting drop reads as the natural cross-section. Depth scales with
+// terrain relief (60 % of (Ymax-Ymin), floor 30 m) so flat regions
+// don't get a paper-thin base.
+//
+// The radial shadow plane underneath grounds the model visually — when
+// you orbit, the soft gradient suggests the block sits on a notional
+// surface rather than floating. CSS radial-gradient baked into a
+// CanvasTexture, no extra GPU cost.
+//
+// All MeshBasicMaterial — viewer's procedural shader stack doesn't
+// install any lights, so PBR/Lambert would render black.
+{
+  // Terrain vertex shader: pos.y = absY - uYBase (uYBase = yMid). So the
+  // terrain in scene space is centred around Y=0, ranging from
+  // (globalYmin - yMid) to (globalYmax - yMid). The block must use the
+  // same scene-space frame, not absolute AMSL — otherwise it lands
+  // ~yMid metres below the terrain and disappears below the horizon.
+  const W = widestSide;
+  const sceneYmin = globalYmin - yMid;
+  const sceneYmax = globalYmax - yMid;
+  // Shallow base: deep block dips far below the sky horizon (Y=0) and
+  // looks "wedged" against the background. 30 % of the terrain relief
+  // range, floored at 12 m, capped at 25 m — enough to read as a 3D
+  // diagram cross-section without becoming an iceberg.
+  const range = sceneYmax - sceneYmin;
+  const BASE_DEPTH = Math.min(25, Math.max(12, range * 0.3));
+  const topY = sceneYmin - 0.1;
+  const bottomY = topY - BASE_DEPTH;
+
+  const STONE = 0x9a9088;   // matte plaster / gypsum
+  const DARK  = 0x4a4540;   // bottom face, suggests shadow under the model
+  // Fake vertical AO: scene has no lights, so the wall gets its depth from a
+  // per-vertex grayscale multiplier baked into vertexColors. Brightest at the
+  // terrain edge, darkest at the block floor — reads as ambient occlusion
+  // sinking into the base. Multiplier (not absolute colour) so STONE/DARK tone
+  // is preserved; F_TOP slightly >1 lifts the lit edge without clipping.
+  const F_TOP = 1.06, F_BOT = 0.48;
+  const Y_TOP = sceneYmax;   // highest terrain → lit edge
+  const Y_BOT = bottomY;     // block floor → occluded
+  const shadeF = (worldY) => {
+    const t = Math.max(0, Math.min(1, (worldY - Y_BOT) / (Y_TOP - Y_BOT)));
+    return F_BOT + (F_TOP - F_BOT) * t;
+  };
+  const stone = new THREE.MeshBasicMaterial({ color: STONE, fog: true, vertexColors: true });
+  const dark  = new THREE.MeshBasicMaterial({ color: DARK,  fog: true, vertexColors: true });
+  const invis = new THREE.MeshBasicMaterial({ visible: false });
+  // BoxGeometry face order: +X, -X, +Y(top), -Y(bot), +Z, -Z
+  // Top face invisible — terrain covers it from above; cleaner than a
+  // duplicate stone face poking through if the terrain edge dips below
+  // globalYmin (shouldn't happen, but defensive).
+  const boxGeo = new THREE.BoxGeometry(W, BASE_DEPTH, W);
+  // Per-vertex gradient multiplier. Bottom face (normal.y < 0) keeps f=1 so
+  // the DARK material stays pure; walls fade by height. Box local Y is
+  // centred on (topY+bottomY)/2, so world Y = localY + that midpoint.
+  {
+    const bpos = boxGeo.attributes.position;
+    const bnor = boxGeo.attributes.normal;
+    const bcol = new Float32Array(bpos.count * 3);
+    const midY = (topY + bottomY) / 2;
+    for (let i = 0; i < bpos.count; i++) {
+      const f = bnor.getY(i) < -0.5 ? 1.0 : shadeF(bpos.getY(i) + midY);
+      bcol[i * 3] = bcol[i * 3 + 1] = bcol[i * 3 + 2] = f;
+    }
+    boxGeo.setAttribute('color', new THREE.BufferAttribute(bcol, 3));
+  }
+  const box = new THREE.Mesh(boxGeo, [stone, stone, invis, dark, stone, stone]);
+  box.position.set(0, (topY + bottomY) / 2, 0);
+  box.renderOrder = 0;     // before terrain (renderOrder 1+) so no z-fight surprises
+  box.frustumCulled = false;
+  scene.add(box);
+
+  // Radial shadow plane: 256² canvas with a CSS radial gradient baked
+  // into a CanvasTexture. Centred at the model, fades to transparent
+  // at the plane edge. Placed at the same Y as the box bottom so the
+  // visible (transparent-fading) annulus sits on the same plane as the
+  // dark bottom face — reads as the box casting a soft halo.
+  const shadowCanvas = document.createElement('canvas');
+  shadowCanvas.width = shadowCanvas.height = 256;
+  const ctx = shadowCanvas.getContext('2d');
+  const grad = ctx.createRadialGradient(128, 128, 30, 128, 128, 128);
+  grad.addColorStop(0,   'rgba(0,0,0,0.45)');
+  grad.addColorStop(0.7, 'rgba(0,0,0,0.15)');
+  grad.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 256, 256);
+  const shadowTex = new THREE.CanvasTexture(shadowCanvas);
+  const shadowMat = new THREE.MeshBasicMaterial({
+    map: shadowTex,
+    transparent: true,
+    depthWrite: false,    // don't occlude the box that sits at the same Y
+    fog: false,           // FogExp2 would dim the outer halo
+  });
+  const SHADOW_SIZE = W * 2;
+  const shadowGeo = new THREE.PlaneGeometry(SHADOW_SIZE, SHADOW_SIZE);
+  const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
+  shadowMesh.rotation.x = -Math.PI / 2;     // face up
+  shadowMesh.position.set(0, bottomY + 0.05, 0);
+  shadowMesh.renderOrder = -1;
+  shadowMesh.frustumCulled = false;
+  scene.add(shadowMesh);
+
+  console.info(`[block-base] W=${W.toFixed(0)}m, depth=${BASE_DEPTH.toFixed(0)}m, ` +
+               `topY=${topY.toFixed(1)} (scene), bottomY=${bottomY.toFixed(1)} (scene), ` +
+               `yMid=${yMid.toFixed(1)} (AMSL)`);
+
+  // ── Skirt: extruded perimeter that closes the gap between the flat
+  //          box top and the varying terrain edge profile.
+  // The box top sits at sceneYmin (= globally lowest point). Wherever
+  // the actual terrain edge rises above sceneYmin (= most of the time),
+  // there's a vertical gap between terrain underside and box top. Skirt
+  // is a thin band of triangles whose TOP vertices follow the sampled
+  // heightmap profile and BOTTOM vertices sit at the box top (topY).
+  // No bottom face — that's the box's job.
+  //
+  // Sampling is async (await loadHeightmapData on the outer ring's LERC).
+  // Until it lands, the user sees the flat box; the skirt drops in once
+  // ready (~1-2 s). This avoids loading 16 MB of heightmap into JS heap
+  // synchronously at startup.
+  (async () => {
+    try {
+      const outer = rings[0];
+      const info = ringData[outer.slug].heightLoadInfo;
+      const { data: f32 } = await loadHeightmapData(
+        info.url, info.fmt, info.size, info.y_min, info.y_max);
+      const n = info.size;
+      const sideM = outer.side_m;
+
+      // Bilinear heightmap sample at hmUv ∈ [0,1]² → scene-space Y.
+      // Mirrors what the terrain vertex shader does: it samples uHeight
+      // with LinearFilter + ClampToEdgeWrapping, where pixel CENTRES sit
+      // at uv = ((i+0.5)/n, (j+0.5)/n). Reproducing that exact filter
+      // here lets the skirt land on the SAME heights the terrain edge
+      // shows; any "i/(n-1)" texel-corner approximation left half-texel
+      // gaps because the shader's interpolation is offset by 0.5 texel.
+      const sampleHmUv = (hmU, hmV) => {
+        const tu = hmU * n - 0.5;
+        const tv = hmV * n - 0.5;
+        let i0 = Math.floor(tu), i1 = i0 + 1;
+        let j0 = Math.floor(tv), j1 = j0 + 1;
+        let du = tu - i0, dv = tv - j0;
+        if (i0 < 0)     { i0 = 0;     i1 = 0;     du = 0; }
+        if (i1 > n - 1) { i0 = n - 1; i1 = n - 1; du = 0; }
+        if (j0 < 0)     { j0 = 0;     j1 = 0;     dv = 0; }
+        if (j1 > n - 1) { j0 = n - 1; j1 = n - 1; dv = 0; }
+        const h00 = f32[j0 * n + i0];
+        const h10 = f32[j0 * n + i1];
+        const h01 = f32[j1 * n + i0];
+        const h11 = f32[j1 * n + i1];
+        return h00 * (1 - du) * (1 - dv) +
+               h10 *      du  * (1 - dv) +
+               h01 * (1 - du) *      dv  +
+               h11 *      du  *      dv  - yMid;
+      };
+
+      // Walk perimeter CW from NW at TERRAIN vertex resolution
+      // (GEO_SUBDIVS = 1024 segments → 1025 points per edge). The
+      // terrain mesh's vertex shader interpolates between adjacent
+      // vertices linearly; a skirt sampling at every terrain vertex
+      // and connecting with straight segments matches the rendered
+      // edge exactly. Corners shared with neighbouring edges so the
+      // perimeter loop has 4 × GEO_SUBDIVS unique samples.
+      //
+      // PlaneGeometry vertex at (u, v) maps to scene
+      //   x = (u - 0.5) * sideM, z = (0.5 - v) * sideM  [pre-rotation]
+      // After rotateX(-π/2): the *original* y becomes -z, so
+      //   x = (u - 0.5) * sideM, z = (0.5 - v) * sideM
+      // (sign on z depends on which corner you call "north"; the
+      // mapping below was verified to put data row 0 at world z=-half.)
+      // Shader samples uHeight at hmUv = (u, 1 - v).
+      const NSEG = 1024;   // matches GEO_SUBDIVS, the terrain plane subdivision
+      const vertexXZ = (u, v) => ({
+        x: (u - 0.5) * sideM,
+        // v=0 maps to scene z=+sideM/2 (south) per PlaneGeometry rotation;
+        // v=1 maps to z=-sideM/2 (north).
+        z: (0.5 - v) * sideM,
+      });
+      const sampleVertY = (u, v) => sampleHmUv(u, 1.0 - v);
+
+      const perim = [];
+      const pushUV = (u, v) => {
+        const w = vertexXZ(u, v);
+        perim.push({ x: w.x, z: w.z, y: sampleVertY(u, v) });
+      };
+      // North edge: v=1, u from 0 to 1 (1025 points, includes both corners)
+      for (let i = 0; i <= NSEG; i++) pushUV(i / NSEG, 1);
+      // East edge: u=1, v from <1 down to 0 (1024 points, skip NE corner)
+      for (let i = NSEG - 1; i >= 0; i--) pushUV(1, i / NSEG);
+      // South edge: v=0, u from <1 to 0 (1024 points, skip SE)
+      for (let i = NSEG - 1; i >= 0; i--) pushUV(i / NSEG, 0);
+      // West edge: u=0, v from >0 to <1 (1023 points, skip SW and NW)
+      for (let i = 1; i < NSEG; i++) pushUV(0, i / NSEG);
+
+      // Build geometry: 2 vertices per perimeter sample (top follows
+      // terrain, bottom at box top). 2 triangles per quad, P quads.
+      const P = perim.length;
+      const positions = new Float32Array(P * 2 * 3);
+      for (let k = 0; k < P; k++) {
+        const p = perim[k];
+        const offs = k * 6;
+        positions[offs + 0] = p.x;
+        positions[offs + 1] = p.y;          // top: terrain edge height
+        positions[offs + 2] = p.z;
+        positions[offs + 3] = p.x;
+        positions[offs + 4] = topY;         // bottom: box top
+        positions[offs + 5] = p.z;
+      }
+      const indices = new Uint16Array(P * 6);
+      for (let k = 0; k < P; k++) {
+        const next = (k + 1) % P;
+        const a = k * 2, b = k * 2 + 1, c = next * 2, d = next * 2 + 1;
+        const off = k * 6;
+        indices[off + 0] = a; indices[off + 1] = b; indices[off + 2] = c;
+        indices[off + 3] = b; indices[off + 4] = d; indices[off + 5] = c;
+      }
+      const skirtGeo = new THREE.BufferGeometry();
+      skirtGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      skirtGeo.setIndex(new THREE.BufferAttribute(indices, 1));
+
+      // Same fake-AO gradient as the box wall. Top vertex = terrain edge
+      // height, bottom vertex = topY (box top). Bottom matches the box wall's
+      // top vertices (both at world Y = topY), so the gradient is continuous
+      // across the skirt→box seam.
+      const scol = new Float32Array(P * 2 * 3);
+      for (let k = 0; k < P; k++) {
+        const tf = shadeF(perim[k].y);
+        const bf = shadeF(topY);
+        const o = k * 6;
+        scol[o] = scol[o + 1] = scol[o + 2] = tf;
+        scol[o + 3] = scol[o + 4] = scol[o + 5] = bf;
+      }
+      skirtGeo.setAttribute('color', new THREE.BufferAttribute(scol, 3));
+
+      // DoubleSide so wall faces both directions — saves figuring out
+      // CW/CCW vertex winding for the 4 wall orientations.
+      const skirtMat = new THREE.MeshBasicMaterial({
+        color: STONE, fog: true, side: THREE.DoubleSide, vertexColors: true,
+      });
+      const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
+      skirtMesh.renderOrder = 0;
+      skirtMesh.frustumCulled = false;
+      scene.add(skirtMesh);
+      console.info(`[block-base] skirt added (${P} perim samples, ` +
+                   `outer ring ${sideM.toFixed(0)}×${sideM.toFixed(0)} m)`);
+    } catch (e) {
+      console.warn('[block-base] skirt build failed:', e);
+    }
+  })();
+}
 
 // ── CPU heightmap sample ──
 // Returns absolute elevation (m AMSL) at scene-local (lx, lz). Iterates
@@ -2274,9 +2547,34 @@ async function switchOrthoTier(tier) {
   }
   if (freed) console.info(`[ortho] disposed ${freed} stale tier texture(s)`);
 }
+// Format toggle: KTX2-auto vs forced JPEG. Format isn't part of the tier
+// cache key, so switching flushes the cache and rebuilds the active tier.
+function syncFmtButtons() {
+  const sel = _orthoFmt === 'jpg' ? 'jpg' : 'auto';
+  for (const btn of orthoTierUI.querySelectorAll('.of')) {
+    const active = btn.dataset.fmt === sel;
+    btn.style.background = active ? '#1a6a8e' : '';
+    btn.style.color = active ? '#fff' : '';
+    btn.style.fontWeight = active ? 'bold' : 'normal';
+  }
+}
+async function setOrthoFormat(fmt) {
+  if (fmt === _orthoFmt) return;
+  _orthoFmt = fmt;
+  for (const [key, tex] of Object.entries(orthoTierCache)) {
+    tex.dispose();
+    delete orthoTierCache[key];
+  }
+  syncFmtButtons();
+  const t = currentTier;
+  currentTier = null;          // force switchOrthoTier to reload under new fmt
+  await switchOrthoTier(t);
+}
 orthoTierUI.addEventListener('click', (e) => {
   if (e.target.dataset?.tier) switchOrthoTier(e.target.dataset.tier);
+  else if (e.target.dataset?.fmt) setOrthoFormat(e.target.dataset.fmt);
 });
+syncFmtButtons();
 
 // ── Cadastre overlay toggle ──
 // Each ring fetches its own SJTSK-aligned cadastre PNG from inzerator's

@@ -1093,8 +1093,35 @@ hideLoader();
   const topY = sceneYmin - 0.1;
   const bottomY = topY - BASE_DEPTH;
 
-  const STONE = 0x9a9088;   // matte plaster / gypsum
+  const STONE = 0xa89986;   // warm matte stone (was flat 0x9a9088 beige)
   const DARK  = 0x4a4540;   // bottom face, suggests shadow under the model
+  const RIM_F = 0.38;       // dark rim multiplier at the ortho↔wall cut
+  const RIM_M = 0.6;        // rim band height in metres (reads as ~1px edge)
+
+  // Fine procedural grain — kills the "default flat material" read. White-ish
+  // hash noise (deterministic; no Math.random so renders are reproducible),
+  // narrow 0.86–1.0 brightness so it modulates without speckling. Tiled via
+  // RepeatWrapping; box uses 0–1 UVs (repeat sets scale), skirt sets metric
+  // UVs on a clone so the grain size matches across both meshes.
+  const makeGrainTex = () => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const img = g.createImageData(128, 128);
+    for (let i = 0; i < 128 * 128; i++) {
+      const h = ((i * 2654435761) >>> 0) / 4294967295;
+      const v = Math.round((0.86 + h * 0.14) * 255);
+      img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v;
+      img.data[i * 4 + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    return t;
+  };
+  const GRAIN_M = 150;      // metres per grain-texture tile (shared box+skirt)
+  const grainBox = makeGrainTex();
+  grainBox.repeat.set(W / GRAIN_M, 1);
   // Fake vertical AO: scene has no lights, so the wall gets its depth from a
   // per-vertex grayscale multiplier baked into vertexColors. Brightest at the
   // terrain edge, darkest at the block floor — reads as ambient occlusion
@@ -1107,7 +1134,7 @@ hideLoader();
     const t = Math.max(0, Math.min(1, (worldY - Y_BOT) / (Y_TOP - Y_BOT)));
     return F_BOT + (F_TOP - F_BOT) * t;
   };
-  const stone = new THREE.MeshBasicMaterial({ color: STONE, fog: true, vertexColors: true });
+  const stone = new THREE.MeshBasicMaterial({ color: STONE, fog: true, vertexColors: true, map: grainBox });
   const dark  = new THREE.MeshBasicMaterial({ color: DARK,  fog: true, vertexColors: true });
   const invis = new THREE.MeshBasicMaterial({ visible: false });
   // BoxGeometry face order: +X, -X, +Y(top), -Y(bot), +Z, -Z
@@ -1256,50 +1283,66 @@ hideLoader();
       // West edge: u=0, v from >0 to <1 (1023 points, skip SW and NW)
       for (let i = 1; i < NSEG; i++) pushUV(0, i / NSEG);
 
-      // Build geometry: 2 vertices per perimeter sample (top follows
-      // terrain, bottom at box top). 2 triangles per quad, P quads.
+      // Build geometry: 3 vertices per perimeter sample.
+      //   row0 = terrain edge (rim top)
+      //   row1 = rim bottom = edge − RIM_M  (clamped to box top)
+      //   row2 = box top (topY)
+      // Two stacked quad bands per segment: a thin dark RIM band (row0→row1)
+      // that reads as a deliberate edge at the ortho↔wall cut (#3), and the
+      // gradient wall band (row1→row2). Cumulative perimeter distance + world
+      // Y give metric UVs so the grain (#5) tiles at GRAIN_M regardless of
+      // edge profile. 3·P ≤ 12288 verts → fits Uint16 indices.
       const P = perim.length;
-      const positions = new Float32Array(P * 2 * 3);
+      const positions = new Float32Array(P * 3 * 3);
+      const scol      = new Float32Array(P * 3 * 3);
+      const uvs       = new Float32Array(P * 3 * 2);
+      let cum = 0;
       for (let k = 0; k < P; k++) {
         const p = perim[k];
-        const offs = k * 6;
-        positions[offs + 0] = p.x;
-        positions[offs + 1] = p.y;          // top: terrain edge height
-        positions[offs + 2] = p.z;
-        positions[offs + 3] = p.x;
-        positions[offs + 4] = topY;         // bottom: box top
-        positions[offs + 5] = p.z;
+        const prev = perim[(k - 1 + P) % P];
+        cum += Math.hypot(p.x - prev.x, p.z - prev.z);
+        const rimBotY = Math.max(topY, p.y - RIM_M);
+        const ys = [p.y, rimBotY, topY];
+        const fs = [RIM_F, shadeF(rimBotY), shadeF(topY)];
+        const u = cum / GRAIN_M;
+        for (let row = 0; row < 3; row++) {
+          const vi = k * 3 + row;
+          positions[vi * 3 + 0] = p.x;
+          positions[vi * 3 + 1] = ys[row];
+          positions[vi * 3 + 2] = p.z;
+          scol[vi * 3 + 0] = scol[vi * 3 + 1] = scol[vi * 3 + 2] = fs[row];
+          uvs[vi * 2 + 0] = u;
+          uvs[vi * 2 + 1] = ys[row] / GRAIN_M;
+        }
       }
-      const indices = new Uint16Array(P * 6);
+      // 2 quads (rim + wall) × 2 tris × 3 idx = 12 indices per segment.
+      const indices = new Uint32Array(P * 12);
       for (let k = 0; k < P; k++) {
         const next = (k + 1) % P;
-        const a = k * 2, b = k * 2 + 1, c = next * 2, d = next * 2 + 1;
-        const off = k * 6;
-        indices[off + 0] = a; indices[off + 1] = b; indices[off + 2] = c;
-        indices[off + 3] = b; indices[off + 4] = d; indices[off + 5] = c;
+        const a = k * 3, b = next * 3;     // base vertex of each sample column
+        const off = k * 12;
+        // rim band: rows 0,1
+        indices[off + 0] = a;     indices[off + 1] = a + 1; indices[off + 2] = b;
+        indices[off + 3] = a + 1; indices[off + 4] = b + 1; indices[off + 5] = b;
+        // wall band: rows 1,2
+        indices[off + 6] = a + 1; indices[off + 7] = a + 2; indices[off + 8]  = b + 1;
+        indices[off + 9] = a + 2; indices[off + 10] = b + 2; indices[off + 11] = b + 1;
       }
       const skirtGeo = new THREE.BufferGeometry();
       skirtGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      skirtGeo.setAttribute('color', new THREE.BufferAttribute(scol, 3));
+      skirtGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
       skirtGeo.setIndex(new THREE.BufferAttribute(indices, 1));
 
-      // Same fake-AO gradient as the box wall. Top vertex = terrain edge
-      // height, bottom vertex = topY (box top). Bottom matches the box wall's
-      // top vertices (both at world Y = topY), so the gradient is continuous
-      // across the skirt→box seam.
-      const scol = new Float32Array(P * 2 * 3);
-      for (let k = 0; k < P; k++) {
-        const tf = shadeF(perim[k].y);
-        const bf = shadeF(topY);
-        const o = k * 6;
-        scol[o] = scol[o + 1] = scol[o + 2] = tf;
-        scol[o + 3] = scol[o + 4] = scol[o + 5] = bf;
-      }
-      skirtGeo.setAttribute('color', new THREE.BufferAttribute(scol, 3));
-
+      // Grain clone with metric UVs already baked in → repeat 1×1.
+      const grainSkirt = grainBox.clone();
+      grainSkirt.needsUpdate = true;
+      grainSkirt.repeat.set(1, 1);
       // DoubleSide so wall faces both directions — saves figuring out
       // CW/CCW vertex winding for the 4 wall orientations.
       const skirtMat = new THREE.MeshBasicMaterial({
         color: STONE, fog: true, side: THREE.DoubleSide, vertexColors: true,
+        map: grainSkirt,
       });
       const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
       skirtMesh.renderOrder = 0;

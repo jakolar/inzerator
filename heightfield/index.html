@@ -1112,10 +1112,15 @@ hideLoader();
   const topY = sceneYmin - 0.1;
   const bottomY = topY - BASE_DEPTH;
 
-  const STONE = 0xa89986;   // warm matte stone (was flat 0x9a9088 beige)
-  const DARK  = 0x4a4540;   // bottom face, suggests shadow under the model
-  const RIM_F = 0.38;       // dark rim multiplier at the ortho↔wall cut
-  const RIM_M = 0.6;        // rim band height in metres (reads as ~1px edge)
+  // Premium "anthracite" look: dark slate/graphite walls that contrast the
+  // colourful ortho on top and read as a machined plinth rather than a beige
+  // cartographic block. A bright edge-highlight on the top chamfer lip is the
+  // only light cue (scene is unlit) — it fakes a rim-light catching the bevel.
+  const STONE   = 0x34383c;   // dark anthracite wall (was warm beige 0xa89986)
+  const DARK    = 0x1b1d1f;   // near-black bottom face
+  const BEVEL_W = 8;          // horizontal outward overhang of the top chamfer (m)
+  const BEVEL_H = 6;          // vertical drop of the chamfer facet (m)
+  const EDGE_HL = 2.8;        // edge-highlight multiplier on the chamfer lip (rim light)
 
   // Fine procedural grain — kills the "default flat material" read. White-ish
   // hash noise (deterministic; no Math.random so renders are reproducible),
@@ -1142,11 +1147,12 @@ hideLoader();
   const grainBox = makeGrainTex();
   grainBox.repeat.set(W / GRAIN_M, 1);
   // Fake vertical AO: scene has no lights, so the wall gets its depth from a
-  // per-vertex grayscale multiplier baked into vertexColors. Brightest at the
-  // terrain edge, darkest at the block floor — reads as ambient occlusion
-  // sinking into the base. Multiplier (not absolute colour) so STONE/DARK tone
-  // is preserved; F_TOP slightly >1 lifts the lit edge without clipping.
-  const F_TOP = 1.06, F_BOT = 0.48;
+  // per-vertex grayscale multiplier baked into vertexColors. Brightest just
+  // under the chamfer, darkest at the block floor — reads as ambient occlusion
+  // sinking into the base. Multiplier (not absolute colour) so the anthracite
+  // tone is preserved. The chamfer lip itself gets EDGE_HL (well above F_TOP)
+  // for the bright rim-light read; the vertical wall fades F_TOP→F_BOT.
+  const F_TOP = 1.0, F_BOT = 0.5;
   const Y_TOP = sceneYmax;   // highest terrain → lit edge
   const Y_BOT = bottomY;     // block floor → occluded
   const shadeF = (worldY) => {
@@ -1160,7 +1166,11 @@ hideLoader();
   // Top face invisible — terrain covers it from above; cleaner than a
   // duplicate stone face poking through if the terrain edge dips below
   // globalYmin (shouldn't happen, but defensive).
-  const boxGeo = new THREE.BoxGeometry(W, BASE_DEPTH, W);
+  // Box footprint is widened by the chamfer overhang on each side: the
+  // skirt's vertical wall sits BEVEL_W metres outboard of the terrain edge
+  // (the chamfer flares out), so the box must reach it or a gap shows.
+  const BW = W + 2 * BEVEL_W;
+  const boxGeo = new THREE.BoxGeometry(BW, BASE_DEPTH, BW);
   // Per-vertex gradient multiplier. Bottom face (normal.y < 0) keeps f=1 so
   // the DARK material stays pure; walls fade by height. Box local Y is
   // centred on (topY+bottomY)/2, so world Y = localY + that midpoint.
@@ -1181,20 +1191,47 @@ hideLoader();
   box.frustumCulled = false;
   scene.add(box);
 
-  // Radial shadow plane: 256² canvas with a CSS radial gradient baked
-  // into a CanvasTexture. Centred at the model, fades to transparent
-  // at the plane edge. Placed at the same Y as the box bottom so the
-  // visible (transparent-fading) annulus sits on the same plane as the
-  // dark bottom face — reads as the box casting a soft halo.
+  // Ground shadow: a RECTANGULAR soft shadow that matches the model's square
+  // footprint, not the old radial blob (a round halo under a square block
+  // floats wrong in perspective). Two cues baked into one CanvasTexture:
+  //   1. a tight, dark CONTACT shadow hugging the footprint edge (anchors the
+  //      base to the ground plane — the "it's sitting ON something" cue),
+  //   2. a wide, faint AMBIENT halo fading out around it (soft grounding).
+  // Drawn by filling a rounded rect inset into the canvas with a large
+  // ctx.shadowBlur, twice (sharp+near, then soft+wide), so the alpha falls
+  // off as a rectangle with rounded corners rather than a circle.
+  const SHADOW_PAD = 1.7;                 // plane span = footprint × this (room for halo)
+  const SC = 512;                         // canvas resolution (rect edges need >256 to stay crisp)
   const shadowCanvas = document.createElement('canvas');
-  shadowCanvas.width = shadowCanvas.height = 256;
+  shadowCanvas.width = shadowCanvas.height = SC;
   const ctx = shadowCanvas.getContext('2d');
-  const grad = ctx.createRadialGradient(128, 128, 30, 128, 128, 128);
-  grad.addColorStop(0,   'rgba(0,0,0,0.45)');
-  grad.addColorStop(0.7, 'rgba(0,0,0,0.15)');
-  grad.addColorStop(1,   'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 256, 256);
+  // Footprint maps to the centre 1/SHADOW_PAD of the canvas.
+  const fp = SC / SHADOW_PAD;             // footprint side in canvas px
+  const m0 = (SC - fp) / 2;               // margin → footprint top-left
+  const drawRoundRect = (x, y, w, h, r) => {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y,     x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x,     y + h, r);
+    ctx.arcTo(x,     y + h, x,     y,     r);
+    ctx.arcTo(x,     y,     x + w, y,     r);
+    ctx.closePath();
+    ctx.fill();
+  };
+  // Pass 1 — wide ambient halo: heavy blur, low opacity.
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.32)';
+  ctx.shadowBlur = fp * 0.16;
+  ctx.fillStyle = 'rgba(0,0,0,1)';
+  drawRoundRect(m0, m0, fp, fp, fp * 0.04);
+  ctx.restore();
+  // Pass 2 — tight contact shadow: small blur, higher opacity, hugs the edge.
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.5)';
+  ctx.shadowBlur = fp * 0.03;
+  ctx.fillStyle = 'rgba(0,0,0,1)';
+  drawRoundRect(m0, m0, fp, fp, fp * 0.04);
+  ctx.restore();
   const shadowTex = new THREE.CanvasTexture(shadowCanvas);
   const shadowMat = new THREE.MeshBasicMaterial({
     map: shadowTex,
@@ -1202,7 +1239,7 @@ hideLoader();
     depthWrite: false,    // don't occlude the box that sits at the same Y
     fog: false,           // FogExp2 would dim the outer halo
   });
-  const SHADOW_SIZE = W * 2;
+  const SHADOW_SIZE = BW * SHADOW_PAD;
   const shadowGeo = new THREE.PlaneGeometry(SHADOW_SIZE, SHADOW_SIZE);
   const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
   shadowMesh.rotation.x = -Math.PI / 2;     // face up
@@ -1303,14 +1340,15 @@ hideLoader();
       for (let i = 1; i < NSEG; i++) pushUV(0, i / NSEG);
 
       // Build geometry: 3 vertices per perimeter sample.
-      //   row0 = terrain edge (rim top)
-      //   row1 = rim bottom = edge − RIM_M  (clamped to box top)
-      //   row2 = box top (topY)
-      // Two stacked quad bands per segment: a thin dark RIM band (row0→row1)
-      // that reads as a deliberate edge at the ortho↔wall cut (#3), and the
-      // gradient wall band (row1→row2). Cumulative perimeter distance + world
-      // Y give metric UVs so the grain (#5) tiles at GRAIN_M regardless of
-      // edge profile. 3·P ≤ 12288 verts → fits Uint16 indices.
+      //   row0 = terrain-edge lip   (on the footprint, bright edge-highlight)
+      //   row1 = chamfer bottom     (lip pushed OUT BEVEL_W, DOWN BEVEL_H)
+      //   row2 = wall bottom        (same XZ as row1, at box top)
+      // Two stacked quad bands per segment: the CHAMFER facet (row0→row1) is a
+      // sloped bevel that catches the fake rim-light (EDGE_HL) where terrain
+      // meets stone — the "machined physical object" cue; below it the vertical
+      // anthracite WALL (row1→row2) fades F_TOP→F_BOT. Cumulative perimeter
+      // distance + world Y give metric UVs so the grain tiles at GRAIN_M
+      // regardless of edge profile. 3·P verts, Uint32 indices.
       const P = perim.length;
       const positions = new Float32Array(P * 3 * 3);
       const scol      = new Float32Array(P * 3 * 3);
@@ -1320,27 +1358,36 @@ hideLoader();
         const p = perim[k];
         const prev = perim[(k - 1 + P) % P];
         cum += Math.hypot(p.x - prev.x, p.z - prev.z);
-        const rimBotY = Math.max(topY, p.y - RIM_M);
-        const ys = [p.y, rimBotY, topY];
-        const fs = [RIM_F, shadeF(rimBotY), shadeF(topY)];
+        // Outward direction in XZ (radial from model centre). On a square
+        // perimeter this points straight out along the walls and diagonally
+        // at the corners, so the chamfer flares the corners slightly — reads
+        // as a softened, rounded-off edge rather than a sharp prism.
+        const len = Math.hypot(p.x, p.z) || 1;
+        const ox = (p.x / len) * BEVEL_W;
+        const oz = (p.z / len) * BEVEL_W;
+        const bevelBotY = Math.max(topY, p.y - BEVEL_H);
+        const px = [p.x, p.x + ox, p.x + ox];
+        const pz = [p.z, p.z + oz, p.z + oz];
+        const ys = [p.y, bevelBotY, topY];
+        const fs = [EDGE_HL, shadeF(bevelBotY), shadeF(topY)];
         const u = cum / GRAIN_M;
         for (let row = 0; row < 3; row++) {
           const vi = k * 3 + row;
-          positions[vi * 3 + 0] = p.x;
+          positions[vi * 3 + 0] = px[row];
           positions[vi * 3 + 1] = ys[row];
-          positions[vi * 3 + 2] = p.z;
+          positions[vi * 3 + 2] = pz[row];
           scol[vi * 3 + 0] = scol[vi * 3 + 1] = scol[vi * 3 + 2] = fs[row];
           uvs[vi * 2 + 0] = u;
           uvs[vi * 2 + 1] = ys[row] / GRAIN_M;
         }
       }
-      // 2 quads (rim + wall) × 2 tris × 3 idx = 12 indices per segment.
+      // 2 quads (chamfer + wall) × 2 tris × 3 idx = 12 indices per segment.
       const indices = new Uint32Array(P * 12);
       for (let k = 0; k < P; k++) {
         const next = (k + 1) % P;
         const a = k * 3, b = next * 3;     // base vertex of each sample column
         const off = k * 12;
-        // rim band: rows 0,1
+        // chamfer facet: rows 0,1
         indices[off + 0] = a;     indices[off + 1] = a + 1; indices[off + 2] = b;
         indices[off + 3] = a + 1; indices[off + 4] = b + 1; indices[off + 5] = b;
         // wall band: rows 1,2

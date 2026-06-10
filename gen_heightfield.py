@@ -769,16 +769,17 @@ def main():
                    help="comma-separated list of ortho quality tiers to emit. "
                         "low=1024², mid=2048², high=4096², ultra=8192², "
                         "super=16384² (closest to ČÚZK source). Viewer can "
-                        "switch live. Default: mid,high,ultra (no low — "
-                        "rarely useful since ultra is the boot tier; no "
-                        "super — opt-in via refresh_ortho.py).")
+                        "switch live. Default: mid,high,ultra (mid doubles "
+                        "as the viewer's fast boot tier; no super — opt-in "
+                        "via refresh_ortho.py).")
     p.add_argument("--ortho-default", default="ultra",
                    choices=["low", "mid", "high", "ultra", "super"],
-                   help="which tier becomes manifest's `ortho_file` (legacy "
-                        "key) AND boots the viewer. Must be one of the tiers "
-                        "in --ortho-tiers. Default: ultra (since 2026-05-25; "
-                        "was 'mid' — bumped now that KTX2 ETC1S makes the "
-                        "32 MB GPU cost acceptable on most devices).")
+                   help="the tier the viewer settles on (it boots on `mid` "
+                        "and upgrades to this in the background) and the "
+                        "target of the manifest's legacy `ortho_file` alias. "
+                        "Must be one of the tiers in --ortho-tiers. Default: "
+                        "ultra (since 2026-05-25; KTX2 ETC1S makes the 32 MB "
+                        "GPU cost acceptable on most devices).")
     args = p.parse_args()
     if args.slug:
         cx, cy, out_dir = resolve_slug_paths(args.slug, args.cx, args.cy)
@@ -848,7 +849,6 @@ def main():
         ext = 'lerc' if args.format == 'lerc' else 'png'
         hm_path = out_dir / f"{slug}_heightmap.{ext}"
         bare_path = out_dir / f"{slug}_bare.{ext}"
-        oh_path = out_dir / f"{slug}_ortho.jpg"
         cad_path = out_dir / f"{slug}_cadastre.png"
 
         # Fetch order: bare first (despike reference), then SM5. SM5 spikes
@@ -899,9 +899,6 @@ def main():
         # ring has its own bbox extent.
         ensure_sm5_cached(args.cx, args.cy, half,
                           fetch_missing=not args.no_fetch_missing)
-        # The legacy `oh_path` (= `<slug>_ortho.jpg`) is kept as a copy of
-        # the default tier JPEG so older viewers that don't know about
-        # tiers still work.
         ortho_files = {}
         for tier in tiers:
             t = ORTHO_TIERS[tier]
@@ -946,9 +943,15 @@ def main():
                   f"jpg {jpg_kb:>7.1f} KB (q={t['quality']}, "
                   f"sub={'4:2:0' if t['subsampling']==2 else '4:4:4'}, prog)  "
                   f"webp {webp_kb:>7.1f} KB (q={t['webp_quality']}){extra}")
-        # Legacy `<slug>_ortho.jpg` = copy of the default tier for back-compat.
-        default_src = out_dir / ortho_files[args.ortho_default]["file"]
-        oh_path.write_bytes(default_src.read_bytes())
+        # No more legacy `<slug>_ortho.jpg` copy — the v1/v2 viewers that
+        # needed it were retired (June 2026) and the duplicate cost ~35 MB
+        # per ring. The manifest's `ortho_file` field now points straight at
+        # the default tier's JPEG. Drop a stale copy left by older gens
+        # (regenerable build artifact, hard delete is fine).
+        stale_legacy = out_dir / f"{slug}_ortho.jpg"
+        if stale_legacy.exists():
+            stale_legacy.unlink()
+            print(f"  removed stale legacy {stale_legacy.name}")
 
         cad_ok = False
         cad_ktx2_path = out_dir / f"{slug}_cadastre.ktx2"
@@ -998,7 +1001,8 @@ def main():
             "heightmap_file": hm_path.name,
             "heightmap_format": args.format,
             "bare_file": bare_path.name,
-            "ortho_file": oh_path.name,            # legacy = default tier copy
+            # legacy field — now an alias for the default tier JPEG (no copy)
+            "ortho_file": ortho_files[args.ortho_default]["file"],
             "ortho_default": args.ortho_default,    # name of the default tier
             "ortho_tiers": ortho_files,             # full tier table
         }
@@ -1017,7 +1021,7 @@ def main():
         manifest["rings"].append(ring_meta)
         total_bytes += (hm_path.stat().st_size
                         + bare_path.stat().st_size
-                        + oh_path.stat().st_size
+                        + (out_dir / ortho_files[args.ortho_default]["file"]).stat().st_size
                         + (cad_path.stat().st_size if cad_ok else 0))
 
     # Overall Y range across all rings (used by viewer for camera framing

@@ -364,8 +364,14 @@ function renderProgress() {
     `${mb(loadStats.bytesDone)} / ${mb(loadStats.bytesTotal)} MB · ${pct}%`
   );
 }
+// Boot tier: first paint uses the smallest reasonable ortho tier (mid,
+// ~0.7 MB KTX2 vs ~10.7 MB ultra). The manifest default (`ortho_default`)
+// is fetched in the background once the scene is interactive and swapped
+// in via switchOrthoTier — same final quality, ~4× less data before the
+// first rendered frame.
+const bootTier = (r) => (r.ortho_tiers?.mid ? 'mid' : (r.ortho_default || 'mid'));
 // Pre-register expected assets so the totals aren't a moving target.
-// Per ring: heightmap LERC + bare LERC + 1 ortho (mid tier default).
+// Per ring: heightmap LERC + bare LERC + 1 ortho (boot tier).
 // LERC sizes aren't in the manifest, so we use a per-cell heuristic
 // (~0.8 bytes/cell empirically for 10cm tolerance) — fetch then corrects
 // the total to the real byte count as each LERC arrives.
@@ -373,7 +379,7 @@ for (const r of manifest.rings) {
   loadStats.filesTotal += 3;
   const lercEstimate = r.heightmap_size * r.heightmap_size * 0.8;
   loadStats.bytesTotal += 2 * lercEstimate;          // heightmap + bare
-  const t = r.ortho_tiers?.[r.ortho_default || 'mid'];
+  const t = r.ortho_tiers?.[bootTier(r)];
   if (t) {
     // Prefer WebP size when the browser will pick WebP (detected later);
     // for the initial estimate we assume yes (modern browser).
@@ -599,11 +605,12 @@ const pickTierUrl = (tierEntry) => {
   if (_canWebP && tierEntry.webp_file) return asset(tierEntry.webp_file);
   return asset(tierEntry.file);
 };
-// Legacy entry point: `r.ortho_file` is a flat JPEG copy of the default tier.
-// If tiers are present, route to the picker on the default tier instead.
-const pickOrthoUrl = (r) => {
-  if (r.ortho_tiers && r.ortho_default) {
-    const d = r.ortho_tiers[r.ortho_default];
+// Legacy entry point: `r.ortho_file` points at the default tier's JPEG.
+// If tiers are present, route to the picker — `tier` overrides the
+// manifest default (used by the boot-tier fast path).
+const pickOrthoUrl = (r, tier) => {
+  if (r.ortho_tiers) {
+    const d = r.ortho_tiers[tier || r.ortho_default];
     if (d) return pickTierUrl(d);
   }
   return asset(r.ortho_file);
@@ -724,21 +731,28 @@ setStage(`načítám textury (${rings.length} ringů)…`);
 const bareLoadInfo = new Array(rings.length).fill(null);
 const bareLoadedTex = {};   // slug → THREE.DataTexture
 let bareLoadInFlight = null;
+// Kick off EVERY ring's heightmap + ortho fetch up front — ring N's network
+// time overlaps ring N-1's decode/mesh build instead of serialising behind
+// it. Orthos boot on the smallest tier (see bootTier); the manifest default
+// is upgraded in the background after first render. Bare-earth (DMR5G) is
+// deferred — most users never enable the 🌳 toggle, so paying ~16 MB/ring
+// (Float32 at 2000²) up front is waste (see bareLoadInfo + ensureBareLoaded).
+const ringFetches = rings.map((r) => ({
+  heightP: loadHeightmapData(asset(r.heightmap_file), r.heightmap_format || 'png',
+                             r.heightmap_size, r.y_min, r.y_max),
+  orthoP: webpSupport.then(() => loadTex(pickOrthoUrl(r, bootTier(r)))),
+}));
+// Mark rejections as handled — the build loop below awaits each promise in
+// order, so a later ring failing before its turn would otherwise surface as
+// a spurious unhandledrejection (the real error still lands in the loop).
+for (const f of ringFetches) { f.heightP.catch(() => {}); f.orthoP.catch(() => {}); }
 for (let i = 0; i < rings.length; i++) {
   const r = rings[i];
   const hmFmt = r.heightmap_format || 'png';
   console.info(`[ring ${r.slug}] loading (heightmap=${hmFmt})…`);
   let heightTex, orthoTex, bareTex, heightData;
   try {
-    // Heightmap + ortho. Bare-earth (DMR5G) heightmap is deferred —
-    // most users never enable the 🌳 toggle, so paying ~16 MB/ring (Float32
-    // at 2000² = 16 MB) up front is waste. We record the info needed to
-    // fetch it later (see bareLoadInfo + ensureBareLoaded below).
-    const heightP = loadHeightmapData(asset(r.heightmap_file), hmFmt,
-      r.heightmap_size, r.y_min, r.y_max);
-    await webpSupport;
-    const orthoP = loadTex(pickOrthoUrl(r));
-    const [heightRes, ortho] = await Promise.all([heightP, orthoP]);
+    const [heightRes, ortho] = await Promise.all([ringFetches[i].heightP, ringFetches[i].orthoP]);
     heightTex = makeHeightTexture(heightRes.data, heightRes.n);
     heightData = heightRes.data;     // shared with CPU sampleHeight below
     orthoTex = ortho;
@@ -2534,15 +2548,23 @@ let currentTier = null;
 const anyTiers = rings.some(r => r.ortho_tiers);
 if (anyTiers) {
   orthoTierUI.style.display = '';
-  // Seed cache with the default tiers already loaded during ring setup.
+  // Seed cache with the boot tiers loaded during ring setup.
   for (let i = 0; i < rings.length; i++) {
     const r = rings[i];
-    const defaultTier = r.ortho_default || 'mid';
-    currentTier = currentTier || defaultTier;
-    orthoTierCache[`${r.slug}|${defaultTier}`] = ringMeshes[i].material.uniforms.uOrtho.value;
+    const bt = bootTier(r);
+    currentTier = currentTier || bt;
+    orthoTierCache[`${r.slug}|${bt}`] = ringMeshes[i].material.uniforms.uOrtho.value;
   }
   syncTierButtons();
   orthoTierStatus.textContent = `(${currentTier})`;
+  // Background upgrade boot tier → manifest default (typically ultra).
+  // Deliberately not awaited: the scene is already interactive on the boot
+  // tier; switchOrthoTier swaps uniforms + updates the tier UI when done.
+  const targetTier = rings[0].ortho_default;
+  if (targetTier && targetTier !== currentTier) {
+    switchOrthoTier(targetTier).catch(e =>
+      console.warn('[ortho] background tier upgrade failed (staying on boot tier):', e));
+  }
 }
 function syncTierButtons() {
   for (const btn of orthoTierUI.querySelectorAll('.oq')) {

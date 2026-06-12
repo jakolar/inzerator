@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sokl — řešení stěn</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "SF Pro Text", Segoe UI, sans-serif; margin: 0;
+         background: #f4f2ee; color: #2b2b28; padding: 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #6b675f; margin: 0 0 24px; font-size: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; max-width: 1500px; }
+  .card { background: #fff; border-radius: 12px; padding: 16px 16px 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 16px; margin: 0 0 2px; }
+  .card .tag { display: inline-block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+               color: #fff; border-radius: 4px; padding: 2px 7px; margin-bottom: 8px; }
+  .a .tag { background: #3e7d4f; } .b .tag { background: #4a6fa0; } .c .tag { background: #8a8a85; }
+  svg { width: 100%; height: auto; display: block; background: #fbfaf8; border-radius: 8px; }
+  .desc { font-size: 13px; line-height: 1.45; color: #44423d; margin-top: 10px; }
+  .desc b { color: #1f1e1c; }
+  .pn { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; margin-top: 8px; }
+  .pn div { background: #f5f8f3; border-radius: 6px; padding: 7px 9px; }
+  .pn .minus { background: #faf3f1; }
+  .pn ul { margin: 4px 0 0; padding-left: 16px; }
+  .legend { font-size: 12px; color: #6b675f; margin: 18px 0 0; }
+  .legend span { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin: 0 4px 0 12px; }
+</style>
+</head>
+<body>
+<h1>Sokl: co s rozeklanou horní hranou stěn?</h1>
+<p class="sub">Řez okrajem modelu. Silueta terénu (stromy ↑) zůstává vždy stejná — terén se nemění. Liší se, čím je vyplněná stěna pod ní a kde začíná „čistý sokl". Odpověz v chatu: A / B / C (klidně s komentářem).</p>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <!-- jagged terrain edge profile: spikes = trees, shared by all cards -->
+    <polyline id="sil" points="20,84 40,76 52,88 64,52 72,90 88,86 102,46 112,88 128,82 146,78 160,90 176,44 186,92 204,88 224,84 244,90 258,50 268,94 286,88 306,82 326,94 340,48 350,96 368,90 388,86 408,92 420,88"
+              fill="none" />
+    <!-- stretched ortho texels: thin vertical stripes -->
+    <pattern id="ortho" width="14" height="10" patternUnits="userSpaceOnUse">
+      <rect width="14" height="10" fill="#67724f"/>
+      <rect x="3" width="2.5" height="10" fill="#7c8660"/>
+      <rect x="7" width="2" height="10" fill="#55603f"/>
+      <rect x="10.5" width="2" height="10" fill="#8d9168"/>
+    </pattern>
+    <linearGradient id="wallg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#aaa49a"/><stop offset="1" stop-color="#938d83"/>
+    </linearGradient>
+    <linearGradient id="wallg-c" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a5a09a"/><stop offset="1" stop-color="#8f8a82"/>
+    </linearGradient>
+  </defs>
+</svg>
+
+<div class="cards">
+
+  <div class="card a">
+    <h2>A — Vyhlazený lem + „geologický řez" nad ním</h2>
+    <span class="tag">doporučuju</span>
+    <svg viewBox="0 0 440 290">
+      <!-- ortho section band: from silhouette down to smoothed envelope -->
+      <path d="M20,84 L40,76 L52,88 L64,52 L72,90 L88,86 L102,46 L112,88 L128,82 L146,78 L160,90 L176,44 L186,92 L204,88 L224,84 L244,90 L258,50 L268,94 L286,88 L306,82 L326,94 L340,48 L350,96 L368,90 L388,86 L408,92 L420,88
+               L420,126 C320,132 140,124 20,128 Z" fill="url(#ortho)" opacity="0.85"/>
+      <!-- smoothed rim (rolling-min envelope, gentle curve) -->
+      <path d="M20,128 C140,124 320,132 420,126" fill="none" stroke="#e8e2d6" stroke-width="4" stroke-linecap="round"/>
+      <!-- clean matte wall -->
+      <path d="M20,130 C140,126 320,134 420,128 L420,238 L20,238 Z" fill="url(#wallg)"/>
+      <!-- AO band under rim -->
+      <path d="M20,133 C140,129 320,137 420,131" fill="none" stroke="#6e6960" stroke-width="6" opacity="0.25"/>
+      <!-- bottom bevel -->
+      <polygon points="20,238 420,238 426,248 14,248" fill="#867f74"/>
+      <line x1="14" y1="248" x2="426" y2="248" stroke="#79736a" stroke-width="2"/>
+      <!-- terrain edge stroke -->
+      <use href="#sil" stroke="#3f5b35" stroke-width="5" stroke-linejoin="round"/>
+      <!-- annotations -->
+      <text x="226" y="110" font-size="11" fill="#fff" text-anchor="middle">pruhy z ortofota (protažený krajní pixel, ztmavené)</text>
+      <text x="226" y="165" font-size="11" fill="#5a554d" text-anchor="middle">světlý lem = vyhlazená obálka (klouzavé minimum ~40 m)</text>
+      <text x="226" y="205" font-size="12" fill="#4a463f" text-anchor="middle">čistá matná stěna</text>
+    </svg>
+    <p class="desc">Stěna se rozdělí: <b>nahoře pás textury z ortofota</b> (stejný trik jako u LOD seam skirtu — protažený krajní pixel, ztmavený), který kopíruje zubatou hranu a čte se jako „řez krajinou". <b>Pod ním čistý světlý lem</b> vedený po vyhlazené obálce (klouzavé minimum výšek po obvodu) a od lemu dolů už jen hladká matná stěna. Zubatost zůstane jen v textuře, ne v šedé hmotě.</p>
+    <div class="pn">
+      <div><b>+</b><ul><li>sokl je 100% čistý, zubatost „patří terénu"</li><li>vodotěsné — žádné nové škvíry</li><li>klasický vzhled prezentačních modelů</li></ul></div>
+      <div class="minus"><b>−</b><ul><li>nejvíc práce (nová geometrie + 2 materiály)</li><li>výška lemu kolísá podle reliéfu</li></ul></div>
+    </div>
+  </div>
+
+  <div class="card b">
+    <h2>B — Lem po holém terénu (DMR5G)</h2>
+    <span class="tag">varianta</span>
+    <svg viewBox="0 0 440 290">
+      <!-- ortho band down to bare-earth line (hugs silhouette minus vegetation) -->
+      <path d="M20,84 L40,76 L52,88 L64,52 L72,90 L88,86 L102,46 L112,88 L128,82 L146,78 L160,90 L176,44 L186,92 L204,88 L224,84 L244,90 L258,50 L268,94 L286,88 L306,82 L326,94 L340,48 L350,96 L368,90 L388,86 L408,92 L420,88
+               L420,98 C320,104 140,96 20,98 Z" fill="url(#ortho)" opacity="0.85"/>
+      <path d="M20,98 C140,96 320,104 420,98" fill="none" stroke="#e8e2d6" stroke-width="4" stroke-linecap="round"/>
+      <path d="M20,100 C140,98 320,106 420,100 L420,238 L20,238 Z" fill="url(#wallg)"/>
+      <path d="M20,103 C140,101 320,109 420,103" fill="none" stroke="#6e6960" stroke-width="6" opacity="0.25"/>
+      <polygon points="20,238 420,238 426,248 14,248" fill="#867f74"/>
+      <line x1="14" y1="248" x2="426" y2="248" stroke="#79736a" stroke-width="2"/>
+      <use href="#sil" stroke="#3f5b35" stroke-width="5" stroke-linejoin="round"/>
+      <text x="226" y="93" font-size="10" fill="#fff" text-anchor="middle">tenký pás ortofota (jen vegetace/stavby)</text>
+      <text x="226" y="130" font-size="11" fill="#5a554d" text-anchor="middle">lem = skutečný holý terén (DMR5G)</text>
+      <text x="226" y="200" font-size="12" fill="#4a463f" text-anchor="middle">čistá matná stěna</text>
+    </svg>
+    <p class="desc">Jako A, ale lem nevede po umělé vyhlazené křivce, nýbrž po <b>skutečném holém terénu z DMR5G</b> (data už v projektu jsou — používá je bare mód 🌳). Pás ortofota nad lemem pak pokrývá přesně tloušťku vegetace/staveb. Geologicky „poctivější" — lem je opravdová zemská linie.</p>
+    <div class="pn">
+      <div><b>+</b><ul><li>lem kopíruje reálný terén, ne aproximaci</li><li>v polích lem těsně přiléhá k povrchu</li></ul></div>
+      <div class="minus"><b>−</b><ul><li>DMR5G se musí načítat hned při startu (dnes lazy)</li><li>lem sám je zvlněný podle terénu — méně „strojový"</li><li>kolize s bare módem (lem ≈ terén) se musí ošetřit</li></ul></div>
+    </div>
+  </div>
+
+  <div class="card c">
+    <h2>C — Jen kosmetika dnešního stavu</h2>
+    <span class="tag">minimální</span>
+    <svg viewBox="0 0 440 290">
+      <!-- single grey wall from silhouette down (current concept, lighter material) -->
+      <path d="M20,84 L40,76 L52,88 L64,52 L72,90 L88,86 L102,46 L112,88 L128,82 L146,78 L160,90 L176,44 L186,92 L204,88 L224,84 L244,90 L258,50 L268,94 L286,88 L306,82 L326,94 L340,48 L350,96 L368,90 L388,86 L408,92 L420,88
+               L420,238 L20,238 Z" fill="url(#wallg-c)"/>
+      <polygon points="20,238 420,238 426,248 14,248" fill="#867f74"/>
+      <line x1="14" y1="248" x2="426" y2="248" stroke="#79736a" stroke-width="2"/>
+      <use href="#sil" stroke="#3f5b35" stroke-width="5" stroke-linejoin="round"/>
+      <text x="226" y="150" font-size="12" fill="#4a463f" text-anchor="middle">jedna šedá stěna od zubaté hrany až dolů</text>
+      <text x="226" y="168" font-size="11" fill="#6b675f" text-anchor="middle">(světlejší matný materiál, nižší sokl, fazety, AO)</text>
+    </svg>
+    <p class="desc">Geometrie stěn zůstane (jedna stěna od hrany terénu dolů), změní se jen <b>materiál, výška, fazety a AO</b>. Zubatá šedá hmota stromů na okraji zůstává — jen bude světlejší a méně dramatická.</p>
+    <div class="pn">
+      <div><b>+</b><ul><li>nejmenší zásah, nejrychlejší</li><li>žádná nová geometrie</li></ul></div>
+      <div class="minus"><b>−</b><ul><li>zubaté stěny nezmizí — hlavní výtka zůstane</li></ul></div>
+    </div>
+  </div>
+
+</div>
+
+<p class="legend">Legenda:
+  <span style="background:#3f5b35"></span> hrana terénu (beze změny)
+  <span style="background:#67724f"></span> pás z ortofota (protažené pixely)
+  <span style="background:#e8e2d6;border:1px solid #ccc"></span> lem / rim
+  <span style="background:#a39d93"></span> matná stěna soklu
+  <span style="background:#867f74"></span> spodní fazeta
+</p>
+</body>
+</html>

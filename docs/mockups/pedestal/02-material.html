@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sokl — materiál</title>
+<style>
+  body { font-family: -apple-system, "SF Pro Text", Segoe UI, sans-serif; margin: 0;
+         background: #f4f2ee; color: #2b2b28; padding: 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #6b675f; margin: 0 0 24px; font-size: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; max-width: 1500px; }
+  .card { background: #fff; border-radius: 12px; padding: 16px 16px 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 16px; margin: 0 0 2px; }
+  .tag { display: inline-block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+         color: #fff; border-radius: 4px; padding: 2px 7px; margin-bottom: 8px; }
+  .a .tag { background: #3e7d4f; } .b .tag { background: #4a6fa0; } .c .tag { background: #8a8a85; }
+  svg { width: 100%; height: auto; display: block; border-radius: 8px; }
+  .desc { font-size: 13px; line-height: 1.45; color: #44423d; margin-top: 10px; }
+  .sw { display: flex; gap: 8px; margin-top: 8px; font-size: 11px; color: #6b675f; }
+  .sw div { display: flex; align-items: center; gap: 5px; }
+  .sw span { width: 16px; height: 16px; border-radius: 4px; display: inline-block; border: 1px solid rgba(0,0,0,.12); }
+</style>
+</head>
+<body>
+<h1>Materiál soklu (varianta A — lem + řez)</h1>
+<p class="sub">Stejný blok na pozadí oblohy vieweru (mlha/horizont je světle modrošedá — důležité pro kontrast). Všechno matné: žádný lesk, jemné zrno zůstává. Odpověz v chatu: A / B / C.</p>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <pattern id="ortho2" width="12" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(0)">
+      <rect width="12" height="10" fill="#67724f"/>
+      <rect x="2.5" width="2" height="10" fill="#7c8660"/>
+      <rect x="6" width="1.8" height="10" fill="#55603f"/>
+      <rect x="9.2" width="1.6" height="10" fill="#8d9168"/>
+    </pattern>
+    <linearGradient id="topg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7e8a60"/><stop offset=".5" stop-color="#6c7a52"/><stop offset="1" stop-color="#8e9069"/>
+    </linearGradient>
+  </defs>
+</svg>
+
+<div class="cards">
+
+  <div class="card a">
+    <h2>A — Světlá teplá šedá („galerijní plint")</h2>
+    <span class="tag">doporučuju</span>
+    <svg viewBox="0 0 440 280" style="background:#c9cfd9">
+      <ellipse cx="230" cy="248" rx="195" ry="14" fill="#000" opacity="0.13"/>
+      <!-- side face -->
+      <polygon points="40,96 160,134 160,238 40,200" fill="#a49c8e"/>
+      <polygon points="40,96 160,134 160,148 40,110" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="40,110 160,148 160,152 40,114" fill="#efe9dc"/>
+      <polygon points="40,114 160,152 160,158 40,120" fill="#8b8376" opacity="0.45"/>
+      <!-- front face -->
+      <polygon points="160,134 420,104 420,206 160,238" fill="#b5ada0"/>
+      <polygon points="160,134 420,104 420,118 160,148" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="160,148 420,118 420,122 160,152" fill="#efe9dc"/>
+      <polygon points="160,152 420,122 420,128 160,158" fill="#998f80" opacity="0.4"/>
+      <!-- bottom bevel -->
+      <polygon points="160,238 420,206 424,212 158,245" fill="#9a9183"/>
+      <polygon points="40,200 160,238 158,245 38,206" fill="#8d8476"/>
+      <!-- top terrain -->
+      <polygon points="40,96 300,66 420,104 160,134" fill="url(#topg)"/>
+      <text x="285" y="180" font-size="12" fill="#5d564a" text-anchor="middle">matná teplá šedá</text>
+    </svg>
+    <p class="desc">Tóny muzejního podstavce / architektonické makety. Vřelé, decentní, krásně nese jemné zrno a AO. Na chladně modrošedé obloze se teplý tón čitelně odděluje, ale nekřičí.</p>
+    <div class="sw">
+      <div><span style="background:#b5ada0"></span>stěna #b5ada0</div>
+      <div><span style="background:#efe9dc"></span>lem #efe9dc</div>
+      <div><span style="background:#9a9183"></span>fazeta/AO</div>
+    </div>
+  </div>
+
+  <div class="card b">
+    <h2>B — Střední grafitová (matná)</h2>
+    <span class="tag">varianta</span>
+    <svg viewBox="0 0 440 280" style="background:#c9cfd9">
+      <ellipse cx="230" cy="248" rx="195" ry="14" fill="#000" opacity="0.16"/>
+      <polygon points="40,96 160,134 160,238 40,200" fill="#5e6268"/>
+      <polygon points="40,96 160,134 160,148 40,110" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="40,110 160,148 160,152 40,114" fill="#d9d9d4"/>
+      <polygon points="40,114 160,152 160,158 40,120" fill="#43464b" opacity="0.5"/>
+      <polygon points="160,134 420,104 420,206 160,238" fill="#6d7176"/>
+      <polygon points="160,134 420,104 420,118 160,148" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="160,148 420,118 420,122 160,152" fill="#d9d9d4"/>
+      <polygon points="160,152 420,122 420,128 160,158" fill="#4b4e53" opacity="0.45"/>
+      <polygon points="160,238 420,206 424,212 158,245" fill="#54575c"/>
+      <polygon points="40,200 160,238 158,245 38,206" fill="#494c50"/>
+      <polygon points="40,96 300,66 420,104 160,134" fill="url(#topg)"/>
+      <text x="285" y="180" font-size="12" fill="#e8e8e4" text-anchor="middle">matný střední grafit</text>
+    </svg>
+    <p class="desc">Tmavší příbuzný dnešního antracitu, ale o tři tóny světlejší a bez dramatu. Ortofoto nahoře víc „svítí", lem je kontrastnější. Na modrošedém pozadí působí hutněji, technicky.</p>
+    <div class="sw">
+      <div><span style="background:#6d7176"></span>stěna #6d7176</div>
+      <div><span style="background:#d9d9d4"></span>lem #d9d9d4</div>
+      <div><span style="background:#4b4e53"></span>fazeta/AO</div>
+    </div>
+  </div>
+
+  <div class="card c">
+    <h2>C — Lomená bílá (papír / mušelín)</h2>
+    <span class="tag">varianta</span>
+    <svg viewBox="0 0 440 280" style="background:#c9cfd9">
+      <ellipse cx="230" cy="248" rx="195" ry="14" fill="#000" opacity="0.11"/>
+      <polygon points="40,96 160,134 160,238 40,200" fill="#c4bfb4"/>
+      <polygon points="40,96 160,134 160,148 40,110" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="40,110 160,148 160,152 40,114" fill="#f7f2e8"/>
+      <polygon points="40,114 160,152 160,158 40,120" fill="#a39c8e" opacity="0.4"/>
+      <polygon points="160,134 420,104 420,206 160,238" fill="#d4cfc4"/>
+      <polygon points="160,134 420,104 420,118 160,148" fill="url(#ortho2)" opacity="0.8"/>
+      <polygon points="160,148 420,118 420,122 160,152" fill="#f7f2e8"/>
+      <polygon points="160,152 420,122 420,128 160,158" fill="#aaa294" opacity="0.35"/>
+      <polygon points="160,238 420,206 424,212 158,245" fill="#b3aca0"/>
+      <polygon points="40,200 160,238 158,245 38,206" fill="#a59e91"/>
+      <polygon points="40,96 300,66 420,104 160,134" fill="url(#topg)"/>
+      <text x="285" y="180" font-size="12" fill="#6e675b" text-anchor="middle">lomená bílá</text>
+    </svg>
+    <p class="desc">Nejsvětlejší poloha — 3D tisk / papírový model. Maximálně neutrální, ale na světlé obloze hrozí slévání s horizontem (sokl „ztrácí hranu"); musel by ho držet silnější AO a kontaktní stín.</p>
+    <div class="sw">
+      <div><span style="background:#d4cfc4"></span>stěna #d4cfc4</div>
+      <div><span style="background:#f7f2e8"></span>lem #f7f2e8</div>
+      <div><span style="background:#aaa294"></span>fazeta/AO</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

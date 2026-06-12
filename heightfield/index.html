@@ -4248,7 +4248,8 @@ class DepthSSAOPass extends Pass {
     this.needsSwap = true;
     this._cam = cam;
     const half = (w, h) => new THREE.WebGLRenderTarget(
-      Math.max(1, Math.ceil(w / 2)), Math.max(1, Math.ceil(h / 2)));
+      Math.max(1, Math.ceil(w / 2)), Math.max(1, Math.ceil(h / 2)),
+      { depthBuffer: false });   // colour-only — AO/blur quads never use depth
     const s = renderer.getDrawingBufferSize(new THREE.Vector2());
     this._aoRT = half(s.x, s.y);
     this._blurRT = half(s.x, s.y);
@@ -4517,6 +4518,8 @@ function estimateGpuMB() {
   // finalComposer is MSAA 4×: each of its 2 RTs carries an extra 4-sample
   // multisample renderbuffer besides the resolve texture → (1 + 4)× per RT.
   if (finalComposer) total += composerRtBytes * 2 * 5;
+  // SSAO (lazy): full-res DepthTexture (4 B/px) + two colour-only half-res AO targets.
+  if (ssaoPass) total += innerWidth * innerHeight * dpr * dpr * 4 + 2 * Math.ceil(innerWidth * dpr / 2) * Math.ceil(innerHeight * dpr / 2) * 4;
   // UnrealBloomPass adds 5 mip-chain RTs at half/quarter sizes.
   if (bloomComposer) total += composerRtBytes * 0.4;   // ~5 mips of decreasing size
   return (total / 1048576).toFixed(0);

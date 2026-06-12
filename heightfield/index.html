@@ -254,6 +254,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
@@ -4229,6 +4230,175 @@ tiltShiftToggle.addEventListener('change', () => {
   tiltShiftV.enabled = tiltShiftToggle.checked;
 });
 finalComposer.addPass(new OutputPass());
+
+// ── SSAO (opt-in, lazy) ──
+// Depth-only AO: view-space position from the main render's depth buffer,
+// normals via screen-space derivatives, 10-tap golden-angle spiral kernel,
+// computed at half resolution + depth-aware blur, multiplied onto the colour
+// buffer. Built on first enable so the default session pays nothing (no
+// depth texture, no extra targets). iOS fallback if multisampled-depth
+// resolve misbehaves: see the spec §E (separate non-MSAA depth prepass).
+const SSAO_RADIUS    = 8.0;    // view-space metres (street / canopy scale)
+const SSAO_INTENSITY = 1.0;
+const SSAO_BIAS      = 0.02;
+
+class DepthSSAOPass extends Pass {
+  constructor(depthTex, cam) {
+    super();
+    this.needsSwap = true;
+    this._cam = cam;
+    const half = (w, h) => new THREE.WebGLRenderTarget(
+      Math.max(1, Math.ceil(w / 2)), Math.max(1, Math.ceil(h / 2)));
+    const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+    this._aoRT = half(s.x, s.y);
+    this._blurRT = half(s.x, s.y);
+    const quadVS = `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+    `;
+    this._aoMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uDepth:     { value: depthTex },
+        uProjInv:   { value: new THREE.Matrix4() },
+        uProjScale: { value: new THREE.Vector2() },  // 0.5*(proj[0][0], proj[1][1])
+        uRadius:    { value: SSAO_RADIUS },
+        uIntensity: { value: SSAO_INTENSITY },
+        uBias:      { value: SSAO_BIAS },
+      },
+      vertexShader: quadVS,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform sampler2D uDepth;
+        uniform mat4 uProjInv;
+        uniform vec2 uProjScale;
+        uniform float uRadius, uIntensity, uBias;
+        vec3 viewPos(vec2 uv) {
+          float d = texture2D(uDepth, uv).x;
+          vec4 p = uProjInv * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+          return p.xyz / p.w;
+        }
+        void main() {
+          if (texture2D(uDepth, vUv).x >= 1.0) { gl_FragColor = vec4(1.0); return; }  // sky
+          vec3 p = viewPos(vUv);
+          vec3 n = normalize(cross(dFdx(p), dFdy(p)));
+          // Interleaved gradient noise — per-pixel kernel rotation without a noise texture.
+          float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+          float occ = 0.0;
+          const float N = 10.0;
+          for (int i = 0; i < 10; i++) {
+            float fi = float(i);
+            float ang = (fi + ign) * 2.39996323;          // golden-angle spiral
+            float rad = uRadius * sqrt((fi + 0.5) / N);
+            vec2 duv = vec2(cos(ang), sin(ang)) * rad * uProjScale / -p.z;
+            vec3 dv = viewPos(vUv + duv) - p;
+            float dist = length(dv);
+            occ += max(0.0, dot(n, dv) / max(dist, 0.01) - uBias)
+                 * (1.0 - smoothstep(0.0, uRadius, dist));
+          }
+          gl_FragColor = vec4(vec3(clamp(1.0 - uIntensity * occ / N, 0.0, 1.0)), 1.0);
+        }
+      `,
+    });
+    this._blurMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tAO:    { value: null },
+        uDepth: { value: depthTex },
+        uDir:   { value: new THREE.Vector2(1, 0) },
+        uTexel: { value: new THREE.Vector2(1 / this._aoRT.width, 1 / this._aoRT.height) },
+      },
+      vertexShader: quadVS,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform sampler2D tAO, uDepth;
+        uniform vec2 uDir, uTexel;
+        void main() {
+          float d0 = texture2D(uDepth, vUv).x;
+          float sum = texture2D(tAO, vUv).r;
+          float wsum = 1.0;
+          for (int i = 1; i <= 3; i++) {
+            vec2 off = uDir * uTexel * float(i);
+            // depth-aware: don't bleed AO across silhouettes
+            float wA = exp(-abs(texture2D(uDepth, vUv + off).x - d0) * 4000.0);
+            float wB = exp(-abs(texture2D(uDepth, vUv - off).x - d0) * 4000.0);
+            sum += texture2D(tAO, vUv + off).r * wA + texture2D(tAO, vUv - off).r * wB;
+            wsum += wA + wB;
+          }
+          gl_FragColor = vec4(vec3(sum / wsum), 1.0);
+        }
+      `,
+    });
+    this._compMat = new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: null }, tAO: { value: null } },
+      vertexShader: quadVS,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform sampler2D tDiffuse, tAO;
+        void main() {
+          vec4 c = texture2D(tDiffuse, vUv);
+          gl_FragColor = vec4(c.rgb * texture2D(tAO, vUv).r, c.a);
+        }
+      `,
+    });
+    this._quad = new FullScreenQuad(this._aoMat);
+  }
+  setSize(w, h) {   // called by composer.setSize (covers resize + setDpr)
+    const hw = Math.max(1, Math.ceil(w / 2)), hh = Math.max(1, Math.ceil(h / 2));
+    this._aoRT.setSize(hw, hh);
+    this._blurRT.setSize(hw, hh);
+    this._blurMat.uniforms.uTexel.value.set(1 / hw, 1 / hh);
+  }
+  render(renderer, writeBuffer, readBuffer) {
+    const cam = this._cam;
+    this._aoMat.uniforms.uProjInv.value.copy(cam.projectionMatrixInverse);
+    this._aoMat.uniforms.uProjScale.value.set(
+      cam.projectionMatrix.elements[0] * 0.5, cam.projectionMatrix.elements[5] * 0.5);
+    // 1) raw AO at half res
+    this._quad.material = this._aoMat;
+    renderer.setRenderTarget(this._aoRT);
+    this._quad.render(renderer);
+    // 2) depth-aware blur H → blurRT, V → back to aoRT
+    this._quad.material = this._blurMat;
+    this._blurMat.uniforms.tAO.value = this._aoRT.texture;
+    this._blurMat.uniforms.uDir.value.set(1, 0);
+    renderer.setRenderTarget(this._blurRT);
+    this._quad.render(renderer);
+    this._blurMat.uniforms.tAO.value = this._blurRT.texture;
+    this._blurMat.uniforms.uDir.value.set(0, 1);
+    renderer.setRenderTarget(this._aoRT);
+    this._quad.render(renderer);
+    // 3) multiply onto colour
+    this._quad.material = this._compMat;
+    this._compMat.uniforms.tDiffuse.value = readBuffer.texture;
+    this._compMat.uniforms.tAO.value = this._aoRT.texture;
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    this._quad.render(renderer);
+  }
+}
+
+let ssaoPass = null;
+function initSSAO() {
+  // Rebuild the composer's ping-pong targets with a shared DepthTexture so
+  // the depth of the real (displaced) render is samplable. BOTH targets get
+  // the SAME instance — RenderPass writes into whichever buffer is current,
+  // and the AO shader always reads this one texture. three 0.170 resolves
+  // multisampled depth into the attached DepthTexture on blit.
+  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const depthTex = new THREE.DepthTexture(s.x, s.y);
+  const rt = new THREE.WebGLRenderTarget(s.x, s.y, {
+    samples: 4, type: THREE.HalfFloatType, depthTexture: depthTex,
+  });
+  finalComposer.reset(rt);
+  finalComposer.renderTarget2.depthTexture = depthTex;
+  const pass = new DepthSSAOPass(depthTex, camera);
+  finalComposer.insertPass(pass, 1);   // directly after RenderPass, before bloom combine
+  return pass;
+}
+
+const ssaoToggle = document.getElementById('ssao-toggle');
+ssaoToggle.addEventListener('change', () => {
+  if (ssaoToggle.checked && !ssaoPass) ssaoPass = initSSAO();
+  if (ssaoPass) ssaoPass.enabled = ssaoToggle.checked;
+});
 
 renderer.info.autoReset = false;   // accumulate across multiple render() calls per frame
 

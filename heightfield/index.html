@@ -720,6 +720,179 @@ function fatalLoadError(msg) {
   throw new Error(msg);
 }
 
+// ── Perimeter profile helpers (pedestal solid/section band + LOD seam skirts) ──
+// Bilinear heightmap sampler matching the terrain vertex shader's
+// LinearFilter + ClampToEdgeWrapping lookup (pixel CENTRES at
+// (i+0.5)/n). Returns SCENE-space Y (absolute AMSL minus yMid). Any
+// "i/(n-1)" texel-corner approximation leaves half-texel gaps against
+// the rendered mesh — keep the 0.5 offset.
+function makeSceneYSampler(f32, n) {
+  return (hmU, hmV) => {
+    const tu = hmU * n - 0.5;
+    const tv = hmV * n - 0.5;
+    let i0 = Math.floor(tu), i1 = i0 + 1;
+    let j0 = Math.floor(tv), j1 = j0 + 1;
+    let du = tu - i0, dv = tv - j0;
+    if (i0 < 0)     { i0 = 0;     i1 = 0;     du = 0; }
+    if (i1 > n - 1) { i0 = n - 1; i1 = n - 1; du = 0; }
+    if (j0 < 0)     { j0 = 0;     j1 = 0;     dv = 0; }
+    if (j1 > n - 1) { j0 = n - 1; j1 = n - 1; dv = 0; }
+    const h00 = f32[j0 * n + i0];
+    const h10 = f32[j0 * n + i1];
+    const h01 = f32[j1 * n + i0];
+    const h11 = f32[j1 * n + i1];
+    return h00 * (1 - du) * (1 - dv) +
+           h10 *      du  * (1 - dv) +
+           h01 * (1 - du) *      dv  +
+           h11 *      du  *      dv  - yMid;
+  };
+}
+
+// Walk a ring's perimeter CW from NW at TERRAIN vertex resolution
+// (GEO_SUBDIVS segments per edge). The terrain mesh interpolates
+// linearly between adjacent edge vertices, so a profile sampled at
+// every terrain vertex and connected with straight segments matches
+// the rendered edge EXACTLY. Corners are shared between edges →
+// 4 × GEO_SUBDIVS unique samples.
+//
+// PlaneGeometry vertex (u, v) maps (after rotateX(-π/2)) to scene
+//   x = (u - 0.5) * sideM,  z = (0.5 - v) * sideM
+// and the shader samples uHeight at hmUv = (u, 1 - v).
+// Returns [{x, z, y, u, v}] — scene XZ, scene Y, plane UV.
+function walkPerimeter(sampleSceneY, sideM) {
+  const NSEG = GEO_SUBDIVS;
+  const perim = [];
+  const pushUV = (u, v) => {
+    perim.push({
+      x: (u - 0.5) * sideM,
+      z: (0.5 - v) * sideM,
+      y: sampleSceneY(u, 1.0 - v),
+      u, v,
+    });
+  };
+  // North edge: v=1, u from 0 to 1 (includes both corners)
+  for (let i = 0; i <= NSEG; i++) pushUV(i / NSEG, 1);
+  // East edge: u=1, v from <1 down to 0 (skip NE corner)
+  for (let i = NSEG - 1; i >= 0; i--) pushUV(1, i / NSEG);
+  // South edge: v=0, u from <1 to 0 (skip SE)
+  for (let i = NSEG - 1; i >= 0; i--) pushUV(i / NSEG, 0);
+  // West edge: u=0, v from >0 to <1 (skip SW and NW)
+  for (let i = 1; i < NSEG; i++) pushUV(0, i / NSEG);
+  return perim;
+}
+
+// ── LOD seam skirt ──
+// Vertical curtain around an inner ring's perimeter. The outer ring
+// fragment-discards a hole under this ring's footprint (uClipBox), but
+// the rings sample heightmaps of different resolution (1.5 m vs 0.5 m
+// step), so their surfaces disagree vertically at the cut line — by
+// metres at building walls. Where the inner surface dips below the
+// outer ring's cut edge, view rays escape into the void → black
+// cracks. The skirt fills that gap from every angle.
+//
+// Top row coincides with the rendered mesh edge EXACTLY (same vertex
+// positions, same bilinear filter — walkPerimeter). Both rows of each
+// column share the edge UV, so the GPU stretches the ring's edge texel
+// column downward — every strip continues the local edge colour, which
+// camouflages the seam far better than any flat colour. The ortho +
+// flip uniforms are THE SAME OBJECTS as the ring material's, so tier
+// upgrades (switchOrthoTier), OSM basemap swaps and the visibility
+// unload/reload cycle all propagate to the skirt with zero wiring.
+// Deliberately NOT wired: cadastre overlay, baked shadows, viridis
+// flat-shade and hillshade modes — the skirt stays plain darkened
+// ortho. It is a few pixels wide on screen; not worth the shader.
+const SEAM_SKIRT_DEPTH = 30;     // m below the terrain edge — covers metre-scale LOD disagreement with margin
+const SEAM_SKIRT_DARKEN = 0.75;  // reads as shadow inside the seam, not as a lit wall
+const seamSkirts = [];           // { mesh, ringIndex } — bare-mode toggle hides these
+// Minimal ortho-sampling material for edge curtains (LOD seam skirts, the
+// pedestal section band). SHARES the ring material's ortho + flip uniform
+// OBJECTS — tier upgrades, OSM basemap swaps and the visibility
+// unload/reload cycle all propagate with zero wiring. Fog uniforms must be
+// per-material clones (three.js refreshFogUniforms writes .value into each).
+function makeEdgeOrthoMaterial(ringMat, darken) {
+  const fogUniforms = THREE.UniformsUtils.clone(THREE.UniformsLib.fog);
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      ...fogUniforms,
+      // SHARED with the ring material — reference, do NOT clone.
+      uOrtho:      ringMat.uniforms.uOrtho,
+      uOrthoFlipY: ringMat.uniforms.uOrthoFlipY,
+      uOrthoFlipX: ringMat.uniforms.uOrthoFlipX,
+      uDarken:     { value: darken },
+    },
+    vertexShader: `
+      #include <fog_pars_vertex>
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }
+    `,
+    fragmentShader: `
+      #include <fog_pars_fragment>
+      uniform sampler2D uOrtho;
+      uniform float uOrthoFlipY;
+      uniform float uOrthoFlipX;
+      uniform float uDarken;
+      varying vec2 vUv;
+      void main() {
+        vec2 orthoUv = vUv;
+        if (uOrthoFlipY > 0.5) orthoUv.y = 1.0 - orthoUv.y;
+        if (uOrthoFlipX > 0.5) orthoUv.x = 1.0 - orthoUv.x;
+        gl_FragColor = vec4(texture2D(uOrtho, orthoUv).rgb * uDarken, 1.0);
+        #include <fog_fragment>
+      }
+    `,
+    fog: true,
+    side: THREE.DoubleSide,   // visible from outside AND from inside the seam
+  });
+}
+function buildSeamSkirt(ringIndex, r, heightData, ringMat) {
+  const perim = walkPerimeter(
+    makeSceneYSampler(heightData, r.heightmap_size), r.side_m);
+  const P = perim.length;
+  const positions = new Float32Array(P * 2 * 3);
+  const uvs       = new Float32Array(P * 2 * 2);
+  for (let k = 0; k < P; k++) {
+    const p = perim[k];
+    // Ring fragment shader samples uOrtho at vUv = (u, 1 - v) — the
+    // vertex shader's hmUv flip. Replicate it so each skirt column
+    // reads the exact edge texel the terrain edge above it shows.
+    const tu = p.u, tv = 1.0 - p.v;
+    for (let row = 0; row < 2; row++) {
+      const vi = k * 2 + row;
+      positions[vi * 3 + 0] = p.x;
+      positions[vi * 3 + 1] = row === 0 ? p.y : p.y - SEAM_SKIRT_DEPTH;
+      positions[vi * 3 + 2] = p.z;
+      uvs[vi * 2 + 0] = tu;
+      uvs[vi * 2 + 1] = tv;
+    }
+  }
+  // One quad (2 tris) per perimeter segment, wrapping P-1 → 0.
+  const indices = new Uint32Array(P * 6);
+  for (let k = 0; k < P; k++) {
+    const next = (k + 1) % P;
+    const a = k * 2, b = next * 2;
+    const off = k * 6;
+    indices[off + 0] = a;     indices[off + 1] = a + 1; indices[off + 2] = b;
+    indices[off + 3] = a + 1; indices[off + 4] = b + 1; indices[off + 5] = b;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
+
+  const mat = makeEdgeOrthoMaterial(ringMat, SEAM_SKIRT_DARKEN);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = 1 + ringIndex;   // alongside its ring
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+  seamSkirts.push({ mesh, ringIndex });
+  console.info(`[seam-skirt] ring ${r.slug}: ${P} columns, depth ${SEAM_SKIRT_DEPTH} m`);
+}
+
 // Build outer→inner so smaller rings render LAST (higher renderOrder).
 // Each smaller ring "carves a hole" in the larger one via a clipBox
 // shader uniform, identical to inzerator's approach. Without that, the
@@ -1053,6 +1226,15 @@ for (let i = 0; i < rings.length; i++) {
   scene.add(mesh);
   ringMeshes.push(mesh);
 
+  // Seam skirt for every ring that sits inside another (i > 0) — the
+  // LOD boundary leaks black cracks without it. Must run here while
+  // `heightData` (the decoded Float32Array) is still in scope; it is
+  // dropped right below for heap savings.
+  if (i > 0) {
+    try { buildSeamSkirt(i, r, heightData, mat); }
+    catch (e) { console.warn(`[seam-skirt] ${r.slug} build failed:`, e); }
+  }
+
   // CPU heightfield reuses the Float32 array decoded above for both
   // Drop the heap-side Float32Array: GPU has its copy via DataTexture, and
   // the CPU sampler (parcel-selection raycast + outline drape) is opt-in
@@ -1075,25 +1257,24 @@ setStage('hotovo');
 hideLoader();
 
 // ── Block diagram base + ground shadow ──
-// Cartographic "podstavec": extrudes the outermost ring extent downward
-// into a solid block with stone-coloured vertical walls and a darker
-// bottom. Removes the "floating coin in the sky" feel and reads as a
-// 3D-printed relief model — classic block-diagram convention since the
-// 19th century, used in atlas inserts and museum reliefs.
+// Cartographic "podstavec": light warm-grey matte presentation base — a
+// pale rim lip following a smoothed envelope of the terrain edge, an ortho
+// "section" band absorbing the jagged DSM edge above it, a clean wall with
+// contact AO and a bottom bevel. Removes the "floating coin in the sky"
+// feel and reads as a museum / architectural presentation model.
 //
-// Sized to the widest ring (rings[0].side_m). Block top sits 10 cm
-// below globalYmin so the terrain edge meets the wall cleanly; the
-// resulting drop reads as the natural cross-section. Depth scales with
-// terrain relief (60 % of (Ymax-Ymin), floor 30 m) so flat regions
-// don't get a paper-thin base.
+// Sized to the widest ring (rings[0].side_m). The rim follows the smoothed
+// terrain-edge envelope; depth scales with terrain relief (15 % of
+// (Ymax-Ymin), floor 6 m, cap 12 m).
 //
-// The radial shadow plane underneath grounds the model visually — when
+// The rectangular shadow plane underneath grounds the model visually — when
 // you orbit, the soft gradient suggests the block sits on a notional
-// surface rather than floating. CSS radial-gradient baked into a
-// CanvasTexture, no extra GPU cost.
+// surface rather than floating. Gradient baked into a CanvasTexture, no
+// extra GPU cost.
 //
-// All MeshBasicMaterial — viewer's procedural shader stack doesn't
-// install any lights, so PBR/Lambert would render black.
+// MeshBasicMaterial + vertexColors for the solid, a minimal ortho
+// ShaderMaterial for the section band — the viewer's shader stack installs
+// no lights, so PBR/Lambert would render black.
 {
   // Terrain vertex shader: pos.y = absY - uYBase (uYBase = yMid). So the
   // terrain in scene space is centred around Y=0, ranging from
@@ -1103,30 +1284,37 @@ hideLoader();
   const W = widestSide;
   const sceneYmin = globalYmin - yMid;
   const sceneYmax = globalYmax - yMid;
-  // Shallow base: deep block dips far below the sky horizon (Y=0) and
-  // looks "wedged" against the background. 30 % of the terrain relief
-  // range, floored at 12 m, capped at 25 m — enough to read as a 3D
-  // diagram cross-section without becoming an iceberg.
+  // Slim base: the pedestal should read as a light presentation slab, not a
+  // block. 15 % of the terrain relief range, floored at 6 m, capped at 12 m.
   const range = sceneYmax - sceneYmin;
-  const BASE_DEPTH = Math.min(25, Math.max(12, range * 0.3));
+  const BASE_DEPTH = Math.min(12, Math.max(6, range * 0.15));
   const topY = sceneYmin - 0.1;
   const bottomY = topY - BASE_DEPTH;
 
-  // Premium "anthracite" look: dark slate/graphite walls that contrast the
-  // colourful ortho on top and read as a machined plinth rather than a beige
-  // cartographic block. A bright edge-highlight on the top chamfer lip is the
-  // only light cue (scene is unlit) — it fakes a rim-light catching the bevel.
-  const STONE   = 0x34383c;   // dark anthracite wall (was warm beige 0xa89986)
-  const DARK    = 0x1b1d1f;   // near-black bottom face
-  const BEVEL_W = 8;          // horizontal outward overhang of the top chamfer (m)
-  const BEVEL_H = 6;          // vertical drop of the chamfer facet (m)
-  const EDGE_HL = 2.8;        // edge-highlight multiplier on the chamfer lip (rim light)
+  // Premium presentation-model look: light warm-grey matte solid, pale rim
+  // lip under an ortho-textured "section" band that absorbs the jagged DSM
+  // edge. Spec: docs/superpowers/specs/2026-06-11-pedestal-redesign-design.md.
+  // All tunables live here — adjust during visual verification, no UI.
+  const WALL_C   = 0xb5ada0;  // matte light warm grey wall
+  const RIM_C    = 0xd6cfc0;  // rim lip — a touch lighter than the wall, subtle separator
+  const BEVEL_C  = 0x9a9183;  // bottom bevel facet
+  const BOTTOM_C = 0x867f74;  // bottom face
+  const RIM_OUT  = 2;         // rim horizontal protrusion (m)
+  const RIM_H    = 2;         // rim facet height (m)
+  const BEV_W    = 1.5;       // bottom bevel horizontal inset (m)
+  const BEV_H    = 1.5;       // bottom bevel height (m)
+  const SM_MIN_R = 7;         // envelope rolling-min radius in perimeter columns (≈ ±20 m)
+  const SM_AVG_R = 3;         // envelope smoothing radius — MUST stay <= SM_MIN_R (keeps E(k) <= edge)
+  const BAND_DARKEN = 0.8;    // ortho section band darkening
+  const AO_MIN   = 0.78;      // contact-AO multiplier directly under the rim
+  const AO_H     = 8;         // contact-AO ramp length down the wall (m)
+  const BW = W + 2 * RIM_OUT; // full footprint incl. rim overhang (shadow plane sizing)
 
   // Fine procedural grain — kills the "default flat material" read. White-ish
   // hash noise (deterministic; no Math.random so renders are reproducible),
   // narrow 0.86–1.0 brightness so it modulates without speckling. Tiled via
-  // RepeatWrapping; box uses 0–1 UVs (repeat sets scale), skirt sets metric
-  // UVs on a clone so the grain size matches across both meshes.
+  // RepeatWrapping; the pedestal solid samples it through metric UVs
+  // (metres / GRAIN_M) so grain size is constant in metres.
   const makeGrainTex = () => {
     const c = document.createElement('canvas');
     c.width = c.height = 128;
@@ -1143,53 +1331,19 @@ hideLoader();
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     return t;
   };
-  const GRAIN_M = 150;      // metres per grain-texture tile (shared box+skirt)
-  const grainBox = makeGrainTex();
-  grainBox.repeat.set(W / GRAIN_M, 1);
+  const GRAIN_M = 150;      // metres per grain-texture tile
+  const grainTex = makeGrainTex();
   // Fake vertical AO: scene has no lights, so the wall gets its depth from a
-  // per-vertex grayscale multiplier baked into vertexColors. Brightest just
-  // under the chamfer, darkest at the block floor — reads as ambient occlusion
-  // sinking into the base. Multiplier (not absolute colour) so the anthracite
-  // tone is preserved. The chamfer lip itself gets EDGE_HL (well above F_TOP)
-  // for the bright rim-light read; the vertical wall fades F_TOP→F_BOT.
-  const F_TOP = 1.0, F_BOT = 0.5;
+  // per-vertex grayscale multiplier baked into vertexColors. The global
+  // gradient fades F_TOP→F_BOT down the wall; a contact-AO ramp under the
+  // rim (AO_MIN→1 over AO_H) multiplies on top in the IIFE build below.
+  const F_TOP = 1.0, F_BOT = 0.75;
   const Y_TOP = sceneYmax;   // highest terrain → lit edge
   const Y_BOT = bottomY;     // block floor → occluded
   const shadeF = (worldY) => {
     const t = Math.max(0, Math.min(1, (worldY - Y_BOT) / (Y_TOP - Y_BOT)));
     return F_BOT + (F_TOP - F_BOT) * t;
   };
-  const stone = new THREE.MeshBasicMaterial({ color: STONE, fog: true, vertexColors: true, map: grainBox });
-  const dark  = new THREE.MeshBasicMaterial({ color: DARK,  fog: true, vertexColors: true });
-  const invis = new THREE.MeshBasicMaterial({ visible: false });
-  // BoxGeometry face order: +X, -X, +Y(top), -Y(bot), +Z, -Z
-  // Top face invisible — terrain covers it from above; cleaner than a
-  // duplicate stone face poking through if the terrain edge dips below
-  // globalYmin (shouldn't happen, but defensive).
-  // Box footprint is widened by the chamfer overhang on each side: the
-  // skirt's vertical wall sits BEVEL_W metres outboard of the terrain edge
-  // (the chamfer flares out), so the box must reach it or a gap shows.
-  const BW = W + 2 * BEVEL_W;
-  const boxGeo = new THREE.BoxGeometry(BW, BASE_DEPTH, BW);
-  // Per-vertex gradient multiplier. Bottom face (normal.y < 0) keeps f=1 so
-  // the DARK material stays pure; walls fade by height. Box local Y is
-  // centred on (topY+bottomY)/2, so world Y = localY + that midpoint.
-  {
-    const bpos = boxGeo.attributes.position;
-    const bnor = boxGeo.attributes.normal;
-    const bcol = new Float32Array(bpos.count * 3);
-    const midY = (topY + bottomY) / 2;
-    for (let i = 0; i < bpos.count; i++) {
-      const f = bnor.getY(i) < -0.5 ? 1.0 : shadeF(bpos.getY(i) + midY);
-      bcol[i * 3] = bcol[i * 3 + 1] = bcol[i * 3 + 2] = f;
-    }
-    boxGeo.setAttribute('color', new THREE.BufferAttribute(bcol, 3));
-  }
-  const box = new THREE.Mesh(boxGeo, [stone, stone, invis, dark, stone, stone]);
-  box.position.set(0, (topY + bottomY) / 2, 0);
-  box.renderOrder = 0;     // before terrain (renderOrder 1+) so no z-fight surprises
-  box.frustumCulled = false;
-  scene.add(box);
 
   // Ground shadow: a RECTANGULAR soft shadow that matches the model's square
   // footprint, not the old radial blob (a round halo under a square block
@@ -1200,7 +1354,7 @@ hideLoader();
   // Drawn by filling a rounded rect inset into the canvas with a large
   // ctx.shadowBlur, twice (sharp+near, then soft+wide), so the alpha falls
   // off as a rectangle with rounded corners rather than a circle.
-  const SHADOW_PAD = 1.7;                 // plane span = footprint × this (room for halo)
+  const SHADOW_PAD = 1.5;                 // plane span = footprint × this (room for halo)
   const SC = 512;                         // canvas resolution (rect edges need >256 to stay crisp)
   const shadowCanvas = document.createElement('canvas');
   shadowCanvas.width = shadowCanvas.height = SC;
@@ -1236,7 +1390,7 @@ hideLoader();
   const shadowMat = new THREE.MeshBasicMaterial({
     map: shadowTex,
     transparent: true,
-    depthWrite: false,    // don't occlude the box that sits at the same Y
+    depthWrite: false,    // don't occlude the pedestal that sits at the same Y
     fog: false,           // FogExp2 would dim the outer halo
   });
   const SHADOW_SIZE = BW * SHADOW_PAD;
@@ -1252,19 +1406,16 @@ hideLoader();
                `topY=${topY.toFixed(1)} (scene), bottomY=${bottomY.toFixed(1)} (scene), ` +
                `yMid=${yMid.toFixed(1)} (AMSL)`);
 
-  // ── Skirt: extruded perimeter that closes the gap between the flat
-  //          box top and the varying terrain edge profile.
-  // The box top sits at sceneYmin (= globally lowest point). Wherever
-  // the actual terrain edge rises above sceneYmin (= most of the time),
-  // there's a vertical gap between terrain underside and box top. Skirt
-  // is a thin band of triangles whose TOP vertices follow the sampled
-  // heightmap profile and BOTTOM vertices sit at the box top (topY).
-  // No bottom face — that's the box's job.
+  // ── Pedestal solid: watertight perimeter extrusion built from the
+  //    outer ring's edge profile — a pale rim lip following a smoothed
+  //    envelope of the terrain edge, a contact-AO wall, a bottom bevel
+  //    and a bottom fan. Replaces the old BoxGeometry + skirt duo (whose
+  //    mismatch caused the see-through corner slivers).
   //
   // Sampling is async (await loadHeightmapData on the outer ring's LERC).
-  // Until it lands, the user sees the flat box; the skirt drops in once
-  // ready (~1-2 s). This avoids loading 16 MB of heightmap into JS heap
-  // synchronously at startup.
+  // Until it lands, the terrain edge floats unsupported for a moment; the
+  // pedestal drops in once ready (~1-2 s). This avoids loading 16 MB of
+  // heightmap into JS heap synchronously at startup.
   (async () => {
     try {
       const outer = rings[0];
@@ -1274,150 +1425,174 @@ hideLoader();
       const n = info.size;
       const sideM = outer.side_m;
 
-      // Bilinear heightmap sample at hmUv ∈ [0,1]² → scene-space Y.
-      // Mirrors what the terrain vertex shader does: it samples uHeight
-      // with LinearFilter + ClampToEdgeWrapping, where pixel CENTRES sit
-      // at uv = ((i+0.5)/n, (j+0.5)/n). Reproducing that exact filter
-      // here lets the skirt land on the SAME heights the terrain edge
-      // shows; any "i/(n-1)" texel-corner approximation left half-texel
-      // gaps because the shader's interpolation is offset by 0.5 texel.
-      const sampleHmUv = (hmU, hmV) => {
-        const tu = hmU * n - 0.5;
-        const tv = hmV * n - 0.5;
-        let i0 = Math.floor(tu), i1 = i0 + 1;
-        let j0 = Math.floor(tv), j1 = j0 + 1;
-        let du = tu - i0, dv = tv - j0;
-        if (i0 < 0)     { i0 = 0;     i1 = 0;     du = 0; }
-        if (i1 > n - 1) { i0 = n - 1; i1 = n - 1; du = 0; }
-        if (j0 < 0)     { j0 = 0;     j1 = 0;     dv = 0; }
-        if (j1 > n - 1) { j0 = n - 1; j1 = n - 1; dv = 0; }
-        const h00 = f32[j0 * n + i0];
-        const h10 = f32[j0 * n + i1];
-        const h01 = f32[j1 * n + i0];
-        const h11 = f32[j1 * n + i1];
-        return h00 * (1 - du) * (1 - dv) +
-               h10 *      du  * (1 - dv) +
-               h01 * (1 - du) *      dv  +
-               h11 *      du  *      dv  - yMid;
-      };
+      // Bilinear sampler + perimeter walk shared with the LOD seam
+      // skirts — see makeSceneYSampler / walkPerimeter above the ring
+      // build loop. Top row matches the rendered terrain edge exactly.
+      const perim = walkPerimeter(makeSceneYSampler(f32, n), sideM);
 
-      // Walk perimeter CW from NW at TERRAIN vertex resolution
-      // (GEO_SUBDIVS = 1024 segments → 1025 points per edge). The
-      // terrain mesh's vertex shader interpolates between adjacent
-      // vertices linearly; a skirt sampling at every terrain vertex
-      // and connecting with straight segments matches the rendered
-      // edge exactly. Corners shared with neighbouring edges so the
-      // perimeter loop has 4 × GEO_SUBDIVS unique samples.
-      //
-      // PlaneGeometry vertex at (u, v) maps to scene
-      //   x = (u - 0.5) * sideM, z = (0.5 - v) * sideM  [pre-rotation]
-      // After rotateX(-π/2): the *original* y becomes -z, so
-      //   x = (u - 0.5) * sideM, z = (0.5 - v) * sideM
-      // (sign on z depends on which corner you call "north"; the
-      // mapping below was verified to put data row 0 at world z=-half.)
-      // Shader samples uHeight at hmUv = (u, 1 - v).
-      const NSEG = 1024;   // matches GEO_SUBDIVS, the terrain plane subdivision
-      const vertexXZ = (u, v) => ({
-        x: (u - 0.5) * sideM,
-        // v=0 maps to scene z=+sideM/2 (south) per PlaneGeometry rotation;
-        // v=1 maps to z=-sideM/2 (north).
-        z: (0.5 - v) * sideM,
-      });
-      const sampleVertY = (u, v) => sampleHmUv(u, 1.0 - v);
-
-      const perim = [];
-      const pushUV = (u, v) => {
-        const w = vertexXZ(u, v);
-        perim.push({ x: w.x, z: w.z, y: sampleVertY(u, v) });
-      };
-      // North edge: v=1, u from 0 to 1 (1025 points, includes both corners)
-      for (let i = 0; i <= NSEG; i++) pushUV(i / NSEG, 1);
-      // East edge: u=1, v from <1 down to 0 (1024 points, skip NE corner)
-      for (let i = NSEG - 1; i >= 0; i--) pushUV(1, i / NSEG);
-      // South edge: v=0, u from <1 to 0 (1024 points, skip SE)
-      for (let i = NSEG - 1; i >= 0; i--) pushUV(i / NSEG, 0);
-      // West edge: u=0, v from >0 to <1 (1023 points, skip SW and NW)
-      for (let i = 1; i < NSEG; i++) pushUV(0, i / NSEG);
-
-      // Build geometry: 3 vertices per perimeter sample.
-      //   row0 = terrain-edge lip   (on the footprint, bright edge-highlight)
-      //   row1 = chamfer bottom     (lip pushed OUT BEVEL_W, DOWN BEVEL_H)
-      //   row2 = wall bottom        (same XZ as row1, at box top)
-      // Two stacked quad bands per segment: the CHAMFER facet (row0→row1) is a
-      // sloped bevel that catches the fake rim-light (EDGE_HL) where terrain
-      // meets stone — the "machined physical object" cue; below it the vertical
-      // anthracite WALL (row1→row2) fades F_TOP→F_BOT. Cumulative perimeter
-      // distance + world Y give metric UVs so the grain tiles at GRAIN_M
-      // regardless of edge profile. 3·P verts, Uint32 indices.
       const P = perim.length;
-      const positions = new Float32Array(P * 3 * 3);
-      const scol      = new Float32Array(P * 3 * 3);
-      const uvs       = new Float32Array(P * 3 * 2);
+
+      // Smoothed envelope E(k): cyclic rolling minimum (radius SM_MIN_R)
+      // then cyclic moving average (radius SM_AVG_R). Because
+      // SM_AVG_R <= SM_MIN_R, every averaged value is a mean of minima
+      // whose windows all contain k, so E(k) <= edge height always — the
+      // section band above the rim can never invert.
+      const mins = new Float64Array(P);
+      for (let k = 0; k < P; k++) {
+        let m = Infinity;
+        for (let d = -SM_MIN_R; d <= SM_MIN_R; d++)
+          m = Math.min(m, perim[(k + d + P) % P].y);
+        mins[k] = m;
+      }
+      const env = new Float64Array(P);
+      for (let k = 0; k < P; k++) {
+        let s = 0;
+        for (let d = -SM_AVG_R; d <= SM_AVG_R; d++)
+          s += mins[(k + d + P) % P];
+        env[k] = s / (2 * SM_AVG_R + 1);
+      }
+
+      // Per-edge outward unit offset, mitred at the corners (full offset on
+      // both axes there) — the wall must land exactly on the footprint plane
+      // at half + RIM_OUT. Radial-from-centre offsets fall short everywhere
+      // except edge midpoints (the 2026-06-10 corner-sliver bug).
+      const out = (p) => [
+        (p.u === 0 || p.u === 1) ? Math.sign(p.x) : 0,
+        (p.v === 0 || p.v === 1) ? Math.sign(p.z) : 0,
+      ];
+      // Palette hexes are authored in sRGB (mockup swatches); vertexColors
+      // are consumed as LINEAR and re-encoded by OutputPass — feeding the
+      // raw hex would render the base noticeably lighter than designed.
+      const rgb = (hex, f) => {
+        const c = new THREE.Color(hex).convertSRGBToLinear();
+        return [c.r * f, c.g * f, c.b * f];
+      };
+
+      // ── Matte pedestal solid ──
+      // One watertight perimeter extrusion replaces the old box + skirt duo
+      // (whose mismatch caused the see-through sliver bug). 6 vertex rows
+      // per column — rim top, rim bottom ×2 (duplicated so wall AO doesn't
+      // bleed into the flat pale rim), AO ring, bevel top, bevel bottom —
+      // plus one centre vertex fanning the bottom face closed. Material
+      // colour is white: the actual colours (rim/wall/bevel/bottom) live in
+      // vertexColors and the grain map multiplies on top.
+      const bevelTopY = bottomY + BEV_H;
+      const ROWS = 6;
+      const positions = new Float32Array((P * ROWS + 1) * 3);
+      const scol      = new Float32Array((P * ROWS + 1) * 3);
+      const uvs       = new Float32Array((P * ROWS + 1) * 2);
       let cum = 0;
       for (let k = 0; k < P; k++) {
         const p = perim[k];
         const prev = perim[(k - 1 + P) % P];
         cum += Math.hypot(p.x - prev.x, p.z - prev.z);
-        // Outward direction in XZ (radial from model centre). On a square
-        // perimeter this points straight out along the walls and diagonally
-        // at the corners, so the chamfer flares the corners slightly — reads
-        // as a softened, rounded-off edge rather than a sharp prism.
-        const len = Math.hypot(p.x, p.z) || 1;
-        const ox = (p.x / len) * BEVEL_W;
-        const oz = (p.z / len) * BEVEL_W;
-        const bevelBotY = Math.max(topY, p.y - BEVEL_H);
-        const px = [p.x, p.x + ox, p.x + ox];
-        const pz = [p.z, p.z + oz, p.z + oz];
-        const ys = [p.y, bevelBotY, topY];
-        const fs = [EDGE_HL, shadeF(bevelBotY), shadeF(topY)];
+        const [ou, ov] = out(p);
+        const E = env[k];
+        const aoY = Math.max(bevelTopY, E - RIM_H - AO_H);
+        const wx = p.x + ou * RIM_OUT, wz = p.z + ov * RIM_OUT;
+        const px = [p.x, wx, wx, wx, wx, p.x + ou * (RIM_OUT - BEV_W)];
+        const pz = [p.z, wz, wz, wz, wz, p.z + ov * (RIM_OUT - BEV_W)];
+        const ys = [E, E - RIM_H, E - RIM_H, aoY, bevelTopY, bottomY];
+        const cs = [
+          rgb(RIM_C, 1),                              // rim top
+          rgb(RIM_C, 1),                              // rim bottom (rim copy)
+          rgb(WALL_C, AO_MIN * shadeF(E - RIM_H)),    // rim bottom (wall copy)
+          rgb(WALL_C, shadeF(aoY)),                   // AO ramp end
+          rgb(WALL_C, shadeF(bevelTopY)),             // bevel top
+          rgb(BEVEL_C, 1),                            // bevel bottom
+        ];
         const u = cum / GRAIN_M;
-        for (let row = 0; row < 3; row++) {
-          const vi = k * 3 + row;
-          positions[vi * 3 + 0] = px[row];
+        for (let row = 0; row < ROWS; row++) {
+          const vi = k * ROWS + row;
+          positions[vi * 3]     = px[row];
           positions[vi * 3 + 1] = ys[row];
           positions[vi * 3 + 2] = pz[row];
-          scol[vi * 3 + 0] = scol[vi * 3 + 1] = scol[vi * 3 + 2] = fs[row];
-          uvs[vi * 2 + 0] = u;
+          scol[vi * 3]     = cs[row][0];
+          scol[vi * 3 + 1] = cs[row][1];
+          scol[vi * 3 + 2] = cs[row][2];
+          uvs[vi * 2]     = u;
           uvs[vi * 2 + 1] = ys[row] / GRAIN_M;
         }
       }
-      // 2 quads (chamfer + wall) × 2 tris × 3 idx = 12 indices per segment.
-      const indices = new Uint32Array(P * 12);
+      // Bottom-centre vertex closes the solid from below.
+      const ci = P * ROWS;
+      positions[ci * 3] = 0; positions[ci * 3 + 1] = bottomY; positions[ci * 3 + 2] = 0;
+      const bc = rgb(BOTTOM_C, 1);
+      scol[ci * 3] = bc[0]; scol[ci * 3 + 1] = bc[1]; scol[ci * 3 + 2] = bc[2];
+      uvs[ci * 2] = 0; uvs[ci * 2 + 1] = bottomY / GRAIN_M;
+
+      // 4 quad bands per segment (rim 0→1, AO wall 2→3, wall 3→4,
+      // bevel 4→5; rows 1|2 share positions, only colours differ) + one
+      // bottom-fan triangle = 27 indices per segment.
+      const indices = new Uint32Array(P * 27);
+      const bands = [[0, 1], [2, 3], [3, 4], [4, 5]];
       for (let k = 0; k < P; k++) {
         const next = (k + 1) % P;
-        const a = k * 3, b = next * 3;     // base vertex of each sample column
-        const off = k * 12;
-        // chamfer facet: rows 0,1
-        indices[off + 0] = a;     indices[off + 1] = a + 1; indices[off + 2] = b;
-        indices[off + 3] = a + 1; indices[off + 4] = b + 1; indices[off + 5] = b;
-        // wall band: rows 1,2
-        indices[off + 6] = a + 1; indices[off + 7] = a + 2; indices[off + 8]  = b + 1;
-        indices[off + 9] = a + 2; indices[off + 10] = b + 2; indices[off + 11] = b + 1;
+        const a = k * ROWS, b = next * ROWS;
+        let off = k * 27;
+        for (const [t, m] of bands) {
+          indices[off++] = a + t; indices[off++] = a + m; indices[off++] = b + t;
+          indices[off++] = a + m; indices[off++] = b + m; indices[off++] = b + t;
+        }
+        indices[off++] = a + 5; indices[off++] = ci; indices[off++] = b + 5;
       }
-      const skirtGeo = new THREE.BufferGeometry();
-      skirtGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      skirtGeo.setAttribute('color', new THREE.BufferAttribute(scol, 3));
-      skirtGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-      skirtGeo.setIndex(new THREE.BufferAttribute(indices, 1));
-
-      // Grain clone with metric UVs already baked in → repeat 1×1.
-      const grainSkirt = grainBox.clone();
-      grainSkirt.needsUpdate = true;
-      grainSkirt.repeat.set(1, 1);
-      // DoubleSide so wall faces both directions — saves figuring out
-      // CW/CCW vertex winding for the 4 wall orientations.
-      const skirtMat = new THREE.MeshBasicMaterial({
-        color: STONE, fog: true, side: THREE.DoubleSide, vertexColors: true,
-        map: grainSkirt,
+      const solidGeo = new THREE.BufferGeometry();
+      solidGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      solidGeo.setAttribute('color', new THREE.BufferAttribute(scol, 3));
+      solidGeo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      solidGeo.setIndex(new THREE.BufferAttribute(indices, 1));
+      // DoubleSide saves worrying about winding across 4 wall orientations
+      // + bottom fan.
+      const solidMat = new THREE.MeshBasicMaterial({
+        color: 0xffffff, fog: true, side: THREE.DoubleSide, vertexColors: true,
+        map: grainTex,
       });
-      const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
-      skirtMesh.renderOrder = 0;
-      skirtMesh.frustumCulled = false;
-      scene.add(skirtMesh);
-      console.info(`[block-base] skirt added (${P} perim samples, ` +
-                   `outer ring ${sideM.toFixed(0)}×${sideM.toFixed(0)} m)`);
+      const solid = new THREE.Mesh(solidGeo, solidMat);
+      solid.renderOrder = 0;
+      solid.frustumCulled = false;
+      scene.add(solid);
+      console.info(`[block-base] pedestal solid (${P} columns, depth ${BASE_DEPTH.toFixed(0)} m, rim ${RIM_H} m @ envelope)`);
+
+      // ── Ortho section band ──
+      // Fills the strip between the exact (jagged) terrain edge and the
+      // smoothed rim envelope. Top row is watertight against the terrain
+      // edge; both rows share the perimeter UV so the GPU stretches the
+      // ring's edge texel column downward — the jaggedness reads as a
+      // terrain cross-section, not as pedestal. Same technique + shared
+      // uniforms as the LOD seam skirt (ring 0 material here).
+      const bpos = new Float32Array(P * 2 * 3);
+      const buv  = new Float32Array(P * 2 * 2);
+      for (let k = 0; k < P; k++) {
+        const p = perim[k];
+        const tu = p.u, tv = 1.0 - p.v;
+        for (let row = 0; row < 2; row++) {
+          const vi = k * 2 + row;
+          bpos[vi * 3]     = p.x;
+          bpos[vi * 3 + 1] = row === 0 ? p.y : env[k];
+          bpos[vi * 3 + 2] = p.z;
+          buv[vi * 2]     = tu;
+          buv[vi * 2 + 1] = tv;
+        }
+      }
+      const bidx = new Uint32Array(P * 6);
+      for (let k = 0; k < P; k++) {
+        const next = (k + 1) % P;
+        const a = k * 2, b = next * 2, off = k * 6;
+        bidx[off]     = a;     bidx[off + 1] = a + 1; bidx[off + 2] = b;
+        bidx[off + 3] = a + 1; bidx[off + 4] = b + 1; bidx[off + 5] = b;
+      }
+      const bandGeo = new THREE.BufferGeometry();
+      bandGeo.setAttribute('position', new THREE.BufferAttribute(bpos, 3));
+      bandGeo.setAttribute('uv', new THREE.BufferAttribute(buv, 2));
+      bandGeo.setIndex(new THREE.BufferAttribute(bidx, 1));
+      const band = new THREE.Mesh(
+        bandGeo, makeEdgeOrthoMaterial(ringMeshes[0].material, BAND_DARKEN));
+      band.renderOrder = 1;        // alongside the outer ring
+      band.frustumCulled = false;
+      scene.add(band);
+      console.info(`[block-base] section band added (${P} columns)`);
     } catch (e) {
-      console.warn('[block-base] skirt build failed:', e);
+      console.warn('[block-base] pedestal build failed:', e);
     }
   })();
 }
@@ -1619,6 +1794,10 @@ bareToggle.addEventListener('change', async () => {
   for (const mesh of ringMeshes) {
     mesh.material.uniforms.uBareMode.value = v;
   }
+  // Seam skirts are built from DSM heights — in bare-earth mode they'd
+  // stick up above the lowered terrain. Hide them; without buildings
+  // the rings' heightmaps nearly agree and the seam is invisible.
+  for (const s of seamSkirts) s.mesh.visible = v < 0.5;
   // If shadows are on, the bake's input changed — re-render shadow maps
   // for the new surface (DSM vs DMR5G silhouettes differ wherever there
   // are buildings or trees).

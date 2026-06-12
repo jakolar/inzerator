@@ -474,6 +474,11 @@ scene.fog = new THREE.FogExp2(SKY_HAZE, 0.00012);
 // most legible relief on Czech terrain (north-facing slopes shaded, south
 // slopes lit — matches photo intuition).
 const SUN_EL = 45, SUN_AZ = 215;   // 45° elevation, SSW (geographic bearing)
+// Hillshade presets. SUBTLE is on from startup — gentle relief legibility
+// with zero startup cost (uShadows 0 → the baked shadow map is never read,
+// so no bake happens until the "🌑" checkbox first turns FULL on).
+const HILLSHADE_SUBTLE = { ambient: 0.78, diffuse: 0.22, shadows: 0.0 };
+const HILLSHADE_FULL   = { ambient: 0.55, diffuse: 0.45, shadows: 1.0 };
 const sunPolar = THREE.MathUtils.degToRad(90 - SUN_EL);
 // Compass azimuth (0°=N, clockwise) → Three.js spherical theta. In our
 // PlaneGeometry layout +Z = south, +X = east, so theta=0 points to +Z
@@ -1008,15 +1013,15 @@ for (let i = 0; i < rings.length; i++) {
       uHmStep:    { value: r.step },
       uRingHalf:  { value: r.half },       // ring extent in metres, for shadow ray clipping
       uSunDir:    { value: window._heightfieldSunDir },  // shared across all rings (set below)
-      uHillshade: { value: 0.0 },        // 0 = off (plain ortho), 1 = on
-      uShadows:   { value: 0.0 },        // 0 = lambert only, 1 = + cast shadows
+      uHillshade: { value: 1.0 },        // always on; SUBTLE↔FULL via "🌑" checkbox
+      uShadows:   { value: HILLSHADE_SUBTLE.shadows },
       // Precomputed shadow texture (baked GPU pass — see bakeShadowMaps).
       // Default: 1×1 white = "fully lit" so toggling shadows before bake
       // completes doesn't blacken everything. Replaced by render-target
       // texture once bake finishes.
       uShadowMap: { value: window._heightfieldDefaultShadowTex },
-      uAmbient:   { value: 0.55 },        // base lighting on shadow side
-      uDiffuse:   { value: 0.45 },        // sun-facing slope brightness boost
+      uAmbient:   { value: HILLSHADE_SUBTLE.ambient },
+      uDiffuse:   { value: HILLSHADE_SUBTLE.diffuse },
     },
     vertexShader: `
       #include <fog_pars_vertex>
@@ -1969,10 +1974,14 @@ shadowToggle.addEventListener('change', async () => {
   } else {
     sunControls.style.display = 'none';
   }
-  const on = shadowToggle.checked ? 1.0 : 0.0;
+  // Switch between presets — hillshade itself never turns off (uHillshade
+  // stays 1.0; the viridis flat-shade mode bypasses it in-shader).
+  const p = shadowToggle.checked ? HILLSHADE_FULL : HILLSHADE_SUBTLE;
   for (const mesh of ringMeshes) {
-    mesh.material.uniforms.uHillshade.value = on;
-    mesh.material.uniforms.uShadows.value = on;
+    const u = mesh.material.uniforms;
+    u.uAmbient.value = p.ambient;
+    u.uDiffuse.value = p.diffuse;
+    u.uShadows.value = p.shadows;
   }
 });
 

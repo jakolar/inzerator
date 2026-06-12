@@ -4447,12 +4447,10 @@ function animate() {
   }
 }
 
-// Estimate GPU memory by scanning materials + composers for unique textures
-// and summing image-byte-size by format/type. WebGL doesn't expose VRAM
-// directly; this is an upper bound for the texture footprint (mipmaps add
-// ~33 %, included). Render targets (bloom, shadow bake) are counted via
-// `renderer.info.memory.textures` heuristic — each RT contributes ~ W*H*4
-// bytes (RGBA half-float for HDR composer paths).
+// Estimate GPU memory by walking materials + render targets and summing
+// actual byte footprints: HalfFloat = 8 B/px, ×5 per finalComposer RT
+// (MSAA 4× multisample renderbuffer + resolve), plus the SSAO DepthTexture
+// and two half-res AO targets when ssaoPass is active.
 function _texBytes(tex) {
   if (!tex || !tex.image) return 0;
   // Compressed (KTX2 ETC1S/UASTC): mipmaps array carries actual byte arrays.
@@ -4611,8 +4609,16 @@ async function disposeAllAssets() {
     const m = outlineGroup.children.pop();
     m.geometry.dispose();
   }
-  // Don't dispose _parcelLineMat / _emissiveMat — singleton materials,
-  // cheap to keep. Composer RTs likewise stay (they re-clear naturally).
+  // Don't dispose _parcelLineMat / _emissiveMat — singleton materials, cheap to keep.
+  // Composer targets are the biggest remaining block after the MSAA upgrade
+  // (2 × (1+4 samples) × 8 B/px ≈ 170 MB at iPad retina) — drop them too.
+  // EffectComposer re-allocates GL storage transparently on the next render.
+  bloomComposer?.renderTarget1.dispose(); bloomComposer?.renderTarget2.dispose();
+  finalComposer?.renderTarget1.dispose(); finalComposer?.renderTarget2.dispose();
+  if (ssaoPass) {
+    ssaoPass._aoRT.dispose(); ssaoPass._blurRT.dispose();
+    finalComposer.renderTarget1.depthTexture?.dispose();
+  }
   // Bump epoch LAST so any in-flight loader notices on its next await
   // boundary and bails before writing into the just-cleared caches.
   _epoch++;

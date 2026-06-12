@@ -337,8 +337,8 @@ const _CAD_FLIP = parseInt(URL_PARAMS.get('cadflip') ?? '0', 10);
 const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
 // Tone-mapping A/B (?tone=agx|aces, ?exp=1.1). Default NoToneMapping — the
 // ortho is already colour-graded (docs/notes/2026-05-16-ortofoto-color-grading.md);
-// this is a verification tool, not a default. Applied by OutputPass only.
-const _TONE = { agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping }[
+// this is a verification tool, not a default. Applied by OutputPass (composer path).
+const _TONE = { __proto__: null, agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping }[
   URL_PARAMS.get('tone')] ?? THREE.NoToneMapping;
 const _TONE_EXP = parseFloat(URL_PARAMS.get('exp') ?? '1') || 1.0;
 
@@ -4263,7 +4263,9 @@ function estimateGpuMB() {
   const dpr = renderer.getPixelRatio();
   const composerRtBytes = innerWidth * innerHeight * dpr * dpr * 8;
   if (bloomComposer) total += composerRtBytes * 2;   // bloomComposer 2 RTs
-  if (finalComposer) total += composerRtBytes * 2;   // finalComposer 2 RTs
+  // finalComposer is MSAA 4×: each of its 2 RTs carries an extra 4-sample
+  // multisample renderbuffer besides the resolve texture → (1 + 4)× per RT.
+  if (finalComposer) total += composerRtBytes * 2 * 5;
   // UnrealBloomPass adds 5 mip-chain RTs at half/quarter sizes.
   if (bloomComposer) total += composerRtBytes * 0.4;   // ~5 mips of decreasing size
   return (total / 1048576).toFixed(0);

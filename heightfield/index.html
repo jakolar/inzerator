@@ -335,6 +335,12 @@ const _CAD_FLIP = parseInt(URL_PARAMS.get('cadflip') ?? '0', 10);
 // Bypass postprocess (no parcel glow). For comparing ortho colours
 // against the pre-bloom direct-render baseline.
 const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
+// Tone-mapping A/B (?tone=agx|aces, ?exp=1.1). Default NoToneMapping — the
+// ortho is already colour-graded (docs/notes/2026-05-16-ortofoto-color-grading.md);
+// this is a verification tool, not a default. Applied by OutputPass only.
+const _TONE = { agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping }[
+  URL_PARAMS.get('tone')] ?? THREE.NoToneMapping;
+const _TONE_EXP = parseFloat(URL_PARAMS.get('exp') ?? '1') || 1.0;
 
 console.log('manifest:', manifest);
 
@@ -429,6 +435,8 @@ try {
 const _HIRES = new URLSearchParams(location.search).get('hires') === '1';
 renderer.setPixelRatio(_HIRES ? devicePixelRatio : Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = _TONE;            // OutputPass reads this at render time
+renderer.toneMappingExposure = _TONE_EXP;
 document.body.appendChild(renderer.domElement);
 
 // 1×1 white texture used as default uShadowMap so the shadow toggle stays
@@ -4128,7 +4136,13 @@ const combineShader = new THREE.ShaderMaterial({
     }
   `,
 });
-const finalComposer = new EffectComposer(renderer);
+// Canvas `antialias: true` never applies through the composer (it renders
+// into offscreen targets), so building edges alias. Explicit MSAA 4× target
+// fixes that; HalfFloatType keeps the HDR sky's >1.0 values for the bloom
+// combine + tone mapping. bloomComposer stays non-MSAA — its output is
+// blurred anyway. setSize/setPixelRatio preserve `samples`.
+const finalComposer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(
+  innerWidth, innerHeight, { samples: 4, type: THREE.HalfFloatType }));
 finalComposer.setPixelRatio(renderer.getPixelRatio());
 finalComposer.setSize(innerWidth, innerHeight);
 finalComposer.addPass(new RenderPass(scene, camera));

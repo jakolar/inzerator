@@ -100,6 +100,16 @@
     </div>
   </details>
 
+  <details class="info-section">
+    <summary>Efekty</summary>
+    <label style="display:block;cursor:pointer;">
+      <input id="tiltshift-toggle" type="checkbox"> 📷 Miniatura
+    </label>
+    <label style="display:block;cursor:pointer;">
+      <input id="ssao-toggle" type="checkbox"> 🏘 Okluzní stíny (SSAO)
+    </label>
+  </details>
+
   <details open class="info-section">
     <summary>Parcely a POI</summary>
     <label style="display:block;cursor:pointer;">
@@ -549,6 +559,7 @@ function setDpr(dpr) {
   finalComposer?.setPixelRatio(dpr);
   bloomComposer?.setSize(innerWidth, innerHeight);
   finalComposer?.setSize(innerWidth, innerHeight);
+  updateTiltShiftTexel?.();
 }
 controls.addEventListener('start', () => {
   if (_idleDprT) { clearTimeout(_idleDprT); _idleDprT = null; }
@@ -4156,6 +4167,67 @@ finalComposer.setPixelRatio(renderer.getPixelRatio());
 finalComposer.setSize(innerWidth, innerHeight);
 finalComposer.addPass(new RenderPass(scene, camera));
 finalComposer.addPass(new ShaderPass(combineShader, 'baseTexture'));
+// ── Tilt-shift ("miniature" effect, opt-in) ──
+// Separable Gaussian whose radius grows with vertical distance from a
+// screen-space focus band — no depth input needed, so it is cheap and can't
+// be confused by the displaced terrain. Placed after the bloom combine so
+// selected-parcel glow blurs together with the scene.
+const TILT_FOCUS_Y   = 0.5;    // focus band centre (UV y)
+const TILT_BAND_HALF = 0.18;   // sharp half-height of the band
+const TILT_FALLOFF   = 0.25;   // smoothstep ramp beyond the band
+const TILT_MAX_BLUR  = 6.0;    // max blur radius in device px (at capped DPR)
+const TiltShiftShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uDir:     { value: new THREE.Vector2(1, 0) },
+    uTexel:   { value: new THREE.Vector2(1 / innerWidth, 1 / innerHeight) },
+    uFocusY:  { value: TILT_FOCUS_Y },
+    uBandHalf:{ value: TILT_BAND_HALF },
+    uFalloff: { value: TILT_FALLOFF },
+    uMaxBlur: { value: TILT_MAX_BLUR },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform vec2 uDir, uTexel;
+    uniform float uFocusY, uBandHalf, uFalloff, uMaxBlur;
+    varying vec2 vUv;
+    void main() {
+      float amt = uMaxBlur * smoothstep(uBandHalf, uBandHalf + uFalloff, abs(vUv.y - uFocusY));
+      vec2 stp = uDir * uTexel * amt;
+      // 5-tap linearly-sampled Gaussian (effective 9-tap).
+      vec4 c = texture2D(tDiffuse, vUv) * 0.227027;
+      c += (texture2D(tDiffuse, vUv + stp * 1.384615) + texture2D(tDiffuse, vUv - stp * 1.384615)) * 0.316216;
+      c += (texture2D(tDiffuse, vUv + stp * 3.230769) + texture2D(tDiffuse, vUv - stp * 3.230769)) * 0.070270;
+      gl_FragColor = c;
+    }
+  `,
+};
+const tiltShiftH = new ShaderPass(TiltShiftShader);
+const tiltShiftV = new ShaderPass(TiltShiftShader);
+tiltShiftV.material.uniforms.uDir.value.set(0, 1);
+tiltShiftH.enabled = false;
+tiltShiftV.enabled = false;
+finalComposer.addPass(tiltShiftH);
+finalComposer.addPass(tiltShiftV);
+// uTexel must track the real drawing-buffer size (DPR changes during drag —
+// see setDpr — and on window resize). ShaderPass.setSize is a no-op, so we
+// update it explicitly from both call sites.
+function updateTiltShiftTexel() {
+  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+  for (const p of [tiltShiftH, tiltShiftV])
+    p.material.uniforms.uTexel.value.set(1 / s.x, 1 / s.y);
+}
+updateTiltShiftTexel();
+
+const tiltShiftToggle = document.getElementById('tiltshift-toggle');
+tiltShiftToggle.addEventListener('change', () => {
+  tiltShiftH.enabled = tiltShiftToggle.checked;
+  tiltShiftV.enabled = tiltShiftToggle.checked;
+});
 finalComposer.addPass(new OutputPass());
 
 renderer.info.autoReset = false;   // accumulate across multiple render() calls per frame
@@ -4286,6 +4358,7 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   bloomComposer.setSize(innerWidth, innerHeight);
   finalComposer.setSize(innerWidth, innerHeight);
+  updateTiltShiftTexel();
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 });

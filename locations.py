@@ -89,7 +89,9 @@ def location_status(slug: str) -> str:
     return "partial"
 
 
-def _persist_location_meta(slug: str, label: str, cx: float, cy: float) -> None:
+def _persist_location_meta(slug: str, label: str, cx: float, cy: float,
+                           inner_half: float | None = None,
+                           parcel_ids: list | None = None) -> None:
     """Write tiles_v2_<slug>/location.json with {slug, label, cx, cy} so
     the label survives the only on-disk persistence path we have now that
     the v2 top-level manifest is no longer written. Called at job enqueue
@@ -98,6 +100,10 @@ def _persist_location_meta(slug: str, label: str, cx: float, cy: float) -> None:
     base.mkdir(parents=True, exist_ok=True)
     meta = {"slug": slug, "label": label, "cx": cx, "cy": cy,
             "created_at": time.time()}
+    if inner_half is not None:
+        meta["inner_half"] = inner_half
+    if parcel_ids:
+        meta["subject_parcels"] = list(parcel_ids)
     out = base / "location.json"
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
@@ -732,7 +738,9 @@ def _new_job(slug: str, label: str, cx: float, cy: float,
 
 
 def enqueue_job(slug: str, label: str, cx: float, cy: float,
-                force_recompress: bool = False) -> str | None:
+                force_recompress: bool = False,
+                inner_half: float | None = None,
+                parcel_ids: list | None = None) -> str | None:
     """Add new job. Returns job_id, or None if a non-terminal job with the
     same slug is already queued or running (caller maps to 409).
 
@@ -750,6 +758,8 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
             if existing and existing["slug"] == slug:
                 return None
         job = _new_job(slug, label, cx, cy, force_recompress=force_recompress)
+        if inner_half is not None:
+            job["inner_half"] = inner_half
         JOBS[job["job_id"]] = job
         JOB_QUEUE.append(job["job_id"])
         JOB_CV.notify()   # vzbudí worker
@@ -757,7 +767,7 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
     # state contention. Failure is non-fatal: dashboard would just show
     # the slug instead of the human-readable label until next gen.
     try:
-        _persist_location_meta(slug, label, cx, cy)
+        _persist_location_meta(slug, label, cx, cy, inner_half, parcel_ids)
     except OSError as e:
         print(f"[enqueue_job] persist meta failed for {slug!r}: {e}")
     return job["job_id"]
@@ -851,7 +861,8 @@ _LOD_PRESET = {
 }
 
 
-def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
+def cmd_for(step: str, slug: str, cx: float, cy: float,
+            inner_half: float | None = None) -> list[str]:
     """Vyrobí subprocess command pro daný step. `--center-sjtsk=cx,cy`
     musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag).
     Raises ValueError for 'sm5' and 'compress' — those are in-process,
@@ -873,10 +884,13 @@ def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
         # top-level manifest gen_heightfield read from) is retired. gen_
         # heightfield will fall back to disk manifests only for legacy lokace
         # that already have one — new ones rely on these CLI args.
-        return base + [
+        cmd = base + [
             "gen_heightfield.py", "--slug", slug,
             f"--cx={cx}", f"--cy={cy}",
         ]
+        if inner_half is not None:
+            cmd += ["--inner-half", str(inner_half)]
+        return cmd
     p = _LOD_PRESET[step]
     return base + [
         "gen_detail.py",
@@ -956,7 +970,8 @@ def _run_step(job: dict, step: dict) -> bool:
         return False
 
     # === Subprocess step: panorama, outer, closeup, inner ===
-    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"])
+    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"],
+                  inner_half=job.get("inner_half"))
 
     try:
         try:

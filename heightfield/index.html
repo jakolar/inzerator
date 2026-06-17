@@ -108,6 +108,18 @@
     <label style="display:block;cursor:pointer;">
       <input id="ssao-toggle" type="checkbox"> 🏘 Okluzní stíny (SSAO)
     </label>
+    <label style="display:block;margin-top:4px;">
+      🎨 Tónování:
+      <select id="tone-select">
+        <option value="off">vyp</option>
+        <option value="agx">AgX</option>
+        <option value="aces">ACES</option>
+      </select>
+    </label>
+    <label style="display:block;">
+      Expozice: <input id="exp-slider" type="range" min="0.5" max="1.8" step="0.05" value="1" style="vertical-align:middle;">
+      <span id="exp-val">1.00</span>
+    </label>
   </details>
 
   <details open class="info-section">
@@ -346,11 +358,12 @@ const _CAD_FLIP = parseInt(URL_PARAMS.get('cadflip') ?? '0', 10);
 // Bypass postprocess (no parcel glow). For comparing ortho colours
 // against the pre-bloom direct-render baseline.
 const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
-// Tone-mapping A/B (?tone=agx|aces, ?exp=1.1). Default NoToneMapping — the
-// ortho is already colour-graded (docs/notes/2026-05-16-ortofoto-color-grading.md);
-// this is a verification tool, not a default. Applied by OutputPass (composer path).
-const _TONE = { __proto__: null, agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping }[
-  URL_PARAMS.get('tone')] ?? THREE.NoToneMapping;
+// Tone-mapping (?tone=agx|aces & ?exp=, or the "Efekty" UI). Default off — the
+// ortho is already colour-graded (docs/notes/2026-05-16-ortofoto-color-grading.md).
+// Applied by OutputPass; no effect under ?nobloom=1 (that path skips the composer).
+const TONE_MODES = { __proto__: null, off: THREE.NoToneMapping,
+  agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping };
+const _TONE = TONE_MODES[URL_PARAMS.get('tone')] ?? THREE.NoToneMapping;
 const _TONE_EXP = parseFloat(URL_PARAMS.get('exp') ?? '1') || 1.0;
 
 console.log('manifest:', manifest);
@@ -4448,6 +4461,24 @@ ssaoToggle.addEventListener('change', () => {
   if (ssaoToggle.checked && !ssaoPass) ssaoPass = initSSAO();
   if (ssaoPass) ssaoPass.enabled = ssaoToggle.checked;
 });
+
+// Tone-mapping UI — mirrors ?tone=/?exp=. OutputPass recompiles on a
+// toneMapping change and reads toneMappingExposure each frame, so we only push
+// to the renderer. No effect under ?nobloom=1 (that path bypasses the composer).
+const toneSelect = document.getElementById('tone-select');
+const expSlider = document.getElementById('exp-slider');
+const expVal = document.getElementById('exp-val');
+const _toneParam = URL_PARAMS.get('tone');
+toneSelect.value = (_toneParam === 'agx' || _toneParam === 'aces') ? _toneParam : 'off';
+expSlider.value = _TONE_EXP;
+expVal.textContent = _TONE_EXP.toFixed(2);
+function applyTone() {
+  renderer.toneMapping = TONE_MODES[toneSelect.value] ?? THREE.NoToneMapping;
+  renderer.toneMappingExposure = parseFloat(expSlider.value) || 1.0;
+  expVal.textContent = renderer.toneMappingExposure.toFixed(2);
+}
+toneSelect.addEventListener('change', applyTone);
+expSlider.addEventListener('input', applyTone);
 
 renderer.info.autoReset = false;   // accumulate across multiple render() calls per frame
 

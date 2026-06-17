@@ -806,3 +806,20 @@ def test_persist_location_meta_omits_selection_when_absent(tmp_path, monkeypatch
     import json as _json
     data = _json.loads((tmp_path / "tiles_v2_foo" / "location.json").read_text())
     assert "inner_half" not in data and "subject_parcels" not in data
+
+
+def test_parse_job_extent_empty():
+    assert locations.parse_job_extent({}) == (None, None)
+
+
+def test_parse_job_extent_values():
+    assert locations.parse_job_extent({"inner_half": 750}) == (750.0, None)
+    assert locations.parse_job_extent({"parcel_ids": [1, 2, 3]}) == (None, [1, 2, 3])
+
+
+def test_parse_job_extent_rejects_bad():
+    import pytest
+    for bad in ({"inner_half": -5}, {"inner_half": "x"}, {"inner_half": True},
+                {"parcel_ids": "x"}, {"parcel_ids": [1, "a"]}):
+        with pytest.raises(ValueError):
+            locations.parse_job_extent(bad)

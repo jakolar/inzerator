@@ -2,6 +2,7 @@
 gen_panorama.py + 3× gen_detail.py → exposes job state to UI."""
 from __future__ import annotations
 import json
+import math
 import re
 import subprocess
 import threading
@@ -735,6 +736,25 @@ def _new_job(slug: str, label: str, cx: float, cy: float,
             for name in STEP_NAMES
         ],
     }
+
+
+def parse_job_extent(body: dict):
+    """Extract optional (inner_half, parcel_ids) from a /api/jobs JSON body.
+    Returns (inner_half|None, parcel_ids|None). Raises ValueError on bad types
+    so the HTTP handler can map to 400."""
+    inner_half = body.get("inner_half")
+    if inner_half is not None:
+        if (isinstance(inner_half, bool) or not isinstance(inner_half, (int, float))
+                or not math.isfinite(inner_half) or inner_half <= 0):
+            raise ValueError("inner_half must be a positive finite number")
+        inner_half = float(inner_half)
+    parcel_ids = body.get("parcel_ids")
+    if parcel_ids is not None:
+        if (not isinstance(parcel_ids, list) or len(parcel_ids) > 500
+                or not all(isinstance(x, int) and not isinstance(x, bool)
+                           for x in parcel_ids)):
+            raise ValueError("parcel_ids must be a list of ≤500 ints")
+    return inner_half, parcel_ids
 
 
 def enqueue_job(slug: str, label: str, cx: float, cy: float,

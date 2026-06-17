@@ -4302,25 +4302,38 @@ class DepthSSAOPass extends Pass {
     });
     this._blurMat = new THREE.ShaderMaterial({
       uniforms: {
-        tAO:    { value: null },
-        uDepth: { value: depthTex },
-        uDir:   { value: new THREE.Vector2(1, 0) },
-        uTexel: { value: new THREE.Vector2(1 / this._aoRT.width, 1 / this._aoRT.height) },
+        tAO:      { value: null },
+        uDepth:   { value: depthTex },
+        uProjInv: { value: new THREE.Matrix4() },
+        uDir:     { value: new THREE.Vector2(1, 0) },
+        uTexel:   { value: new THREE.Vector2(1 / this._aoRT.width, 1 / this._aoRT.height) },
       },
       vertexShader: quadVS,
       fragmentShader: `
         varying vec2 vUv;
         uniform sampler2D tAO, uDepth;
+        uniform mat4 uProjInv;
         uniform vec2 uDir, uTexel;
+        // View-space (linear, metres) Z from window-space depth, so the
+        // bilateral weight measures real distance instead of perspective-warped
+        // [0,1] depth — the latter collapses near the camera (noise up close)
+        // and barely moves at the horizon (AO bleeds across far silhouettes).
+        float linZ(float d) {
+          vec4 p = uProjInv * vec4(0.0, 0.0, d * 2.0 - 1.0, 1.0);
+          return p.z / p.w;
+        }
         void main() {
-          float d0 = texture2D(uDepth, vUv).x;
+          float z0 = linZ(texture2D(uDepth, vUv).x);
+          // Edge-stop tolerance scales with distance (~2% of Z, ≥0.5 m) — tracks
+          // both depth precision and the AO radius growing with range.
+          float sigma = max(0.5, abs(z0) * 0.02);
           float sum = texture2D(tAO, vUv).r;
           float wsum = 1.0;
           for (int i = 1; i <= 3; i++) {
             vec2 off = uDir * uTexel * float(i);
             // depth-aware: don't bleed AO across silhouettes
-            float wA = exp(-abs(texture2D(uDepth, vUv + off).x - d0) * 4000.0);
-            float wB = exp(-abs(texture2D(uDepth, vUv - off).x - d0) * 4000.0);
+            float wA = exp(-abs(linZ(texture2D(uDepth, vUv + off).x) - z0) / sigma);
+            float wB = exp(-abs(linZ(texture2D(uDepth, vUv - off).x) - z0) / sigma);
             sum += texture2D(tAO, vUv + off).r * wA + texture2D(tAO, vUv - off).r * wB;
             wsum += wA + wB;
           }
@@ -4351,6 +4364,7 @@ class DepthSSAOPass extends Pass {
   render(renderer, writeBuffer, readBuffer) {
     const cam = this._cam;
     this._aoMat.uniforms.uProjInv.value.copy(cam.projectionMatrixInverse);
+    this._blurMat.uniforms.uProjInv.value.copy(cam.projectionMatrixInverse);
     this._aoMat.uniforms.uProjScale.value.set(
       cam.projectionMatrix.elements[0] * 0.5, cam.projectionMatrix.elements[5] * 0.5);
     // 1) raw AO at half res

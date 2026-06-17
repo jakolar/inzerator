@@ -520,8 +520,14 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
             pass
 
     try:
-        log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half=2500)…")
-        codes = _resolve_sm5_codes(job["cx"], job["cy"], half=2500)
+        # Pre-warm envelope: cover the closeup ring (3× clamped inner_half for
+        # selection-driven gen), floored at the legacy 2500 m so the default /
+        # RÚIAN flow is unchanged. The heightfield subprocess still self-heals
+        # any remaining gap via ensure_sm5_cached(fetch_missing=True).
+        _ih = job.get("inner_half")
+        sm5_half = max(2500.0, 3.0 * max(500.0, min(2000.0, _ih))) if _ih is not None else 2500
+        log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half={sm5_half})…")
+        codes = _resolve_sm5_codes(job["cx"], job["cy"], half=sm5_half)
         log(f"ČÚZK returned {len(codes)} sheet(s): {', '.join(codes)}")
     except RuianUnavailable as e:
         log(f"FAIL: {e}")

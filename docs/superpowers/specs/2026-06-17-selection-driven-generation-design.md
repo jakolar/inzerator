@@ -109,9 +109,12 @@ new fields as optional).
 - The selector app (subsystem A) — computes `cx/cy/inner_half/parcel_ids`.
 - Viewer highlight of `subject_parcels` (subsystem C).
 - Variable `ortho_size` / super-tier per model size (stays 4096).
-- Re-centring/extent for the in-process `sm5` step (it discovers sheets from
-  `cx ± half`; `ensure_sm5_cached` is already half-driven and will pick up the
-  larger closeup half automatically — verify in the plan, no design change).
+- The in-process `sm5` pre-warm step (`locations._do_sm5_download`) uses a fixed
+  `half=2500`. For large selections (closeup half up to 6000 m) it now derives
+  `max(2500, 3 × clamp(inner_half))` so the pre-warm matches the model extent;
+  even without that, the heightfield subprocess self-heals missing sheets via
+  `ensure_sm5_cached(fetch_missing=True)`, so a large extent never yields empty
+  ortho — only a slower first run.
 
 ## Testing
 

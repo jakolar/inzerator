@@ -24,3 +24,22 @@ def test_derive_rings_step_scales_with_half():
     closeup, inner = gh.derive_rings(1000)
     assert (inner["half"], inner["step"]) == (1000, 1.0)
     assert (closeup["half"], closeup["step"]) == (3000, 3.0)
+
+
+def test_resolve_rings_default_when_nothing_set():
+    assert gh.resolve_rings(None, None) is gh.DEFAULT_RINGS
+
+
+def test_resolve_rings_inner_half():
+    rings = gh.resolve_rings(None, 1000)
+    assert rings[1]["half"] == 1000 and rings[1]["step"] == 1.0
+
+
+def test_resolve_rings_file_wins(tmp_path):
+    import json
+    f = tmp_path / "rings.json"
+    f.write_text(json.dumps([{"slug": "x", "half": 42, "step": 1,
+                              "ortho_size": 4096, "max_z_error": 0.1}]))
+    rings = gh.resolve_rings(str(f), 1000)   # file takes precedence over inner_half
+    assert rings == [{"slug": "x", "half": 42, "step": 1,
+                      "ortho_size": 4096, "max_z_error": 0.1}]

@@ -58,6 +58,27 @@ def default_max_z_error_for_step(step: float) -> float:
     """
     return round(max(0.05, step / 7.0), 3)
 
+
+def derive_rings(inner_half):
+    """2-ring pyramid sized to a parcel selection (subsystem B).
+
+    inner_half (m) is clamped to [500, 2000]; closeup = 3× inner (today's
+    ratio); step = half/1000 keeps each ring a ~2000² grid so data stays
+    bounded as the model grows (detail-per-metre degrades instead). At
+    inner_half=500 the geometry equals DEFAULT_RINGS.
+    """
+    inner_half = max(500.0, min(2000.0, float(inner_half)))
+    closeup_half = 3.0 * inner_half
+    inner_step = inner_half / 1000.0
+    closeup_step = closeup_half / 1000.0
+    return [
+        {"slug": "closeup", "half": closeup_half, "step": closeup_step,
+         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(closeup_step)},
+        {"slug": "inner", "half": inner_half, "step": inner_step,
+         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(inner_step)},
+    ]
+
+
 # Ortho quality tiers — gen emits one JPEG per tier per ring so the viewer
 # can switch quality at runtime. `ortho_size` on a ring sets the HIGH-tier
 # resolution; low/mid are halved/quartered. Subsampling 0 = 4:4:4 (no chroma

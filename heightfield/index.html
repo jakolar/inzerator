@@ -112,8 +112,12 @@
       🎨 Tónování:
       <select id="tone-select">
         <option value="off">vyp</option>
+        <option value="linear">Linear</option>
+        <option value="reinhard">Reinhard</option>
+        <option value="cineon">Cineon</option>
         <option value="agx">AgX</option>
         <option value="aces">ACES</option>
+        <option value="neutral">Neutral</option>
       </select>
     </label>
     <label style="display:block;">
@@ -362,7 +366,9 @@ const _NO_BLOOM = URL_PARAMS.get('nobloom') === '1';
 // ortho is already colour-graded (docs/notes/2026-05-16-ortofoto-color-grading.md).
 // Applied by OutputPass; no effect under ?nobloom=1 (that path skips the composer).
 const TONE_MODES = { __proto__: null, off: THREE.NoToneMapping,
-  agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping };
+  linear: THREE.LinearToneMapping, reinhard: THREE.ReinhardToneMapping,
+  cineon: THREE.CineonToneMapping, agx: THREE.AgXToneMapping,
+  aces: THREE.ACESFilmicToneMapping, neutral: THREE.NeutralToneMapping };
 const _TONE = TONE_MODES[URL_PARAMS.get('tone')] ?? THREE.NoToneMapping;
 const _TONE_EXP = parseFloat(URL_PARAMS.get('exp') ?? '1') || 1.0;
 
@@ -4469,7 +4475,7 @@ const toneSelect = document.getElementById('tone-select');
 const expSlider = document.getElementById('exp-slider');
 const expVal = document.getElementById('exp-val');
 const _toneParam = URL_PARAMS.get('tone');
-toneSelect.value = (_toneParam === 'agx' || _toneParam === 'aces') ? _toneParam : 'off';
+toneSelect.value = (_toneParam && (_toneParam in TONE_MODES)) ? _toneParam : 'off';
 expSlider.value = _TONE_EXP;
 expVal.textContent = _TONE_EXP.toFixed(2);
 function applyTone() {

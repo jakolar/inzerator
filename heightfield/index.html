@@ -4157,16 +4157,55 @@ const combineShader = new THREE.ShaderMaterial({
     }
   `,
 });
-// Canvas `antialias: true` never applies through the composer (it renders
-// into offscreen targets), so building edges alias. Explicit MSAA 4× target
-// fixes that; HalfFloatType keeps the HDR sky's >1.0 values for the bloom
-// combine + tone mapping. bloomComposer stays non-MSAA — its output is
-// blurred anyway. setSize/setPixelRatio preserve `samples`.
+// Canvas `antialias: true` never applies through the composer (it renders into
+// offscreen targets), so building edges alias. We multisample ONLY the scene
+// render (MSAAScenePass); the composer's two ping-pong buffers stay non-MSAA so
+// the fullscreen post passes (bloom combine, tilt-shift, SSAO, output) don't
+// each pay a 4× resolve. HalfFloatType throughout keeps the HDR sky's >1.0
+// values for the bloom combine + tone mapping. bloomComposer stays non-MSAA.
+class MSAAScenePass extends Pass {
+  constructor(scene, camera, samples) {
+    super();
+    this.scene = scene;
+    this.camera = camera;
+    this.needsSwap = false;   // like RenderPass: the scene ends up in readBuffer
+    const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+    this._rt = new THREE.WebGLRenderTarget(s.x, s.y, { samples, type: THREE.HalfFloatType });
+    this._copy = new FullScreenQuad(new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: null } },
+      depthTest: false, depthWrite: false,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+      `,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform sampler2D tDiffuse;
+        void main() { gl_FragColor = texture2D(tDiffuse, vUv); }
+      `,
+    }));
+  }
+  setSize(w, h) { this._rt.setSize(w, h); }
+  // SSAO lazily attaches a DepthTexture to the multisampled scene target
+  // (resolved on blit); dispose() forces a framebuffer rebuild with the new
+  // attachment. The default session never allocates it.
+  attachDepth(depthTex) { this._rt.depthTexture = depthTex; this._rt.dispose(); }
+  render(renderer, writeBuffer, readBuffer) {
+    renderer.setRenderTarget(this._rt);
+    renderer.clear();
+    renderer.render(this.scene, this.camera);
+    // Switching target resolves MSAA → _rt.texture; copy it into readBuffer.
+    this._copy.material.uniforms.tDiffuse.value = this._rt.texture;
+    renderer.setRenderTarget(this.renderToScreen ? null : readBuffer);
+    this._copy.render(renderer);
+  }
+}
 const finalComposer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(
-  innerWidth, innerHeight, { samples: 4, type: THREE.HalfFloatType }));
+  innerWidth, innerHeight, { type: THREE.HalfFloatType }));
 finalComposer.setPixelRatio(renderer.getPixelRatio());
 finalComposer.setSize(innerWidth, innerHeight);
-finalComposer.addPass(new RenderPass(scene, camera));
+const scenePass = new MSAAScenePass(scene, camera, 4);
+finalComposer.addPass(scenePass);
 finalComposer.addPass(new ShaderPass(combineShader, 'baseTexture'));
 // ── Tilt-shift ("miniature" effect, opt-in) ──
 // Separable Gaussian whose radius grows with vertical distance from a
@@ -4392,20 +4431,15 @@ class DepthSSAOPass extends Pass {
 
 let ssaoPass = null;
 function initSSAO() {
-  // Rebuild the composer's ping-pong targets with a shared DepthTexture so
-  // the depth of the real (displaced) render is samplable. BOTH targets get
-  // the SAME instance — RenderPass writes into whichever buffer is current,
-  // and the AO shader always reads this one texture. three 0.170 resolves
-  // multisampled depth into the attached DepthTexture on blit.
+  // Attach a DepthTexture to the multisampled scene target so the AO shader can
+  // sample the real (displaced) render's depth. three 0.170 resolves the
+  // multisampled depth into the attached texture on blit. Lazy — the default
+  // session never allocates it; the composer's ping-pong buffers are untouched.
   const s = renderer.getDrawingBufferSize(new THREE.Vector2());
   const depthTex = new THREE.DepthTexture(s.x, s.y);
-  const rt = new THREE.WebGLRenderTarget(s.x, s.y, {
-    samples: 4, type: THREE.HalfFloatType, depthTexture: depthTex,
-  });
-  finalComposer.reset(rt);
-  finalComposer.renderTarget2.depthTexture = depthTex;
+  scenePass.attachDepth(depthTex);
   const pass = new DepthSSAOPass(depthTex, camera);
-  finalComposer.insertPass(pass, 1);   // directly after RenderPass, before bloom combine
+  finalComposer.insertPass(pass, 1);   // after the scene pass, before bloom combine
   return pass;
 }
 
@@ -4527,9 +4561,11 @@ function estimateGpuMB() {
   const dpr = renderer.getPixelRatio();
   const composerRtBytes = innerWidth * innerHeight * dpr * dpr * 8;
   if (bloomComposer) total += composerRtBytes * 2;   // bloomComposer 2 RTs
-  // finalComposer is MSAA 4×: each of its 2 RTs carries an extra 4-sample
-  // multisample renderbuffer besides the resolve texture → (1 + 4)× per RT.
-  if (finalComposer) total += composerRtBytes * 2 * 5;
+  // finalComposer ping-pong: 2 plain (non-MSAA) HalfFloat RTs.
+  if (finalComposer) total += composerRtBytes * 2;
+  // MSAAScenePass: one scene target carrying a 4-sample multisample renderbuffer
+  // besides the resolve texture → (1 + 4)× one RT.
+  if (typeof scenePass !== 'undefined') total += composerRtBytes * 5;
   // SSAO (lazy): full-res DepthTexture (4 B/px) + two colour-only half-res AO targets.
   if (ssaoPass) total += innerWidth * innerHeight * dpr * dpr * 4 + 2 * Math.ceil(innerWidth * dpr / 2) * Math.ceil(innerHeight * dpr / 2) * 4;
   // UnrealBloomPass adds 5 mip-chain RTs at half/quarter sizes.
@@ -4624,14 +4660,15 @@ async function disposeAllAssets() {
     m.geometry.dispose();
   }
   // Don't dispose _parcelLineMat / _emissiveMat — singleton materials, cheap to keep.
-  // Composer targets are the biggest remaining block after the MSAA upgrade
-  // (2 × (1+4 samples) × 8 B/px ≈ 170 MB at iPad retina) — drop them too.
-  // EffectComposer re-allocates GL storage transparently on the next render.
+  // Composer + scene targets are the biggest remaining block (the MSAA scene
+  // target alone is (1+4)× × 8 B/px). EffectComposer and our passes re-allocate
+  // GL storage transparently on the next render.
   bloomComposer?.renderTarget1.dispose(); bloomComposer?.renderTarget2.dispose();
   finalComposer?.renderTarget1.dispose(); finalComposer?.renderTarget2.dispose();
+  scenePass?._rt.dispose();
   if (ssaoPass) {
     ssaoPass._aoRT.dispose(); ssaoPass._blurRT.dispose();
-    finalComposer.renderTarget1.depthTexture?.dispose();
+    scenePass._rt.depthTexture?.dispose();
   }
   // Bump epoch LAST so any in-flight loader notices on its next await
   // boundary and bails before writing into the just-cleared caches.

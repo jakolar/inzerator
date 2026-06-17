@@ -4785,9 +4785,6 @@ async function reloadAllAssets() {
     // redrawOutlines runs after parcels finish loading (handler awaits it).
   }
   _savedToggleState = null;
-  // Re-populate CPU heightmaps for the camera floor (disposeAllAssets nulled
-  // them); otherwise the floor stays on the flat fallback until a toggle reloads it.
-  ensureHeightDataLoaded().catch(() => {});
   console.info(`[unload] reloaded in ${((performance.now() - t0)/1000).toFixed(2)} s`);
 }
 

@@ -3642,9 +3642,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 except OSError as e:
                     self._send_json(500, {"error": f"could not drop .compress_ok: {e}"})
                     return
+        try:
+            inner_half, parcel_ids = locations.parse_job_extent(body)
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
         # 'partial' or 'missing' = OK; worker will resume-skip completed steps
         job_id = locations.enqueue_job(slug, label, cx, cy,
-                                       force_recompress=force_recompress)
+                                       force_recompress=force_recompress,
+                                       inner_half=inner_half,
+                                       parcel_ids=parcel_ids)
         if job_id is None:
             self._send_json(409, {"error": f"a job for slug '{slug}' is already queued or running"})
             return

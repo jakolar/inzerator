@@ -58,6 +58,45 @@ def default_max_z_error_for_step(step: float) -> float:
     """
     return round(max(0.05, step / 7.0), 3)
 
+
+def derive_rings(inner_half):
+    """2-ring pyramid sized to a parcel selection (subsystem B).
+
+    inner_half (m) is clamped to [500, 2000]; closeup = 3× inner (today's
+    ratio); step = half/1000 keeps each ring a ~2000² grid so data stays
+    bounded as the model grows (detail-per-metre degrades instead). At
+    inner_half=500 the geometry equals DEFAULT_RINGS.
+    """
+    inner_half = max(500.0, min(2000.0, float(inner_half)))
+    closeup_half = 3.0 * inner_half
+    inner_step = inner_half / 1000.0
+    closeup_step = closeup_half / 1000.0
+    return [
+        {"slug": "closeup", "half": closeup_half, "step": closeup_step,
+         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(closeup_step)},
+        {"slug": "inner", "half": inner_half, "step": inner_step,
+         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(inner_step)},
+    ]
+
+
+def resolve_rings(rings_file, inner_half):
+    """Pick the ring list: explicit --rings file wins (loaded + validated),
+    then --inner-half (selection-driven), else fixed DEFAULT_RINGS (legacy)."""
+    if rings_file:
+        rings = json.loads(Path(rings_file).read_text())
+        for r in rings:
+            for k in ("slug", "half", "step", "ortho_size"):
+                if k not in r:
+                    raise SystemExit(f"--rings entry missing '{k}': {r}")
+            # max_z_error optional in custom JSON; derive from step otherwise.
+            if "max_z_error" not in r:
+                r["max_z_error"] = default_max_z_error_for_step(r["step"])
+        return rings
+    if inner_half is not None:
+        return derive_rings(inner_half)
+    return DEFAULT_RINGS
+
+
 # Ortho quality tiers — gen emits one JPEG per tier per ring so the viewer
 # can switch quality at runtime. `ortho_size` on a ring sets the HIGH-tier
 # resolution; low/mid are halved/quartered. Subsampling 0 = 4:4:4 (no chroma
@@ -739,6 +778,11 @@ def main():
     p.add_argument("--rings", default=None,
                    help="JSON file with [{slug, half, step, ortho_size}, …] "
                         "(default: 5km/3km/1km outer/closeup/inner preset)")
+    p.add_argument("--inner-half", type=float, default=None,
+                   help="inner-ring half-extent in m (selection-driven gen). "
+                        "Builds a 2-ring pyramid via derive_rings (clamped "
+                        "500–2000). Ignored if --rings is given. Default: "
+                        "DEFAULT_RINGS fixed preset.")
     p.add_argument("--no-cadastre", action="store_true",
                    help="skip cadastre fetch (saves ~500 KB/ring, but viewer "
                         "won't have parcel boundaries unless it fetches live)")
@@ -810,20 +854,14 @@ def main():
         else:
             print(f"LERC mode, per-ring max z-error")
 
-    rings = DEFAULT_RINGS
+    rings = resolve_rings(args.rings, args.inner_half)
     if args.rings:
-        rings = json.loads(Path(args.rings).read_text())
-        for r in rings:
-            for k in ("slug", "half", "step", "ortho_size"):
-                if k not in r:
-                    raise SystemExit(f"--rings entry missing '{k}': {r}")
-            # max_z_error is optional in custom rings JSON; fall back to a
-            # value derived from grid step so the output isn't accidentally
-            # archival-grade (smallest possible error → largest possible file).
-            if "max_z_error" not in r:
-                r["max_z_error"] = default_max_z_error_for_step(r["step"])
         print(f"Using custom rings from {args.rings}: "
               f"{[r['slug'] for r in rings]}")
+    elif args.inner_half is not None:
+        print(f"Using selection-driven rings (inner_half={args.inner_half}): "
+              f"inner half={rings[1]['half']} step={rings[1]['step']}, "
+              f"closeup half={rings[0]['half']} step={rings[0]['step']}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

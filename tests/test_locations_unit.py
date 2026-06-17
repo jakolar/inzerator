@@ -777,3 +777,49 @@ def test_worker_unlinks_partial_manifest_on_failure(tmp_path, monkeypatch, clean
     assert job["steps"][1]["state"] == "fail"
     assert not locations.expected_glb("test", "heightfield").exists(), \
         "partial heightfield manifest must be deleted on failure"
+
+
+def test_cmd_for_heightfield_inner_half():
+    cmd = locations.cmd_for("heightfield", "foo", -1.0, -2.0, inner_half=750)
+    assert "--inner-half" in cmd
+    assert cmd[cmd.index("--inner-half") + 1] == "750"
+
+
+def test_cmd_for_heightfield_no_inner_half():
+    cmd = locations.cmd_for("heightfield", "foo", -1.0, -2.0)
+    assert "--inner-half" not in cmd
+
+
+def test_persist_location_meta_selection_fields(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    locations._persist_location_meta("foo", "Foo", -1.0, -2.0,
+                                     inner_half=750, parcel_ids=[11, 22])
+    import json as _json
+    data = _json.loads((tmp_path / "tiles_v2_foo" / "location.json").read_text())
+    assert data["inner_half"] == 750
+    assert data["subject_parcels"] == [11, 22]
+
+
+def test_persist_location_meta_omits_selection_when_absent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    locations._persist_location_meta("foo", "Foo", -1.0, -2.0)
+    import json as _json
+    data = _json.loads((tmp_path / "tiles_v2_foo" / "location.json").read_text())
+    assert "inner_half" not in data and "subject_parcels" not in data
+
+
+def test_parse_job_extent_empty():
+    assert locations.parse_job_extent({}) == (None, None)
+
+
+def test_parse_job_extent_values():
+    assert locations.parse_job_extent({"inner_half": 750}) == (750.0, None)
+    assert locations.parse_job_extent({"parcel_ids": [1, 2, 3]}) == (None, [1, 2, 3])
+
+
+def test_parse_job_extent_rejects_bad():
+    import pytest
+    for bad in ({"inner_half": -5}, {"inner_half": "x"}, {"inner_half": True},
+                {"parcel_ids": "x"}, {"parcel_ids": [1, "a"]}):
+        with pytest.raises(ValueError):
+            locations.parse_job_extent(bad)

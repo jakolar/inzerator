@@ -2,6 +2,7 @@
 gen_panorama.py + 3× gen_detail.py → exposes job state to UI."""
 from __future__ import annotations
 import json
+import math
 import re
 import subprocess
 import threading
@@ -89,7 +90,9 @@ def location_status(slug: str) -> str:
     return "partial"
 
 
-def _persist_location_meta(slug: str, label: str, cx: float, cy: float) -> None:
+def _persist_location_meta(slug: str, label: str, cx: float, cy: float,
+                           inner_half: float | None = None,
+                           parcel_ids: list | None = None) -> None:
     """Write tiles_v2_<slug>/location.json with {slug, label, cx, cy} so
     the label survives the only on-disk persistence path we have now that
     the v2 top-level manifest is no longer written. Called at job enqueue
@@ -98,6 +101,10 @@ def _persist_location_meta(slug: str, label: str, cx: float, cy: float) -> None:
     base.mkdir(parents=True, exist_ok=True)
     meta = {"slug": slug, "label": label, "cx": cx, "cy": cy,
             "created_at": time.time()}
+    if inner_half is not None:
+        meta["inner_half"] = inner_half
+    if parcel_ids:
+        meta["subject_parcels"] = list(parcel_ids)
     out = base / "location.json"
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
@@ -513,8 +520,14 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
             pass
 
     try:
-        log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half=2500)…")
-        codes = _resolve_sm5_codes(job["cx"], job["cy"], half=2500)
+        # Pre-warm envelope: cover the closeup ring (3× clamped inner_half for
+        # selection-driven gen), floored at the legacy 2500 m so the default /
+        # RÚIAN flow is unchanged. The heightfield subprocess still self-heals
+        # any remaining gap via ensure_sm5_cached(fetch_missing=True).
+        _ih = job.get("inner_half")
+        sm5_half = max(2500.0, 3.0 * max(500.0, min(2000.0, _ih))) if _ih is not None else 2500
+        log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half={sm5_half})…")
+        codes = _resolve_sm5_codes(job["cx"], job["cy"], half=sm5_half)
         log(f"ČÚZK returned {len(codes)} sheet(s): {', '.join(codes)}")
     except RuianUnavailable as e:
         log(f"FAIL: {e}")
@@ -731,8 +744,29 @@ def _new_job(slug: str, label: str, cx: float, cy: float,
     }
 
 
+def parse_job_extent(body: dict):
+    """Extract optional (inner_half, parcel_ids) from a /api/jobs JSON body.
+    Returns (inner_half|None, parcel_ids|None). Raises ValueError on bad types
+    so the HTTP handler can map to 400."""
+    inner_half = body.get("inner_half")
+    if inner_half is not None:
+        if (isinstance(inner_half, bool) or not isinstance(inner_half, (int, float))
+                or not math.isfinite(inner_half) or inner_half <= 0):
+            raise ValueError("inner_half must be a positive finite number")
+        inner_half = float(inner_half)
+    parcel_ids = body.get("parcel_ids")
+    if parcel_ids is not None:
+        if (not isinstance(parcel_ids, list) or len(parcel_ids) > 500
+                or not all(isinstance(x, int) and not isinstance(x, bool)
+                           for x in parcel_ids)):
+            raise ValueError("parcel_ids must be a list of ≤500 ints")
+    return inner_half, parcel_ids
+
+
 def enqueue_job(slug: str, label: str, cx: float, cy: float,
-                force_recompress: bool = False) -> str | None:
+                force_recompress: bool = False,
+                inner_half: float | None = None,
+                parcel_ids: list | None = None) -> str | None:
     """Add new job. Returns job_id, or None if a non-terminal job with the
     same slug is already queued or running (caller maps to 409).
 
@@ -750,6 +784,8 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
             if existing and existing["slug"] == slug:
                 return None
         job = _new_job(slug, label, cx, cy, force_recompress=force_recompress)
+        if inner_half is not None:
+            job["inner_half"] = inner_half
         JOBS[job["job_id"]] = job
         JOB_QUEUE.append(job["job_id"])
         JOB_CV.notify()   # vzbudí worker
@@ -757,7 +793,7 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
     # state contention. Failure is non-fatal: dashboard would just show
     # the slug instead of the human-readable label until next gen.
     try:
-        _persist_location_meta(slug, label, cx, cy)
+        _persist_location_meta(slug, label, cx, cy, inner_half, parcel_ids)
     except OSError as e:
         print(f"[enqueue_job] persist meta failed for {slug!r}: {e}")
     return job["job_id"]
@@ -851,7 +887,8 @@ _LOD_PRESET = {
 }
 
 
-def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
+def cmd_for(step: str, slug: str, cx: float, cy: float,
+            inner_half: float | None = None) -> list[str]:
     """Vyrobí subprocess command pro daný step. `--center-sjtsk=cx,cy`
     musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag).
     Raises ValueError for 'sm5' and 'compress' — those are in-process,
@@ -873,10 +910,13 @@ def cmd_for(step: str, slug: str, cx: float, cy: float) -> list[str]:
         # top-level manifest gen_heightfield read from) is retired. gen_
         # heightfield will fall back to disk manifests only for legacy lokace
         # that already have one — new ones rely on these CLI args.
-        return base + [
+        cmd = base + [
             "gen_heightfield.py", "--slug", slug,
             f"--cx={cx}", f"--cy={cy}",
         ]
+        if inner_half is not None:
+            cmd += ["--inner-half", str(inner_half)]
+        return cmd
     p = _LOD_PRESET[step]
     return base + [
         "gen_detail.py",
@@ -956,7 +996,8 @@ def _run_step(job: dict, step: dict) -> bool:
         return False
 
     # === Subprocess step: panorama, outer, closeup, inner ===
-    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"])
+    cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"],
+                  inner_half=job.get("inner_half"))
 
     try:
         try:

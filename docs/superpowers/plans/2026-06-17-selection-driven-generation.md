@@ -146,10 +146,18 @@ Expected: FAIL — `resolve_rings` not defined.
 
 ```python
 def resolve_rings(rings_file, inner_half):
-    """Pick the ring list: explicit --rings file wins, then --inner-half
-    (selection-driven), else the fixed DEFAULT_RINGS (legacy RÚIAN flow)."""
+    """Pick the ring list: explicit --rings file wins (loaded + validated),
+    then --inner-half (selection-driven), else fixed DEFAULT_RINGS (legacy)."""
     if rings_file:
-        return json.loads(Path(rings_file).read_text())
+        rings = json.loads(Path(rings_file).read_text())
+        for r in rings:
+            for k in ("slug", "half", "step", "ortho_size"):
+                if k not in r:
+                    raise SystemExit(f"--rings entry missing '{k}': {r}")
+            # max_z_error optional in custom JSON; derive from step otherwise.
+            if "max_z_error" not in r:
+                r["max_z_error"] = default_max_z_error_for_step(r["step"])
+        return rings
     if inner_half is not None:
         return derive_rings(inner_half)
     return DEFAULT_RINGS
@@ -165,15 +173,7 @@ def resolve_rings(rings_file, inner_half):
                         "DEFAULT_RINGS fixed preset.")
 ```
 
-- [ ] **Step 5: Use `resolve_rings` at the resolution site.** Replace the block at `gen_heightfield.py:813–825` that currently reads:
-
-```python
-    rings = DEFAULT_RINGS
-    if args.rings:
-        rings = json.loads(Path(args.rings).read_text())
-```
-
-(through its `print(f"Using custom rings from {args.rings}: …")` line) with:
+- [ ] **Step 5: Use `resolve_rings` at the resolution site.** Replace the whole block (~`gen_heightfield.py:834–847`) that starts `rings = DEFAULT_RINGS`, loads + validates `--rings`, and prints "Using custom rings…" — i.e. from `rings = DEFAULT_RINGS` through the closing `f"{[r['slug'] for r in rings]}")` print — with (the validation now lives inside `resolve_rings`):
 
 ```python
     rings = resolve_rings(args.rings, args.inner_half)

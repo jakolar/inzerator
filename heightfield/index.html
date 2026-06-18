@@ -2802,6 +2802,27 @@ parcelsToggle.addEventListener('change', async () => {
   redrawOutlines();
 });
 
+// ── Subject-parcel highlight (subsystem C) ──
+// Generation (subsystem B) persists the listing's subject parcels in
+// tiles_v2_<slug>/location.json. Pre-seed the selection and trigger the
+// parcels overlay so the model opens with the property highlighted. Ids are
+// normalised to strings (/api/parcels returns string ids; B persists ints).
+// Optional file / missing field / unknown ids → silent no-op.
+(async () => {
+  try {
+    const loc = await fetch(`/tiles_v2_${slug}/location.json?t=${Date.now()}`)
+      .then(r => r.ok ? r.json() : null);
+    const subj = loc?.subject_parcels;
+    if (Array.isArray(subj) && subj.length) {
+      for (const id of subj) selectedParcels.add(String(id));
+      parcelsToggle.checked = true;
+      parcelsToggle.dispatchEvent(new Event('change'));
+    }
+  } catch (e) {
+    console.warn('[subject] location.json highlight skipped:', e);
+  }
+})();
+
 parcelsClear.addEventListener('click', () => {
   selectedParcels.clear();
   redrawOutlines();

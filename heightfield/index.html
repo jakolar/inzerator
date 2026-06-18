@@ -3641,16 +3641,33 @@ poiToggle.addEventListener('change', async () => {
 // preset azimuth/pitch combos, then opens a grid modal where the
 // user picks which shots to (a) download or (b) send to the AI
 // image-edit endpoint for cleanup.
-const CAPTURE_ANGLES = [
-  // 8× outer ring, oblique (25° from horizontal — landscape feel)
-  ...[0, 45, 90, 135, 180, 225, 270, 315].map(az => ({ az, pitch: 25, tier: 'oblique' })),
-  // 4× medium pitch (50° — drone-like)
-  ...[0, 90, 180, 270].map(az => ({ az, pitch: 50, tier: 'medium' })),
-  // 4× high pitch (70° — near-overhead)
-  ...[0, 90, 180, 270].map(az => ({ az, pitch: 70, tier: 'high' })),
-  // 4× near-top-down (88°)
-  ...[0, 90, 180, 270].map(az => ({ az, pitch: 88, tier: 'top' })),
+// ── Parcel-size-aware capture angles ──
+// Pitch scales with parcel size: a large parcel viewed at a grazing 25° is
+// foreshortened and doesn't fit the frame, so the floor rises toward top-down;
+// a small parcel keeps today's landscape angles. maxR = max parcel radius (m).
+// sizeT ramps 0→1 over [R_SMALL, R_LARGE], clamped. Each tier lerps between a
+// small-parcel preset (today's values — regression anchor at maxR≤20) and a
+// large-parcel preset (raised floor, top unchanged). 8/4/4/4 = 20 shots, same
+// azimuths. Returns { az, pitch, tier }[] (pitch = degrees above horizontal).
+const CAPTURE_R_SMALL = 20;    // m — small residential lot radius
+const CAPTURE_R_LARGE = 150;   // m — large field; full top-shift at/above
+// [small°, large°] pitch band per tier.
+const CAPTURE_TIERS = [
+  { azs: [0, 45, 90, 135, 180, 225, 270, 315], tier: 'oblique', small: 25, large: 45 },
+  { azs: [0, 90, 180, 270],                     tier: 'medium',  small: 50, large: 60 },
+  { azs: [0, 90, 180, 270],                     tier: 'high',    small: 70, large: 75 },
+  { azs: [0, 90, 180, 270],                     tier: 'top',     small: 88, large: 88 },
 ];
+function captureAngles(maxR) {
+  const sizeT = Math.min(1, Math.max(0,
+    (maxR - CAPTURE_R_SMALL) / (CAPTURE_R_LARGE - CAPTURE_R_SMALL)));
+  const out = [];
+  for (const t of CAPTURE_TIERS) {
+    const pitch = t.small + (t.large - t.small) * sizeT;
+    for (const az of t.azs) out.push({ az, pitch, tier: t.tier });
+  }
+  return out;
+}
 
 let _captureShots = [];   // array of { blob, dataUrl, az, pitch, tier, selected }
 // Distance = parcelRadius × multiplier. User-tunable via the slider in
@@ -3682,6 +3699,9 @@ async function captureParcelAngles() {
     maxR = Math.max(maxR, Math.hypot(dx, dz));
   }
   const distance = Math.max(100, maxR * _captureDistMul);
+  // Size-aware angle set (pitch rises toward top-down for large parcels).
+  const angles = captureAngles(maxR);
+  const obliqueFloor = angles[0].pitch;   // resolved oblique-tier pitch, for the label
   // Remember the parcel for the re-capture button — same lot, new
   // multiplier, no need to click on the canvas again.
   _captureCurrentParcel = p;
@@ -3706,7 +3726,7 @@ async function captureParcelAngles() {
   const statusEl = document.getElementById('capture-status');
   const resultsEl = document.getElementById('capture-results');
   modal.style.display = 'block';
-  statusEl.textContent = `načítám 0/${CAPTURE_ANGLES.length}…`;
+  statusEl.textContent = `načítám 0/${angles.length}…`;
   // New capture session — keep previous batches above so the user has
   // a chronological history (newest at top) and can compare results
   // across different distance multipliers without losing the old ones.
@@ -3721,7 +3741,7 @@ async function captureParcelAngles() {
     'border-bottom:1px solid #2a2e36;display:flex;justify-content:space-between;align-items:center;';
   sessionHeader.innerHTML =
     `<span><b style="color:#e7e9ee;">Náhledy ${sessionTs.toLocaleTimeString('cs-CZ')}</b> ` +
-    `· ${_captureDistMul}× · vzdálenost ${distance.toFixed(0)} m</span>`;
+    `· ${_captureDistMul}× · vzdálenost ${distance.toFixed(0)} m · pitch od ${obliqueFloor.toFixed(0)}°</span>`;
   // Prepend so newest session shows at the top.
   if (grid.firstChild) grid.insertBefore(sessionHeader, grid.firstChild);
   else grid.appendChild(sessionHeader);
@@ -3735,8 +3755,8 @@ async function captureParcelAngles() {
   const targetSceneY = centroid.y - yMid;
 
   try {
-    for (let i = 0; i < CAPTURE_ANGLES.length; i++) {
-      const { az, pitch, tier } = CAPTURE_ANGLES[i];
+    for (let i = 0; i < angles.length; i++) {
+      const { az, pitch, tier } = angles[i];
       // Convert spherical (az, pitch above horizontal) → cartesian.
       const phi = pitch * Math.PI / 180;          // angle ABOVE horizontal
       const theta = az * Math.PI / 180;            // azimuth (0 = +Z south, CW)
@@ -3775,7 +3795,7 @@ async function captureParcelAngles() {
                       ts: Date.now(), sessionIdx: sessionStart,
                       selected: false };
       _captureShots.push(shot);
-      statusEl.textContent = `${i + 1}/${CAPTURE_ANGLES.length}…`;
+      statusEl.textContent = `${i + 1}/${angles.length}…`;
       // Insert each thumb directly after the previously-inserted node
       // so the session block stays in chronological order (first shot
       // = top-left of the session block).

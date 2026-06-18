@@ -29,8 +29,11 @@ Relevant existing pieces (all in `heightfield/index.html`):
   `redrawOutlines()`, and the `parcelsToggle` (`#parcels-toggle`) change handler
   which awaits `Promise.all([ensureParcels(), ensureHeightDataLoaded()])`, sets
   `outlineGroup.visible = true`, and calls `redrawOutlines()`.
-- `/api/parcels` returns each parcel's `id` as a **string** (`str(attrs["id"])`,
-  `server.py`).
+- `/api/parcels` returns each parcel's `id` as a **string built from a float** —
+  the ČÚZK id is numeric, so `str(attrs["id"])` yields e.g. `"959535737.0"`
+  (note the trailing `.0`). B persists `subject_parcels` as **ints**
+  (`959535737`). So `String(959535737) === "959535737"` ≠ `"959535737.0"` — the
+  ids must be matched **numerically** (`Number(...)`), not by string equality.
 
 ## Design
 
@@ -49,27 +52,34 @@ missing/empty `subject_parcels` is a silent no-op (no highlight, no error).
 
 ### Highlight (reuse the existing overlay)
 
-When `location.json.subject_parcels` is a non-empty array:
+When `location.json.subject_parcels` is a non-empty array, load the overlay
+first, then highlight by **numeric** id match (can't seed-by-string because of
+the `.0` id format above):
 
-1. **Normalise ids to strings** and seed the selection — the viewer keys
-   everything on the string `p.id` from `/api/parcels`, while B persists ints:
-   ```js
-   for (const id of subj) selectedParcels.add(String(id));
-   ```
-2. **Reflect + trigger the overlay** by reusing the toggle handler verbatim:
+1. Build a numeric want-set: `const want = new Set(subj.map(Number));`
+2. Check the box + load the data (replicating the toggle handler's load, since
+   the matching parcels' ids aren't known until `parcels` is fetched):
    ```js
    parcelsToggle.checked = true;
-   parcelsToggle.dispatchEvent(new Event('change'));
+   parcelsToggle.disabled = true;
+   await Promise.all([ensureParcels(), ensureHeightDataLoaded()]);
+   parcelsToggle.disabled = false;
    ```
-   The handler then loads parcels + heightData, shows `outlineGroup`, and
-   `redrawOutlines()` draws exactly the seeded subject set with the normal
-   selection style. The checkbox shows checked, so the UI is consistent and the
-   user can deselect/add as usual.
+3. Add each loaded parcel whose id matches numerically (storing the parcel's OWN
+   `p.id`, so `redrawOutlines`' `parcelsById.get(p.id)` lookup hits), then show:
+   ```js
+   for (const p of (parcels || [])) {
+     if (p.id && want.has(Number(p.id))) selectedParcels.add(p.id);
+   }
+   outlineGroup.visible = true;
+   redrawOutlines();
+   ```
 
+The checkbox shows checked (UI consistent; the user can deselect/add as usual).
 This runs once at startup, after the parcels machinery is defined (so
-`parcelsToggle`, `selectedParcels`, `ensureParcels`, `redrawOutlines`, `asset`
-all exist) — i.e. near the parcels-overlay setup / end of module init, inside a
-`try/catch` that logs and continues on any failure.
+`parcelsToggle`, `parcels`, `selectedParcels`, `ensureParcels`, `redrawOutlines`
+all exist) — i.e. right after the parcels-toggle handler — inside a `try/catch`
+that logs and continues on any failure.
 
 ### Edge cases
 
@@ -81,8 +91,8 @@ all exist) — i.e. near the parcels-overlay setup / end of module init, inside 
 - **Hidden-tab unload/reload** (`_savedToggleState`): the subject ids live in
   `selectedParcels` like any selection, so the existing save/restore path
   preserves them across a reload cycle — no extra wiring.
-- **Id type**: always compare/store as `String(id)` so int-persisted ids match
-  the string `p.id`.
+- **Id type**: match numerically (`Number(p.id)` vs `Number(subjId)`) and store
+  the parcel's own `p.id`; never string-compare (the `.0` float format breaks it).
 
 ## Out of scope
 

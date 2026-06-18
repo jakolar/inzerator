@@ -2804,20 +2804,27 @@ parcelsToggle.addEventListener('change', async () => {
 
 // ── Subject-parcel highlight (subsystem C) ──
 // Generation (subsystem B) persists the listing's subject parcels in
-// tiles_v2_<slug>/location.json. Pre-seed the selection and trigger the
-// parcels overlay so the model opens with the property highlighted. Ids are
-// normalised to strings (/api/parcels returns string ids; B persists ints).
-// Optional file / missing field / unknown ids → silent no-op.
+// tiles_v2_<slug>/location.json. Load the parcels overlay, then highlight the
+// matches — compared NUMERICALLY: /api/parcels returns ids like "959535737.0"
+// (ČÚZK id is a float) while B persists the int 959535737, so String() compare
+// would miss. We add each loaded parcel's own id so redrawOutlines' parcelsById
+// lookup hits. Optional file / missing field / unknown ids → silent no-op.
 (async () => {
   try {
     const loc = await fetch(`/tiles_v2_${slug}/location.json?t=${Date.now()}`)
       .then(r => r.ok ? r.json() : null);
     const subj = loc?.subject_parcels;
-    if (Array.isArray(subj) && subj.length) {
-      for (const id of subj) selectedParcels.add(String(id));
-      parcelsToggle.checked = true;
-      parcelsToggle.dispatchEvent(new Event('change'));
+    if (!Array.isArray(subj) || !subj.length) return;
+    const want = new Set(subj.map(Number));
+    parcelsToggle.checked = true;
+    parcelsToggle.disabled = true;
+    await Promise.all([ensureParcels(), ensureHeightDataLoaded()]);
+    parcelsToggle.disabled = false;
+    for (const p of (parcels || [])) {
+      if (p.id && want.has(Number(p.id))) selectedParcels.add(p.id);
     }
+    outlineGroup.visible = true;
+    redrawOutlines();
   } catch (e) {
     console.warn('[subject] location.json highlight skipped:', e);
   }

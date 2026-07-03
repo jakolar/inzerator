@@ -296,6 +296,10 @@ class Tile {
           uSunDir: { value: SUN_DIR },
         },
         vertexShader: VERT, fragmentShader: FRAG,
+        // DoubleSide: the perimeter skirt quads must render from every
+        // viewing direction — FrontSide culled them from half the angles,
+        // which read as black cracks along LOD boundaries.
+        side: THREE.DoubleSide,
       });
       this.mesh = new THREE.Mesh(sharedGeo, mat);
       this.mesh.position.copy(this.center);
@@ -400,7 +404,7 @@ function updateNode(tile) {
   const wantSplit = tile.z < ZMAX && screenPx(tile) > SPLIT_PX;
   if (!wantSplit) {
     hideKids(tile);
-    if (tile.state === 'ready') { tile.mesh.visible = true; tile.lastUsed = frame; return true; }
+    if (tile.state === 'ready') { markVisible(tile); tile.lastUsed = frame; return true; }
     if (tile.state === 'empty') return true;
     enqueue(tile, prio(tile));
     tile.lastUsed = frame;
@@ -413,10 +417,17 @@ function updateNode(tile) {
     return true;
   }
   // children not ready yet → keep showing self while they stream in
-  if (tile.state === 'ready') { tile.mesh.visible = true; tile.lastUsed = frame; return true; }
+  if (tile.state === 'ready') { markVisible(tile); tile.lastUsed = frame; return true; }
   if (tile.state === 'idle') enqueue(tile, prio(tile) - 100);  // fallback loads first
   tile.lastUsed = frame;
   return tile.state === 'empty';
+}
+let visZMin = 99, visZMax = 0, visCount = 0;
+function markVisible(tile) {
+  tile.mesh.visible = true;
+  visCount++;
+  if (tile.z < visZMin) visZMin = tile.z;
+  if (tile.z > visZMax) visZMax = tile.z;
 }
 function hideKids(tile) {
   if (!tile._kids) return;
@@ -451,6 +462,7 @@ function tick() {
   controls.update();
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
+  visZMin = 99; visZMax = 0; visCount = 0;
   for (const r of roots) updateNode(r);
   pump();
   if (frame % 120 === 0) evict();
@@ -468,8 +480,12 @@ function tick() {
       'zkuste detail, např. <code>?lat=49.62&lon=17.29&z=15</code>';
   }
   if (frame % 15 === 0) {
+    const zInfo = visCount
+      ? (visZMin === visZMax ? `z=${visZMin}` : `z=${visZMin}–${visZMax}`)
+      : 'z=—';
     hud.textContent =
-      `dlaždice: ${stats.ready} ready · ${pending.length + inflight} načítá` +
+      `zoom ${zInfo} · ${visCount} dlaždic na obrazovce\n` +
+      `${stats.ready} ready · ${pending.length + inflight} načítá` +
       ` · ${stats.empty} prázdné\n` +
       `cache ${tiles.size} · fetche ${stats.fetches}` +
       (stats.failed ? ` · chyby ${stats.failed}` : '');

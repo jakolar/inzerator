@@ -37,31 +37,31 @@ při ~32 aktivních dlaždicích je to 8 MB vs 1,4 MB — pro MVP nepodstatné.
 ## Tasks
 
 ### Task 1: build_ortho_tile.py
-- [ ] `read_jgw(path)` — world file → (px_size, origin) — a
+- [x] `read_jgw(path)` — world file → (px_size, origin) — a
       `pick_draft_k(target_mpp, native_mpp)` → 1/2/4/8.
-- [ ] `sjtsk_envelope(z, x, y, margin_m)` — merc bbox rohy+středy hran
+- [x] `sjtsk_envelope(z, x, y, margin_m)` — merc bbox rohy+středy hran
       přes pyproj do 5514 (Křovák rotace ~7,7°).
-- [ ] `build_ortho_tile(z, x, y, bulk_dir, out_dir, size, ktx2, overwrite)`
+- [x] `build_ortho_tile(z, x, y, bulk_dir, out_dir, size, ktx2, overwrite)`
       — inventář → sheets → draft decode+crop → reproject lanczos →
       JPEG atomic; vrací ok/empty.
-- [ ] CLI `--z --x --y [--size 256] [--ktx2] [--overwrite]`.
-- [ ] Test: unit `pick_draft_k` + envelope obsahuje reprojektované rohy;
+- [x] CLI `--z --x --y [--size 256] [--ktx2] [--overwrite]`.
+- [x] Test: unit `pick_draft_k` + envelope obsahuje reprojektované rohy;
       ručně 1 dlaždice Šternberk z=16 a vizuální kontrola.
 
 ### Task 2: dispatch_ortho_pyramid.py
-- [ ] Klon dispatch_pyramid struktury: base z=16 přes ThreadPool
+- [x] Klon dispatch_pyramid struktury: base z=16 přes ThreadPool
       (default 3 workers — heightmap dispatch může běžet souběžně),
       z=15..8 `_build_agg` (4 děti → 512² → LANCZOS 256²).
-- [ ] Resumabilita existencí `.jpg`, SIGTERM drain, countery, log
+- [x] Resumabilita existencí `.jpg`, SIGTERM drain, countery, log
       `ortho_build.log`, `--center/--win` smoke okno.
-- [ ] Test: unit downsample (kvadrantové barvy), smoke okno Šternberk
+- [x] Test: unit downsample (kvadrantové barvy), smoke okno Šternberk
       z=15..16.
 
 ### Task 3: viewer integrace
-- [ ] `map3d/index.html`: ortho load řetěz — pyramid `.jpg` → (z≥14) WMS
+- [x] `map3d/index.html`: ortho load řetěz — pyramid `.jpg` → (z≥14) WMS
       fallback → hypsometrie. Žádný jiný zásah.
-- [ ] Ověření chrome-devtools: dlaždice ze smoke okna se servírují ze
+- [x] Ověření chrome-devtools: dlaždice ze smoke okna se servírují ze
       statiky (network: `/cuzk-pyramid/ortho/...` 200), WMS jen mimo okno.
 
 ### Task 4: commit
-- [ ] pytest unit, commit feat branch, merge.
+- [x] pytest unit, commit feat branch, merge.

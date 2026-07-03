@@ -220,13 +220,12 @@ const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
 
 // ── Tile object ───────────────────────────────────────────────────────
 const HEIGHT_URL = (z, x, y) => `/cuzk-pyramid/dmpok/${z}/${x}/${y}.lerc`;
-// Ortho pyramid (F1) doesn't exist yet — drape per-tile JPEGs cut from the
-// local bulk SM5 sheets (hires=1 routes to _proxy_ortofoto_raw, no ČÚZK
-// round-trip). Below z=14 a tile spans >2.4 km → the raw composite would
-// mosaic hundreds of sheets per request, so overview zooms keep the shader's
-// hypsometric fallback until F1 pre-bakes real ortho tiles.
-// ponytail: swap for /tiles/ortho/{z}/{x}/{y}.ktx2 + KTX2Loader after F1.
-const ORTHO_URL = (z, x, y) => {
+// Ortho: pre-baked pyramid JPEG first (F1, dispatch_ortho_pyramid.py),
+// then per-tile WMS cut from local bulk sheets for z>=14 not yet baked,
+// then the shader's hypsometric fallback. Below z=14 the WMS composite
+// would mosaic hundreds of sheets per request → pyramid or nothing.
+const ORTHO_TILE_URL = (z, x, y) => `/cuzk-pyramid/ortho/${z}/${x}/${y}.jpg`;
+const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);
   return `/proxy/ortofoto?hires=1&WBBOX=${b.w},${b.s},${b.e},${b.n}` +
@@ -307,8 +306,7 @@ class Tile {
       this.state = 'ready';
       stats.ready++;
 
-      const orthoUrl = ORTHO_URL(this.z, this.x, this.y);
-      if (orthoUrl) texLoader.load(orthoUrl, (tex) => {
+      const applyOrtho = (tex) => {
         if (!this.mesh) { tex.dispose(); return; }
         tex.flipY = false;               // raster row 0 = north = uv.v 0
         tex.colorSpace = THREE.NoColorSpace;  // passthrough shader, no composer
@@ -316,9 +314,13 @@ class Tile {
         this.orthoTex = tex;
         mat.uniforms.uOrtho.value = tex;
         mat.uniforms.uHasOrtho.value = 1;
-      }, undefined, (err) => {
-        console.warn('ortho load failed', this.key, err?.message ?? err);
-      });
+      };
+      texLoader.load(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
+        undefined, () => {
+          const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
+          if (wms) texLoader.load(wms, applyOrtho, undefined,
+            () => console.warn('ortho load failed', this.key));
+        });
     } catch (err) {
       console.warn('tile load failed', this.key, err);
       this.state = 'empty'; stats.failed++;

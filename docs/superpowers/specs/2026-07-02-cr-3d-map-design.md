@@ -104,6 +104,17 @@ znamenají zahodit funkční shader stack a část pyramidy.
 s existujícím loaderem a GPU rozpočtem. Kvalitu ladit `q`/`comp_level` na
 vzorku (viz commit `b65ffb4`, q=220 už vyzkoušeno).
 
+> **AMENDMENT 2026-07-04 — KTX2 pass se ruší, zůstává JPEG.** Měření na
+> reálných dlaždicích (vesnice/pole/les, q=220 comp_level=4): ETC1S soubor
+> je **stejně velký nebo větší než JPEG q=87** (17,6–18,4 KB vs
+> 15,9–18,7 KB) — na disku a přenosu se nešetří nic; vizuálně
+> srovnatelné (mírné změkčení lesa). Jediný přínos je GPU paměť
+> (43 KB vs 256 KB/dlaždici), tj. ~8 MB vs ~1,4 MB při 32 aktivních —
+> na cílových zařízeních (desktop, iPad) bezvýznamné. Proti tomu: dny
+> encode času + KTX2Loader/WASM transcoder ve vieweru. Tabulka výše
+> předpokládala ~5–10 KB ETC1S; reálné ortofoto má vyšší entropii.
+> Srovnání: scratchpad `ktx2_srovnani.png`, vzorky z 2026-07-04.
+
 ### D3 — Strategie vysokých zoomů (z=15..18)
 
 | Varianta | Disk | Výhody | Nevýhody |

@@ -24,7 +24,8 @@ Concurrency caps: `_CUZK_SEM = Semaphore(6)` (across all threads) and `_OSM_SEM 
 Endpoints (all under `ProxyHandler.do_GET` / `do_POST`):
 
 - `/proxy/ortofoto`, `/proxy/cadastre`, `/proxy/osm` — ČÚZK / OSM tile/WMS proxies, in-process LRU caches (`_CUZK_CACHE`, `_BoundedCache`).
-- `/api/locations`, `/api/ruian/search?q=`, `/api/sjtsk2wgs`, `/api/jobs[/<id>][/retry|/cancel]` — Lokace UI; backed by `locations.py`.
+- `/api/locations`, `/api/ruian/search?q=`, `/api/sjtsk2wgs`, `/api/jobs[/<id>][/retry|/cancel]` — Lokace UI; backed by `locations.py`. POST `/api/jobs` optionally takes `inner_half` (m, selection-driven ring sizing) + `parcel_ids` (subject parcels the viewer pre-highlights).
+- `/cuzk-pyramid/dmpok/<z>/<x>/<y>.lerc` — heightmap pyramid tiles, built **on demand** from bulk DMPOK for z=14..20 (`_PYRAMID_BUILD_SEM = Semaphore(3)`, per-tile locks) and served from disk once built. Lower zooms come pre-baked by `dispatch_pyramid.py`.
 - `/api/buildings`, `/api/parcels`, `/api/parcel-at-point`, `/api/roads`, `/api/poi`, `/api/wiki`, `/api/building-detail` — viewer queries.
 - `/api/image-edit` (POST) + `/api/image-edit/prompt`, `/api/image-edit/status` — OpenAI gpt-image-1 proxy. Refuses with 503 unless `INZERATOR_API_TOKEN` is set (intentional: shared LAN, OpenAI billing attaches to the key). System prompt is read server-side from `image_edit_prompt.txt` — single source of truth, clients cannot override.
 
@@ -43,7 +44,7 @@ Per-step output lives under `tiles_v2_<slug>/` (the directory prefix is unchange
 
 `location_status()` reports `missing` (no slug dir) / `partial` (dir but no heightfield manifest) / `ready` (heightfield manifest present). `STEP_TIMEOUT_SECS = 3600` (cold DMR5G can take 10–30 min).
 
-`tiles_v2_<slug>/location.json` is written by `enqueue_job` and persists `{slug, label, cx, cy, created_at}` so the dashboard label survives across server restarts. Legacy v2 manifest fallback is still wired in `_read_label()` and the resume-from-disk endpoint for lokace that pre-date the retirement.
+`tiles_v2_<slug>/location.json` is written by `enqueue_job` and persists `{slug, label, cx, cy, created_at}` (+ optional `inner_half`, `subject_parcels`) so the dashboard label survives across server restarts. `subject_parcels` drives the viewer's pre-highlight — match parcel ids **numerically**, ČÚZK returns them as floats. Legacy v2 manifest fallback is still wired in `_read_label()` and the resume-from-disk endpoint for lokace that pre-date the retirement.
 
 Atomic manifest write pattern: `tmp = path.with_suffix('.json.tmp'); tmp.write_text(...); tmp.replace(path)`.
 
@@ -53,6 +54,8 @@ Atomic manifest write pattern: `tmp = path.with_suffix('.json.tmp'); tmp.write_t
 
 `cache/jobs/` holds per-job log JSON written by the Lokace worker.
 
+`cuzk-pyramid/` is **a symlink** to `/Volumes/Elements/cuzk-pyramid` — the ČR-wide heightmap pyramid output (`dmpok/<z>/<x>/<y>.lerc`). Server endpoints 404 gracefully into on-demand builds when the external drive holds the data; if the symlink target is unmounted, pyramid features are dead, not broken code.
+
 ## Heightfield generation (`gen_heightfield.py`)
 
 LOD ring assets for the streaming viewer. Defaults: ortho tiers = `mid,high,ultra`, format = `lerc` (50% smaller than PNG, WASM-decoded), bare-earth DMR5G **cached** to `<slug>_bare.lerc` and skipped on rerun unless `--refresh-bare`. SM5 ortofoto auto-fetched via ČÚZK ATOM feed unless `--no-fetch-missing`.
@@ -61,6 +64,7 @@ LOD ring assets for the streaming viewer. Defaults: ortho tiers = `mid,high,ultr
 python3 gen_heightfield.py --slug hnojice --cx -547700 --cy -1107700   # new lokace path
 python3 gen_heightfield.py --slug hnojice                              # re-gen existing (centre from heightfield manifest)
 python3 gen_heightfield.py --slug hnojice --refresh-bare               # also re-fetch DMR5G
+python3 gen_heightfield.py --slug hnojice --inner-half 1200            # selection-sized rings (clamped 500–2000 m, see derive_rings)
 python3 dispatch_heightfield.py                                        # all ready locations missing heightfield/
 python3 dispatch_heightfield.py --only foo,bar --force                 # subset, regenerate existing
 python3 refresh_ortho.py --tiers super                                 # opt-in 16384² super tier (~40 MB KTX2, 128 MB GPU)
@@ -104,15 +108,29 @@ Negative S-JTSK coords need the `=` form (`--cx=-547700`), otherwise argparse sw
 - **`tiles_v2_` directory prefix** is unchanged after the v2 retirement — rename to `tiles_` is deferred until a separate sweep touches all hard-coded references (`gen_heightfield.py`, `dispatch_heightfield.py`, `refresh_*.py`, `locations.py`, `server.py`).
 - **Czech UI, English code/commits** — matches the global rule in `~/.claude/CLAUDE.md`.
 
-## Bulk DMPOK download
+## Bulk downloads (DMPOK + ortofoto)
 
 ČÚZK DMPOK-TIFF mass pull lives in `bulk_dmpok.py` + `bulk_dmpok_inventory.py` + `bulk_dmpok_status.py` + `bulk_dmpok_profile.py`, writing to `/Volumes/Elements/cuzk-bulk/` by default (override `BULK_OUT_DIR`). 4 workers, ~10 sheets/min observed, ~3 nights for the full 16 299-sheet ČR pull. See `BULK_DMPOK.md` for runbook and `BULK_DMPOK_PROFILE.md` for the performance rationale.
+
+`bulk_ortofoto.py` + `bulk_ortofoto_inventory.py` + `bulk_ortofoto_status.py` are a clone of the same engine for the full ortofoto dataset (~1.1 TB JPEG, newest acquisition per sheet). Runbook in `BULK_ORTOFOTO.md`. Sanity check there: `missing` should stay ~0 — a climbing count means a broken ZIP url pattern, not a coverage gap.
+
+## Heightmap pyramid (ČR-wide)
+
+Web Mercator LERC pyramid built from the bulk DMPOK cache; design + tile-count rationale in `HEIGHTFIELD_PYRAMID.md`. z=8..14 is pre-baked bottom-up (z=14 from DMPOK mosaic, z=13..8 downsampled 2×2 from children); z=15..20 is built on demand by the server endpoint (a high-zoom tile touches only a few sheets).
+
+```bash
+python3 build_pyramid_tile.py --z 14 --x 8975 --y 5635    # single tile (writes inventory.json on first run)
+python3 dispatch_pyramid.py --workers 4                    # full ČR z=8..14; filesystem-resumable, SIGTERM-safe
+python3 dispatch_pyramid.py --center 50.736 15.74 --win 4 --zmin 12   # smoke test window
+```
+
+`pyramid-test.html` is the test viewer (heightmap + ortho drape served from local data by `server.py`).
 
 ## Docs worth reading before touching the relevant area
 
 - `docs/notes/2026-05-16-pipeline-overview.md` — pre-retirement pipeline overview (mentions v2; read with retirement in mind).
 - `docs/notes/three-js-colorspace-srgb.md` + `2026-05-16-ortofoto-color-grading.md` — colorspace pitfalls; matches the `feedback_composer_colorspace.md` memory.
 - `docs/notes/2026-05-19-cuzk-data-resolution.md` — DMR5G vs SM5 vs DMP1G resolution ladder.
-- `BULK_DMPOK.md` + `BULK_DMPOK_PROFILE.md` — bulk download runbook + profile.
-- `HEIGHTFIELD_PYRAMID.md` + `HEIGHTFIELD_PYRAMID_RATIONALE.md` — design + decision log for the planned ČR-wide tile pyramid.
+- `BULK_DMPOK.md` + `BULK_DMPOK_PROFILE.md` + `BULK_ORTOFOTO.md` — bulk download runbooks + profile.
+- `HEIGHTFIELD_PYRAMID.md` + `HEIGHTFIELD_PYRAMID_RATIONALE.md` — design + decision log for the ČR-wide tile pyramid (now partially built — see Heightmap pyramid section).
 - `cuzk-bulk-email.md` — draft access request to ČÚZK for bulk DMR5G/SM5.

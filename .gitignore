@@ -39,3 +39,10 @@ tests/__pycache__/
 # Secrets — never commit. Use .env.example as the shareable template.
 .env
 .env.local
+
+# Data symlinks + TLS key material
+/cuzk-pyramid
+/dispatch_log/
+*.ts.net.crt
+*.ts.net.key
+/cache

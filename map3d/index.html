@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>ČR 3D mapa</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10151c; }
+  #app { position: fixed; inset: 0; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; z-index: 5;
+    font: 12px/1.5 system-ui, sans-serif; color: #dfe7f0;
+    background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
+    pointer-events: none; white-space: pre;
+  }
+  #attrib {
+    position: fixed; bottom: 8px; right: 10px; z-index: 5;
+    font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
+    background: rgba(12, 18, 26, .55); border-radius: 6px; padding: 3px 8px;
+  }
+  #loading {
+    position: fixed; inset: 0; z-index: 10; display: flex;
+    align-items: center; justify-content: center;
+    background: #10151c; color: #dfe7f0; font: 14px system-ui, sans-serif;
+    transition: opacity .4s;
+  }
+  #loading.hidden { opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">načítám…</div>
+<div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
+<div id="loading"><div id="loadmsg">ČR 3D mapa — načítám dlaždice…</div></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { MapControls } from 'three/addons/controls/MapControls.js';
+import * as Lerc from 'https://cdn.jsdelivr.net/npm/lerc@4/+esm';
+
+// Surface module-level failures in the overlay instead of a stuck spinner.
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('loadmsg');
+  if (el) el.innerHTML = `⚠ JS chyba: <code>${e.message}</code>`;
+});
+
+// ── Tile math (EPSG:3857 XYZ slippy) ──────────────────────────────────
+const WMERC = 20037508.342789244;
+// ČR data coverage; tiles fully outside are never requested.
+const CR = { west: 11.8, south: 48.5, east: 19.0, north: 51.2 };
+const lonToMercX = lon => lon / 180 * WMERC;
+const latToMercY = lat => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI * WMERC;
+const mercYToLat = y => (Math.atan(Math.exp(y / WMERC * Math.PI)) - Math.PI / 4) * 360 / Math.PI;
+const tileSideMerc = z => 2 * WMERC / 2 ** z;
+function lonLatToTile(lon, lat, z) {
+  const n = 2 ** z;
+  return {
+    x: Math.floor((lon + 180) / 360 * n),
+    y: Math.floor((1 - Math.asinh(Math.tan(lat * Math.PI / 180)) / Math.PI) / 2 * n),
+  };
+}
+function tileToBBoxMerc(z, x, y) {
+  const s = tileSideMerc(z);
+  return { w: -WMERC + x * s, e: -WMERC + (x + 1) * s,
+           n:  WMERC - y * s, s:  WMERC - (y + 1) * s };
+}
+function tileToBBoxWgs(z, x, y) {
+  const b = tileToBBoxMerc(z, x, y);
+  return { w: b.w / WMERC * 180, e: b.e / WMERC * 180,
+           n: mercYToLat(b.n),   s: mercYToLat(b.s) };
+}
+
+// ── View state / URL params ───────────────────────────────────────────
+const P = new URLSearchParams(location.search);
+const startLat = parseFloat(P.get('lat') ?? '49.82');   // ČR centroid-ish
+const startLon = parseFloat(P.get('lon') ?? '15.47');
+const startZ   = parseFloat(P.get('z') ?? '8');
+const EXAG     = parseFloat(P.get('ex') ?? '1');
+// True-metre heights vs mercator-stretched horizontal: scale Y up by the
+// mercator factor at ČR latitude so proportions are correct (spec kap. 2).
+const Y_SCALE = (1 / Math.cos(startLat * Math.PI / 180)) * EXAG;
+
+const ZMIN = 8, ZMAX = 18;
+// Scene origin (mercator metres) — subtracted from all world coords for
+// fp32 precision. Terrain Y = height * Y_SCALE above y=0 globally.
+const ORIGIN = { x: lonToMercX(startLon), y: latToMercY(startLat) };
+const toScene = (mx, my) => ({ x: mx - ORIGIN.x, z: -(my - ORIGIN.y) });
+
+// ── three.js scaffolding ──────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x10151c);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 5, 4.0e6);
+// Distance heuristic: z=8 frames all of ČR, each zoom halves it.
+const startDist = 450000 * 2 ** (8 - startZ);
+camera.position.set(0, startDist * 0.85, startDist * 0.55);
+
+const controls = new MapControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.maxPolarAngle = 1.45;                 // keep camera above horizon
+controls.minDistance = 150;
+controls.maxDistance = 900000;
+controls.update();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ── Shared skirted grid geometry ──────────────────────────────────────
+// Unit tile in XZ: x=[-0.5,0.5] west→east, z=[-0.5,0.5] north→south.
+// uv.v = 0 at the north edge = LERC/JPEG raster row 0 (flipY=false).
+// Perimeter ring duplicated with aSkirt=1; the vertex shader drops those
+// below the terrain to curtain cracks between neighbouring zoom levels.
+const SEG = 128;   // ponytail: 128 segs for a 256px heightmap; bump to 256 if visuals demand
+function buildTileGeometry() {
+  const n = SEG + 1;
+  const gridCount = n * n;
+  const perim = [];
+  for (let i = 0; i < SEG; i++) perim.push(i);                        // N edge W→E
+  for (let j = 0; j < SEG; j++) perim.push(j * n + (n - 1));          // E edge N→S
+  for (let i = SEG; i > 0; i--) perim.push((n - 1) * n + i);          // S edge E→W
+  for (let j = SEG; j > 0; j--) perim.push(j * n);                    // W edge S→N
+  const total = gridCount + perim.length;
+
+  const pos = new Float32Array(total * 3);
+  const uv = new Float32Array(total * 2);
+  const skirt = new Float32Array(total);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const vi = j * n + i, u = i / SEG, v = j / SEG;
+      pos[vi * 3] = u - 0.5; pos[vi * 3 + 2] = v - 0.5;
+      uv[vi * 2] = u; uv[vi * 2 + 1] = v;
+    }
+  }
+  perim.forEach((src, k) => {
+    const vi = gridCount + k;
+    pos[vi * 3] = pos[src * 3]; pos[vi * 3 + 2] = pos[src * 3 + 2];
+    uv[vi * 2] = uv[src * 2]; uv[vi * 2 + 1] = uv[src * 2 + 1];
+    skirt[vi] = 1;
+  });
+
+  const idx = new Uint32Array(SEG * SEG * 6 + perim.length * 6);
+  let o = 0;
+  for (let j = 0; j < SEG; j++) {
+    for (let i = 0; i < SEG; i++) {
+      const a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+      idx[o++] = a; idx[o++] = c; idx[o++] = b;
+      idx[o++] = b; idx[o++] = c; idx[o++] = d;
+    }
+  }
+  for (let k = 0; k < perim.length; k++) {
+    const a = perim[k], b = perim[(k + 1) % perim.length];
+    const as = gridCount + k, bs = gridCount + (k + 1) % perim.length;
+    idx[o++] = a; idx[o++] = as; idx[o++] = b;
+    idx[o++] = as; idx[o++] = bs; idx[o++] = b;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setAttribute('aSkirt', new THREE.BufferAttribute(skirt, 1));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return g;
+}
+const sharedGeo = buildTileGeometry();
+
+const VERT = /* glsl */`
+  uniform sampler2D uHeight;
+  uniform float uYScale, uSkirtDrop;
+  attribute float aSkirt;
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    float h = texture2D(uHeight, uv).r;
+    vec3 p = position;
+    p.y = h * uYScale;
+    if (aSkirt > 0.5) p.y -= uSkirtDrop;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+  }
+`;
+const FRAG = /* glsl */`
+  uniform sampler2D uHeight, uOrtho;
+  uniform float uTexel;     // 1/256
+  uniform float uNormMul;   // Y_SCALE / (2 * texel size in mercator m)
+  uniform float uHasOrtho;
+  uniform vec3 uSunDir;
+  varying vec2 vUv;
+  void main() {
+    float t = uTexel;
+    float hL = texture2D(uHeight, vUv - vec2(t, 0.)).r;
+    float hR = texture2D(uHeight, vUv + vec2(t, 0.)).r;
+    float hU = texture2D(uHeight, vUv - vec2(0., t)).r;
+    float hD = texture2D(uHeight, vUv + vec2(0., t)).r;
+    vec3 nrm = normalize(vec3((hL - hR) * uNormMul, 1.0, (hU - hD) * uNormMul));
+    float shade = 0.4 + 0.6 * max(dot(nrm, uSunDir), 0.0);
+    vec3 base = uHasOrtho > 0.5
+      ? texture2D(uOrtho, vUv).rgb
+      : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
+            clamp(texture2D(uHeight, vUv).r / 900.0, 0.0, 1.0));
+    gl_FragColor = vec4(base * shade, 1.0);
+  }
+`;
+const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
+
+// ── Tile object ───────────────────────────────────────────────────────
+const HEIGHT_URL = (z, x, y) => `/cuzk-pyramid/dmpok/${z}/${x}/${y}.lerc`;
+// Ortho pyramid (F1) doesn't exist yet — drape per-tile JPEGs cut from the
+// local bulk SM5 sheets (hires=1 routes to _proxy_ortofoto_raw, no ČÚZK
+// round-trip). Below z=14 a tile spans >2.4 km → the raw composite would
+// mosaic hundreds of sheets per request, so overview zooms keep the shader's
+// hypsometric fallback until F1 pre-bakes real ortho tiles.
+// ponytail: swap for /tiles/ortho/{z}/{x}/{y}.ktx2 + KTX2Loader after F1.
+const ORTHO_URL = (z, x, y) => {
+  if (z < 14) return null;
+  const b = tileToBBoxWgs(z, x, y);
+  return `/proxy/ortofoto?hires=1&WBBOX=${b.w},${b.s},${b.e},${b.n}` +
+         `&size=512&format=jpeg`;
+};
+const texLoader = new THREE.TextureLoader();
+
+const tiles = new Map();   // key "z/x/y" → Tile
+const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
+
+class Tile {
+  constructor(z, x, y) {
+    this.z = z; this.x = x; this.y = y;
+    this.key = `${z}/${x}/${y}`;
+    this.state = 'idle';               // idle | loading | ready | empty
+    this.mesh = null;
+    const b = tileToBBoxMerc(z, x, y);
+    const sw = toScene(b.w, b.s), ne = toScene(b.e, b.n);
+    this.sideM = tileSideMerc(z);
+    this.center = new THREE.Vector3((sw.x + ne.x) / 2, 0, (sw.z + ne.z) / 2);
+    this.box = new THREE.Box3(
+      new THREE.Vector3(sw.x, 0, ne.z),
+      new THREE.Vector3(ne.x, 1700 * Y_SCALE, sw.z));
+    const wgs = tileToBBoxWgs(z, x, y);
+    this.inCR = !(wgs.e < CR.west || wgs.w > CR.east ||
+                  wgs.n < CR.south || wgs.s > CR.north);
+    if (!this.inCR) this.state = 'empty';
+  }
+  children() {
+    if (this._kids) return this._kids;
+    this._kids = [];
+    for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+      const t = getTile(this.z + 1, this.x * 2 + dx, this.y * 2 + dy);
+      this._kids.push(t);
+    }
+    return this._kids;
+  }
+  async load() {
+    this.state = 'loading';
+    stats.fetches++;
+    try {
+      const res = await fetch(HEIGHT_URL(this.z, this.x, this.y));
+      if (!res.ok) { this.state = 'empty'; stats.empty++; return; }
+      const decoded = Lerc.decode(new Uint8Array(await res.arrayBuffer()));
+      const w = decoded.width, h = decoded.height;
+      const heights = new Float32Array(decoded.pixels[0]);
+      let min = Infinity;
+      for (let i = 0; i < heights.length; i++)
+        if (heights[i] > -9000 && heights[i] < min) min = heights[i];
+      if (!isFinite(min)) { this.state = 'empty'; stats.empty++; return; }
+      for (let i = 0; i < heights.length; i++)
+        if (heights[i] <= -9000) heights[i] = min;
+
+      this.heightTex = new THREE.DataTexture(heights, w, h,
+        THREE.RedFormat, THREE.FloatType);
+      this.heightTex.magFilter = this.heightTex.minFilter = THREE.LinearFilter;
+      this.heightTex.needsUpdate = true;
+
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          uHeight: { value: this.heightTex },
+          uOrtho: { value: null },
+          uHasOrtho: { value: 0 },
+          uYScale: { value: Y_SCALE },
+          uSkirtDrop: { value: Math.max(30, this.sideM * 0.01) * Y_SCALE },
+          uTexel: { value: 1 / w },
+          uNormMul: { value: Y_SCALE / (2 * this.sideM / w) },
+          uSunDir: { value: SUN_DIR },
+        },
+        vertexShader: VERT, fragmentShader: FRAG,
+      });
+      this.mesh = new THREE.Mesh(sharedGeo, mat);
+      this.mesh.position.copy(this.center);
+      this.mesh.scale.set(this.sideM, 1, this.sideM);
+      this.mesh.visible = false;
+      this.mesh.frustumCulled = false;   // we cull tiles ourselves
+      scene.add(this.mesh);
+      this.state = 'ready';
+      stats.ready++;
+
+      const orthoUrl = ORTHO_URL(this.z, this.x, this.y);
+      if (orthoUrl) texLoader.load(orthoUrl, (tex) => {
+        if (!this.mesh) { tex.dispose(); return; }
+        tex.flipY = false;               // raster row 0 = north = uv.v 0
+        tex.colorSpace = THREE.NoColorSpace;  // passthrough shader, no composer
+        tex.anisotropy = 4;
+        this.orthoTex = tex;
+        mat.uniforms.uOrtho.value = tex;
+        mat.uniforms.uHasOrtho.value = 1;
+      }, undefined, (err) => {
+        console.warn('ortho load failed', this.key, err?.message ?? err);
+      });
+    } catch (err) {
+      console.warn('tile load failed', this.key, err);
+      this.state = 'empty'; stats.failed++;
+    }
+  }
+  dispose() {
+    if (this.mesh) {
+      scene.remove(this.mesh);
+      this.mesh.material.dispose();
+      this.mesh = null;
+    }
+    this.heightTex?.dispose(); this.orthoTex?.dispose();
+    this.heightTex = this.orthoTex = null;
+    if (this.state !== 'empty') this.state = 'idle';
+    stats.ready = Math.max(0, stats.ready - 1);
+  }
+}
+function getTile(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  let t = tiles.get(key);
+  if (!t) { t = new Tile(z, x, y); tiles.set(key, t); }
+  return t;
+}
+
+// ── Fetch queue (bounded; server has _CUZK_SEM=6 and shares the box
+//    with the running dispatch) ─────────────────────────────────────────
+const MAX_INFLIGHT = 4;
+let inflight = 0;
+const pending = [];
+function enqueue(tile, prio) {
+  if (tile.state !== 'idle') return;
+  tile.state = 'queued'; tile.prio = prio;
+  pending.push(tile);
+}
+function pump() {
+  if (!pending.length || inflight >= MAX_INFLIGHT) return;
+  pending.sort((a, b) => a.prio - b.prio);
+  while (inflight < MAX_INFLIGHT && pending.length) {
+    const t = pending.shift();
+    inflight++;
+    t.load().finally(() => { inflight--; pump(); });
+  }
+}
+
+// ── Quadtree selection + replacement refinement ───────────────────────
+const roots = [];
+{
+  const a = lonLatToTile(CR.west, CR.north, ZMIN);
+  const b = lonLatToTile(CR.east, CR.south, ZMIN);
+  for (let x = a.x; x <= b.x; x++)
+    for (let y = a.y; y <= b.y; y++) roots.push(getTile(ZMIN, x, y));
+}
+
+const frustum = new THREE.Frustum();
+const projView = new THREE.Matrix4();
+const SPLIT_PX = 384;
+
+function screenPx(tile) {
+  const dist = Math.max(tile.box.distanceToPoint(camera.position), 1);
+  return tile.sideM * innerHeight /
+         (2 * dist * Math.tan(camera.fov * Math.PI / 360));
+}
+function prio(tile) {
+  return tile.center.distanceTo(controls.target) / tile.sideM;
+}
+
+// Walk the desired tree. Returns true when the node's area is fully
+// covered (rendered, or empty = nothing to render). A parent stays
+// visible until every non-empty child is ready — replacement refinement,
+// no holes and no parent+child double-draw.
+function updateNode(tile) {
+  // Out-of-coverage: permanently nothing. 404-empty tiles inside ČR still
+  // recurse — children may exist server-side (pre-bake in progress).
+  if (!tile.inCR) return true;
+  if (!frustum.intersectsBox(tile.box)) { hideSubtree(tile); return true; }
+
+  const wantSplit = tile.z < ZMAX && screenPx(tile) > SPLIT_PX;
+  if (!wantSplit) {
+    hideKids(tile);
+    if (tile.state === 'ready') { tile.mesh.visible = true; tile.lastUsed = frame; return true; }
+    if (tile.state === 'empty') return true;
+    enqueue(tile, prio(tile));
+    tile.lastUsed = frame;
+    return false;
+  }
+  let covered = true;
+  for (const c of tile.children()) if (!updateNode(c)) covered = false;
+  if (covered) {
+    if (tile.mesh) tile.mesh.visible = false;
+    return true;
+  }
+  // children not ready yet → keep showing self while they stream in
+  if (tile.state === 'ready') { tile.mesh.visible = true; tile.lastUsed = frame; return true; }
+  if (tile.state === 'idle') enqueue(tile, prio(tile) - 100);  // fallback loads first
+  tile.lastUsed = frame;
+  return tile.state === 'empty';
+}
+function hideKids(tile) {
+  if (!tile._kids) return;
+  for (const c of tile._kids) hideSubtree(c);
+}
+function hideSubtree(tile) {
+  if (tile.mesh) tile.mesh.visible = false;
+  hideKids(tile);
+}
+
+// Evict tiles untouched for a while once over budget (roots stay).
+const CACHE_MAX = 300;
+function evict() {
+  if (tiles.size <= CACHE_MAX) return;
+  const candidates = [...tiles.values()]
+    .filter(t => t.z > ZMIN && t.state === 'ready' && frame - (t.lastUsed ?? 0) > 120)
+    .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
+  for (const t of candidates.slice(0, tiles.size - CACHE_MAX)) t.dispose();
+}
+
+// ── Main loop ─────────────────────────────────────────────────────────
+const hud = document.getElementById('hud');
+const loading = document.getElementById('loading');
+let frame = 0, firstRendered = false;
+
+await Lerc.load();
+window.__map3d = { tiles, stats, camera, controls };   // debug console handle
+
+function tick() {
+  requestAnimationFrame(tick);
+  frame++;
+  controls.update();
+  projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projView);
+  for (const r of roots) updateNode(r);
+  pump();
+  if (frame % 120 === 0) evict();
+  renderer.render(scene, camera);
+
+  if (!firstRendered && stats.ready > 0) {
+    firstRendered = true;
+    loading.classList.add('hidden');
+  }
+  // Pre-bake of z=8..13 may still be running server-side; explain instead
+  // of spinning forever when every visible tile 404s.
+  if (!firstRendered && frame === 400 && stats.ready === 0 && stats.empty > 0) {
+    document.getElementById('loadmsg').innerHTML =
+      'Nízké zoomy se na serveru ještě dopočítávají —<br>' +
+      'zkuste detail, např. <code>?lat=49.62&lon=17.29&z=15</code>';
+  }
+  if (frame % 15 === 0) {
+    hud.textContent =
+      `dlaždice: ${stats.ready} ready · ${pending.length + inflight} načítá` +
+      ` · ${stats.empty} prázdné\n` +
+      `cache ${tiles.size} · fetche ${stats.fetches}` +
+      (stats.failed ? ` · chyby ${stats.failed}` : '');
+  }
+}
+tick();
+</script>
+</body>
+</html>

@@ -63,3 +63,15 @@ def test_downsample_children_quadrants():
 def test_downsample_children_all_missing():
     assert downsample_children({(0, 0): None, (0, 1): None,
                                 (1, 0): None, (1, 1): None}) is None
+
+
+def test_populated_mask():
+    from populated_mask import PopulatedMask, lonlat_to_merc
+    from build_pyramid_tile import latlon_to_tile
+    pts = [lonlat_to_merc(17.29, 49.62)]        # Šternberk
+    mask = PopulatedMask(pts, radius_m=1200.0)
+    x, y = latlon_to_tile(49.62, 17.29, 18)
+    assert mask.intersects_tile(18, x, y)
+    assert mask.intersects_tile(18, x + 4, y)    # within 1.2 km buffer
+    assert not mask.intersects_tile(18, x + 200, y)   # ~30 km away
+    assert not mask.intersects_tile(18, x, y + 200)

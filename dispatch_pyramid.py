@@ -185,7 +185,8 @@ def _log(out_dir: Path, line: str) -> None:
 
 
 def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
-               max_z_error: float, workers: int, base_z: int) -> None:
+               max_z_error: float, workers: int, base_z: int,
+               mask=None) -> None:
     x0, x1, y0, y1 = tile_range(bbox, z)
     total = (x1 - x0 + 1) * (y1 - y0 + 1)
     is_base = (z == base_z)
@@ -193,6 +194,10 @@ def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
           f"({'base←DMPOK' if is_base else 'agg←children'})", flush=True)
 
     coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    if mask is not None:
+        coords = [(x, y) for x, y in coords if mask.intersects_tile(z, x, y)]
+        print(f"  mask: {len(coords):,}/{total:,} tiles populated", flush=True)
+        total = len(coords)
 
     def work(xy):
         if stop_event.is_set():
@@ -234,6 +239,8 @@ def main() -> int:
                     help="smoke test: restrict to a window around this point")
     ap.add_argument("--win", type=int, default=4,
                     help="window half-size in base-zoom tiles (with --center)")
+    ap.add_argument("--mask", help="populated.json — build only tiles "
+                    "intersecting the populated mask (spec D3/F3)")
     args = ap.parse_args()
 
     base_z = args.zmax
@@ -270,13 +277,20 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    mask = None
+    if args.mask:
+        from populated_mask import load_mask
+        mask = load_mask(Path(args.mask))
+        print(f"[{_now()}] mask: {sum(len(v) for v in mask.grid.values()):,} "
+              f"place points, r={mask.r} m")
+
     # Base first, then aggregate downward (each level needs the one above it).
     levels = [base_z] + list(range(base_z - 1, args.zmin - 1, -1))
     for z in levels:
         if stop_event.is_set():
             break
         _run_level(z, bbox, bulk_dir, out_dir, args.max_z_error,
-                   args.workers, base_z)
+                   args.workers, base_z, mask)
 
     with _counters_lock:
         c = dict(_counters)

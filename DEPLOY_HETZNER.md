@@ -1,5 +1,22 @@
 # Deploy produkce na Hetzner VPS (F4)
 
+## Stav (2026-07-03)
+
+**Deploy ODLOŽEN** — rozhodnutí uživatele: nejdřív doběhne F3 chain
+(pre-bake vysokých zoomů) a doladí se kvalita mapy; VPS se objedná až pak.
+Kroky níže zůstávají jako fronta práce, nic z nich teď nespouštět.
+
+- [x] Rozhodnutí: produkce plně online na Hetzner VPS, archiv doma
+  (amendment D5 ve spec `docs/superpowers/specs/2026-07-02-cr-3d-map-design.md`)
+- [x] Deploy tooling hotové: `deploy_hetzner.sh`, `deploy/Caddyfile`, tento runbook
+- [x] Pyramida: heightmap z=8..14 kompletní; ortho z=16 + vysoké zoomy
+  dopočítává F3 chain (`f3_chain.sh`, logy `~/Library/Logs/inzerator/f3-*.log`)
+- [ ] Objednat VPS (CX32, Ubuntu 24.04, Falkenstein/Norimberk)
+- [ ] DNS A záznam domény → IP serveru
+- [ ] Setup serveru (blok níže)
+- [ ] První push: `./deploy_hetzner.sh deploy@<host>`
+- [ ] Finální sync po doběhnutí F3 řetězu
+
 Topologie: **produkce plně online** (kompletně předpečená pyramida + viewer
 na VPS), **archiv doma** (2 TB bulk na Elements — z něj se peče; na server
 se nikdy nekopíruje). Mac po dopočtu F3 jen pushuje delty přes rsync.

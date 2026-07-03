@@ -146,6 +146,17 @@ volitelný on-demand fallback origin (D3). Poznámka: globální pravidlo
 dlaždic jsou jiná kategorie než web app; viewer HTML *může* žít na Firebase,
 dlaždice ne.
 
+> **AMENDMENT 2026-07-03 — rozhodnuto jinak: Hetzner VPS (CX32).**
+> Požadavek: produkce musí být kompletně online a nezávislá na Macu;
+> archiv (2 TB bulk) zůstává doma jako build vstup. Produkce je tedy čistá
+> statika (plně předpečená pyramida + viewer) za Caddy na malém VPS
+> (~€7,6/měs, 160 GB NVMe, latence do ČR ~20–30 ms — CDN pro českou
+> audienci netřeba). Nepředpečená dlaždice = klient zobrazí rodiče; žádný
+> on-demand builder v produkci. R2 (`deploy_r2.sh` + `DEPLOY_R2.md`)
+> zůstává plán B pro případ růstu návštěvnosti — přechod je jeden sync.
+> Runbook: `DEPLOY_HETZNER.md`, deploy: `deploy_hetzner.sh`,
+> Caddy: `deploy/Caddyfile`.
+
 ### D6 — Strop ortho detailu (z=18 nestačí na zdroj)
 
 Zdroj má 0,124 m/px, ale z=18 dává na zemi jen 0,38 m/px — pyramida zahodí

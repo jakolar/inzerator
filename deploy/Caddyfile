@@ -1,0 +1,19 @@
+# Caddy config for the map3d production VPS (DEPLOY_HETZNER.md).
+# Replace mapa.example.com with the real domain; Caddy handles TLS itself.
+mapa.example.com {
+	root * /srv/map3d
+	file_server
+
+	# Tile pyramid — immutable, version in the path.
+	handle_path /v1/* {
+		root * /srv/tiles/v1
+		file_server
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	# Viewer HTML — short cache so fixes propagate.
+	@html path / /index.html
+	header @html Cache-Control "public, max-age=300"
+
+	encode zstd gzip
+}

@@ -6,8 +6,20 @@
 #   ./deploy_r2.sh r2:mybucket/v2      # custom remote/version
 set -e
 REMOTE=${1:-r2:inzerator-tiles/v1}
+BUCKET=${REMOTE%%/*}
+VERSION=/${REMOTE#*/}
 SRC=/Volumes/Elements/cuzk-pyramid
 IMMUTABLE='Cache-Control: public, max-age=31536000, immutable'
+
+# Preflight: credentials filled in, remote has a version path, bucket exists.
+if grep -q VYPLN ~/.config/rclone/rclone.conf; then
+  echo "!! ~/.config/rclone/rclone.conf má stále placeholder hodnoty (VYPLN_*)"
+  exit 1
+fi
+if [[ "$REMOTE" != */* ]]; then
+  echo "!! REMOTE musí obsahovat verzi v cestě (r2:bucket/v1)"; exit 1
+fi
+rclone mkdir "${BUCKET}"   # idempotent
 
 # Tiles are immutable (version in the path) → cache forever, size-only sync
 # (checksum listing of millions of objects is slow and costs Class A ops).
@@ -19,9 +31,14 @@ for layer in dmpok ortho; do
     --header-upload "$IMMUTABLE" --stats 60s
 done
 
-# Viewer — short cache so fixes propagate.
-rclone copyto /Users/jan/projekty/inzerator/map3d/index.html \
-  "${REMOTE%/*}/index.html" \
+# Viewer — bake the versioned tile base in (so no ?tiles= param is needed)
+# and upload with a short cache so fixes propagate.
+TMP=$(mktemp -t map3d-index)
+sed "s|P.get('tiles') ?? '/cuzk-pyramid'|P.get('tiles') ?? '${VERSION}'|" \
+  /Users/jan/projekty/inzerator/map3d/index.html > "$TMP"
+grep -q "?? '${VERSION}'" "$TMP" || { echo "!! TILE_BASE bake failed"; exit 1; }
+rclone copyto "$TMP" "${BUCKET}/index.html" \
   --header-upload 'Cache-Control: public, max-age=300'
+rm -f "$TMP"
 
-echo "done. Viewer: https://<custom-domain>/index.html?tiles=https://<custom-domain>/${REMOTE#*/}"
+echo "done. Otevři: https://<custom-domain>/index.html"

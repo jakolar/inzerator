@@ -118,13 +118,17 @@ def _build_base(z: int, x: int, y: int, bulk_dir: Path, out_dir: Path,
 
 
 def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
-               workers: int, base_z: int, inv: dict) -> None:
+               workers: int, base_z: int, inv: dict, mask=None) -> None:
     x0, x1, y0, y1 = tile_range(bbox, z)
     total = (x1 - x0 + 1) * (y1 - y0 + 1)
     is_base = (z == base_z)
     print(f"[{_now()}] level z={z}: {total:,} tiles "
           f"({'base←SM5 ortho' if is_base else 'agg←children'})", flush=True)
     coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    if mask is not None:
+        coords = [(x, y) for x, y in coords if mask.intersects_tile(z, x, y)]
+        print(f"  mask: {len(coords):,}/{total:,} tiles populated", flush=True)
+        total = len(coords)
 
     def work(xy):
         if stop_event.is_set():
@@ -162,6 +166,8 @@ def main() -> int:
                     help="smoke window centre (with --win)")
     ap.add_argument("--win", type=int, default=4,
                     help="smoke window half-size in base-level tiles")
+    ap.add_argument("--mask", help="populated.json — build only tiles "
+                    "intersecting the populated mask (spec D3/F3)")
     a = ap.parse_args()
     bulk_dir, out_dir = Path(a.bulk_dir), Path(a.out)
 
@@ -188,10 +194,17 @@ def main() -> int:
     inv = load_or_build_inventory(bulk_dir)
     print(f"[{_now()}] inventory: {len(inv)} sheets")
 
+    mask = None
+    if a.mask:
+        from populated_mask import load_mask
+        mask = load_mask(Path(a.mask))
+        print(f"[{_now()}] mask: {sum(len(v) for v in mask.grid.values()):,} "
+              f"place points, r={mask.r} m")
+
     for z in range(a.zmax, a.zmin - 1, -1):
         if stop_event.is_set():
             break
-        _run_level(z, bbox, bulk_dir, out_dir, a.workers, a.zmax, inv)
+        _run_level(z, bbox, bulk_dir, out_dir, a.workers, a.zmax, inv, mask)
 
     with _counters_lock:
         c = dict(_counters)

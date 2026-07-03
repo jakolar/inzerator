@@ -219,12 +219,16 @@ const FRAG = /* glsl */`
 const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
 
 // ── Tile object ───────────────────────────────────────────────────────
-const HEIGHT_URL = (z, x, y) => `/cuzk-pyramid/dmpok/${z}/${x}/${y}.lerc`;
+// Tile source base. Same-origin '/cuzk-pyramid' in dev (the local server
+// builds missing high zooms on demand); a CDN deploy passes
+// ?tiles=https://<host>/v1 — 404s there just mean "parent tile covers it".
+const TILE_BASE = P.get('tiles') ?? '/cuzk-pyramid';
+const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc`;
 // Ortho: pre-baked pyramid JPEG first (F1, dispatch_ortho_pyramid.py),
 // then per-tile WMS cut from local bulk sheets for z>=14 not yet baked,
 // then the shader's hypsometric fallback. Below z=14 the WMS composite
 // would mosaic hundreds of sheets per request → pyramid or nothing.
-const ORTHO_TILE_URL = (z, x, y) => `/cuzk-pyramid/ortho/${z}/${x}/${y}.jpg`;
+const ORTHO_TILE_URL = (z, x, y) => `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg`;
 const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);

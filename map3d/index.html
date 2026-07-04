@@ -314,6 +314,10 @@ class Tile {
       this.state = 'ready';
       stats.ready++;
 
+      // orthoDone gates LOD refinement: a parent showing ortho must not be
+      // swapped for children still waiting on their texture — that reads
+      // as the whole area flashing to hillshade and back. Set on success
+      // AND on final failure (hillshade fallback is then the tile's look).
       const applyOrtho = (tex) => {
         if (!this.mesh) { tex.dispose(); return; }
         tex.flipY = false;               // raster row 0 = north = uv.v 0
@@ -322,12 +326,16 @@ class Tile {
         this.orthoTex = tex;
         mat.uniforms.uOrtho.value = tex;
         mat.uniforms.uHasOrtho.value = 1;
+        this.orthoDone = true;
       };
       texLoader.load(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
         undefined, () => {
           const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
-          if (wms) texLoader.load(wms, applyOrtho, undefined,
-            () => console.warn('ortho load failed', this.key));
+          if (!wms) { this.orthoDone = true; return; }
+          texLoader.load(wms, applyOrtho, undefined, () => {
+            console.warn('ortho load failed', this.key);
+            this.orthoDone = true;
+          });
         });
     } catch (err) {
       console.warn('tile load failed', this.key, err);
@@ -408,7 +416,14 @@ function updateNode(tile) {
   const wantSplit = tile.z < ZMAX && screenPx(tile) > SPLIT_PX;
   if (!wantSplit) {
     hideKids(tile);
-    if (tile.state === 'ready') { markVisible(tile); tile.lastUsed = frame; return true; }
+    if (tile.state === 'ready' && tile.orthoDone) {
+      markVisible(tile); tile.lastUsed = frame; return true;
+    }
+    if (tile.state === 'ready') {
+      // Heights ready, ortho still streaming — stay hidden so the parent
+      // keeps covering; showing now would flash hillshade over its ortho.
+      tile.lastUsed = frame; return false;
+    }
     if (tile.state === 'empty') return true;
     enqueue(tile, prio(tile));
     tile.lastUsed = frame;

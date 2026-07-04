@@ -75,3 +75,12 @@ def test_populated_mask():
     assert mask.intersects_tile(18, x + 4, y)    # within 1.2 km buffer
     assert not mask.intersects_tile(18, x + 200, y)   # ~30 km away
     assert not mask.intersects_tile(18, x, y + 200)
+
+
+def test_read_jgw_czech_decimal_comma(tmp_path):
+    jgw = tmp_path / "s.jgw"
+    jgw.write_text(",125\n0\n0\n-,125\n-527499,9375\n-1100000,0625\n")
+    px, left, top = read_jgw(jgw)
+    assert px == 0.125
+    assert left == pytest.approx(-527500.0)
+    assert top == pytest.approx(-1100000.0)

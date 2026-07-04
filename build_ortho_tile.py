@@ -59,8 +59,9 @@ def read_jgw(path: Path) -> tuple[float, float, float]:
 
     JGW stores the CENTRE of the top-left pixel; edges are +-half a pixel.
     Rotation terms are always 0 for ČÚZK sheets (asserted).
+    A handful of ČÚZK world files use Czech decimal commas ("0,125").
     """
-    vals = [float(v) for v in path.read_text().split()]
+    vals = [float(v.replace(",", ".")) for v in path.read_text().split()]
     a, d, b, e, c, f = vals[:6]
     if d != 0.0 or b != 0.0:
         raise ValueError(f"rotated world file not supported: {path}")

@@ -20,11 +20,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from PIL import Image
@@ -124,11 +125,16 @@ def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
     is_base = (z == base_z)
     print(f"[{_now()}] level z={z}: {total:,} tiles "
           f"({'base←SM5 ortho' if is_base else 'agg←children'})", flush=True)
-    coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    # Lazy generator + bounded futures — see dispatch_pyramid._run_level
+    # (materialized coords + exe.map OOM-killed the z=18 run 2026-07-05).
+    def gen():
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                if mask is None or mask.intersects_tile(z, x, y):
+                    yield (x, y)
     if mask is not None:
-        coords = [(x, y) for x, y in coords if mask.intersects_tile(z, x, y)]
-        print(f"  mask: {len(coords):,}/{total:,} tiles populated", flush=True)
-        total = len(coords)
+        total = sum(1 for _ in gen())
+        print(f"  mask: {total:,} tiles populated", flush=True)
 
     def work(xy):
         if stop_event.is_set():
@@ -140,18 +146,22 @@ def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
 
     done = 0
     t0 = time.time()
+    it = gen()
     with ThreadPoolExecutor(max_workers=workers) as exe:
-        for _ in exe.map(work, coords):
-            done += 1
-            if stop_event.is_set():
-                break
-            if done % 500 == 0:
-                rate = done / max(time.time() - t0, 1e-6)
-                with _counters_lock:
-                    c = dict(_counters)
-                print(f"  z={z} {done:,}/{total:,} ({rate:.0f}/s) "
-                      f"ok={c['ok']} skip={c['skip']} empty={c['empty']} "
-                      f"fail={c['fail']}", flush=True)
+        futures = {exe.submit(work, xy) for xy in itertools.islice(it, 512)}
+        while futures and not stop_event.is_set():
+            finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for _ in finished:
+                done += 1
+                if done % 500 == 0:
+                    rate = done / max(time.time() - t0, 1e-6)
+                    with _counters_lock:
+                        c = dict(_counters)
+                    print(f"  z={z} {done:,}/{total:,} ({rate:.0f}/s) "
+                          f"ok={c['ok']} skip={c['skip']} empty={c['empty']} "
+                          f"fail={c['fail']}", flush=True)
+            futures.update(exe.submit(work, xy)
+                           for xy in itertools.islice(it, len(finished)))
 
 
 def main() -> int:

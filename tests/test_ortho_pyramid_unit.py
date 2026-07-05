@@ -84,3 +84,18 @@ def test_read_jgw_czech_decimal_comma(tmp_path):
     assert px == 0.125
     assert left == pytest.approx(-527500.0)
     assert top == pytest.approx(-1100000.0)
+
+
+def test_clip_ring_rectangle():
+    from cz_border import _clip_ring
+    ring = [(0, 0), (10, 0), (10, 10), (0, 10)]        # square 0..10
+    out = _clip_ring(ring, 5, 5, 15, 15)                # clip to 5..15
+    assert sorted(out) == [(5, 5), (5, 10), (10, 5), (10, 10)]
+    assert _clip_ring(ring, 20, 20, 30, 30) == []       # disjoint
+
+
+def test_point_in_ring():
+    from cz_border import _point_in_ring
+    ring = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    assert _point_in_ring(5, 5, ring)
+    assert not _point_in_ring(15, 5, ring)

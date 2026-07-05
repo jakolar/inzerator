@@ -168,10 +168,24 @@ def build_ortho_tile(z: int, x: int, y: int,
                   dst_transform=dst_transform, dst_crs=WMERC,
                   resampling=Resampling.lanczos, init_dest_nodata=False)
 
+    img = Image.fromarray(dst.transpose(1, 2, 0))
+
+    # Clip to the CZ state border: source sheets carry white no-data fill
+    # beyond it. Skipped silently when cz_border.geojson is absent.
+    from cz_border import load_border
+    border = load_border()
+    if border is not None:
+        lbrt = tile_bounds_3857(z, x, y)     # (left, bottom, right, top)
+        cls = border.classify_bbox(*lbrt)
+        if cls == "outside":
+            return False
+        if cls == "crossing":
+            fill = Image.new("RGB", img.size, FILL_RGB)
+            img = Image.composite(img, fill, border.tile_mask(*lbrt, size))
+
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".jpg.tmp")
-    Image.fromarray(dst.transpose(1, 2, 0)).save(
-        tmp, format="JPEG", quality=JPEG_QUALITY, progressive=True)
+    img.save(tmp, format="JPEG", quality=JPEG_QUALITY, progressive=True)
     tmp.replace(out)
 
     if ktx2:

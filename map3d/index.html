@@ -457,6 +457,29 @@ function hideSubtree(tile) {
   hideKids(tile);
 }
 
+// Predictive prefetch: when the fetch queue is idle, warm the tiles the
+// camera is heading towards (~1.5 s ahead at the current LOD) at low
+// priority, so panning reveals ready tiles instead of loading ones.
+const prevTarget = new THREE.Vector3();
+function prefetch() {
+  const v = controls.target.clone().sub(prevTarget);
+  prevTarget.copy(controls.target);
+  if (pending.length || inflight > 1) return;   // only when idle
+  if (v.length() < 2) return;                   // camera not really moving
+  const ahead = controls.target.clone().addScaledVector(v, 90); // ~1.5 s @60fps
+  const mx = ahead.x + ORIGIN.x, my = ORIGIN.y - ahead.z;
+  const z = Math.min(visZMax || ZMIN, ZMAX);
+  const n = 2 ** z;
+  const tx = Math.floor((mx + WMERC) / (2 * WMERC) * n);
+  const ty = Math.floor((WMERC - my) / (2 * WMERC) * n);
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const t = getTile(z, tx + dx, ty + dy);
+      if (t.state === 'idle' && t.inCR) enqueue(t, 1e6);  // behind real work
+    }
+  }
+}
+
 // Evict tiles untouched for a while once over budget (roots stay).
 const CACHE_MAX = 300;
 function evict() {
@@ -483,6 +506,7 @@ function tick() {
   frustum.setFromProjectionMatrix(projView);
   visZMin = 99; visZMax = 0; visCount = 0;
   for (const r of roots) updateNode(r);
+  prefetch();
   pump();
   if (frame % 120 === 0) evict();
   renderer.render(scene, camera);

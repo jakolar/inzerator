@@ -477,7 +477,7 @@ function getTile(z, x, y) {
 
 // ── Fetch queue (bounded; server has _CUZK_SEM=6 and shares the box
 //    with the running dispatch) ─────────────────────────────────────────
-const MAX_INFLIGHT = 4;
+const MAX_INFLIGHT = 6;   // matches Chrome's per-host connection cap
 let inflight = 0;
 const pending = [];
 function enqueue(tile, bias = 0) {
@@ -527,7 +527,11 @@ function screenPx(tile) {
          (2 * dist * Math.tan(camera.fov * Math.PI / 360));
 }
 function prio(tile) {
-  return tile.center.distanceTo(controls.target) / tile.sideM;
+  // Order by screen impact: distance from the CAMERA over tile size
+  // (~1/screenPx). Distance to controls.target misordered tilted views —
+  // the orbit target sits far ahead, so the large tiles right in front
+  // of the camera loaded last.
+  return Math.max(tile.box.distanceToPoint(camera.position), 1) / tile.sideM;
 }
 
 // Walk the desired tree, pushing tiles to display into `show`. Nothing is
@@ -549,7 +553,7 @@ function selectNode(tile, show) {
     // newly entering child streamed in.
     tile.lastUsed = frame;
     if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) return true;
-    if (tile.state === 'idle') enqueue(tile);
+    if (tile.state === 'idle') enqueue(tile, 50);   // after all in-view work
     return false;
   }
   tile.lastUsed = frame;
@@ -601,6 +605,7 @@ function applyVisibility(show) {
   for (const t of next) {
     if (!t.mesh) continue;
     t.mesh.visible = true;
+    t.everShown = true;   // fetch-efficiency metric (HUD console)
     visCount++;
     if (t.z < visZMin) visZMin = t.z;
     if (t.z > visZMax) visZMax = t.z;
@@ -703,12 +708,27 @@ function tick() {
     const zInfo = visCount
       ? (visZMin === visZMax ? `z=${visZMin}` : `z=${visZMin}–${visZMax}`)
       : 'z=—';
+    // GPU memory of the streamed model: height textures + ortho textures
+    // (×1.33 for mipmaps). Shared geometry is a single ~1.3 MB buffer.
+    let gpu = 0;
+    const hBytes = FLOAT_LINEAR ? 4 : 2;
+    for (const t of tiles.values()) {
+      if (t.heightTex) gpu += 256 * 256 * hBytes;
+      if (t.orthoTex) {
+        const im = t.orthoTex.image;
+        gpu += (im?.width ?? 512) * (im?.height ?? 512) * 4 * 1.33;
+      }
+    }
+    const jsHeap = performance.memory
+      ? ` · JS ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB`
+      : '';
     hud.textContent =
       `zoom ${zInfo} · ${visCount} dlaždic na obrazovce\n` +
       `${stats.ready} ready · ${pending.length + inflight} načítá` +
       ` · ${stats.empty} prázdné\n` +
       `cache ${tiles.size} · fetche ${stats.fetches}` +
-      (stats.failed ? ` · chyby ${stats.failed}` : '');
+      (stats.failed ? ` · chyby ${stats.failed}` : '') +
+      `\nGPU ${(gpu / 1048576).toFixed(0)} MB${jsHeap}`;
   }
 }
 tick();

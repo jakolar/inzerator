@@ -49,6 +49,46 @@ FILL_RGB = (107, 112, 95)
 
 _to_sjtsk = Transformer.from_crs(WMERC, SJTSK, always_xy=True)
 
+# Drafted-sheet cache: one z=18 tile shares its source sheet with ~270
+# neighbours, and PIL's convert() decodes the WHOLE 80 MP drafted image —
+# uncached this capped the 2026-07-06 bulk run at 6 tiles/s. Key
+# (jpg_path, k) → (np RGB array, actual per-axis pixel sizes). ~230 MB per
+# draft-2 sheet, so keep the cache tiny; the dispatcher iterates in sheet-
+# sized blocks to make a small cache effective. Per-key locks stop two
+# workers decoding the same sheet twice.
+import collections
+import threading
+_SHEET_CACHE: "collections.OrderedDict" = collections.OrderedDict()
+_SHEET_CACHE_MAX = 6
+_SHEET_CACHE_GUARD = threading.Lock()
+_SHEET_KEY_LOCKS: dict = {}
+
+
+def _load_sheet(jpg: Path, k: int):
+    key = (str(jpg), k)
+    with _SHEET_CACHE_GUARD:
+        if key in _SHEET_CACHE:
+            _SHEET_CACHE.move_to_end(key)
+            return _SHEET_CACHE[key]
+        lock = _SHEET_KEY_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _SHEET_CACHE_GUARD:
+            if key in _SHEET_CACHE:
+                _SHEET_CACHE.move_to_end(key)
+                return _SHEET_CACHE[key]
+        im = Image.open(jpg)
+        ow, oh = im.size
+        im.draft("RGB", (ow // k, oh // k))
+        dw, dh = im.size
+        arr = np.asarray(im.convert("RGB"))
+        entry = (arr, ow / dw, oh / dh)
+        with _SHEET_CACHE_GUARD:
+            _SHEET_CACHE[key] = entry
+            while len(_SHEET_CACHE) > _SHEET_CACHE_MAX:
+                _SHEET_CACHE.popitem(last=False)
+            _SHEET_KEY_LOCKS.pop(key, None)
+        return entry
+
 
 def ortho_out_path(out_dir: Path, z: int, x: int, y: int) -> Path:
     return out_dir / "ortho" / str(z) / str(x) / f"{y}.jpg"
@@ -144,11 +184,8 @@ def build_ortho_tile(z: int, x: int, y: int,
     exmin, eymin, exmax, eymax = env
     for jpg, jgw in sheets:
         px, left, top = read_jgw(jgw)
-        im = Image.open(jpg)
-        ow, oh = im.size
-        im.draft("RGB", (ow // k, oh // k))
-        dw, dh = im.size
-        sx, sy = ow / dw, oh / dh          # actual draft factor (per-axis)
+        sheet, sx, sy = _load_sheet(jpg, k)
+        dh, dw = sheet.shape[:2]
         pxx, pxy = px * sx, px * sy
         # Crop the drafted sheet to the envelope intersection (+1 px pad).
         col0 = max(0, int((exmin - left) / pxx) - 1)
@@ -157,7 +194,7 @@ def build_ortho_tile(z: int, x: int, y: int,
         row1 = min(dh, int(math.ceil((top - eymin) / pxy)) + 1)
         if col0 >= col1 or row0 >= row1:
             continue
-        arr = np.asarray(im.convert("RGB").crop((col0, row0, col1, row1)))
+        arr = sheet[row0:row1, col0:col1]
         src = np.ascontiguousarray(arr.transpose(2, 0, 1))
         src_transform = from_origin(left + col0 * pxx, top - row0 * pxy,
                                     pxx, pxy)

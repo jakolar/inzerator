@@ -127,11 +127,17 @@ def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
           f"({'base←SM5 ortho' if is_base else 'agg←children'})", flush=True)
     # Lazy generator + bounded futures — see dispatch_pyramid._run_level
     # (materialized coords + exe.map OOM-killed the z=18 run 2026-07-05).
+    # Block order (32×32 tiles ≈ one SM5 sheet at z=18) keeps neighbouring
+    # tiles temporally close so the drafted-sheet cache in build_ortho_tile
+    # actually hits; plain column order re-decoded each sheet ~20×.
+    B = 32
     def gen():
-        for x in range(x0, x1 + 1):
-            for y in range(y0, y1 + 1):
-                if mask is None or mask.intersects_tile(z, x, y):
-                    yield (x, y)
+        for bx in range(x0, x1 + 1, B):
+            for by in range(y0, y1 + 1, B):
+                for x in range(bx, min(bx + B, x1 + 1)):
+                    for y in range(by, min(by + B, y1 + 1)):
+                        if mask is None or mask.intersects_tile(z, x, y):
+                            yield (x, y)
     if mask is not None:
         total = sum(1 for _ in gen())
         print(f"  mask: {total:,} tiles populated", flush=True)

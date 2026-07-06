@@ -237,6 +237,26 @@ const ORTHO_WMS_URL = (z, x, y) => {
 };
 const texLoader = new THREE.TextureLoader();
 
+// Ortho loads go through a small gate: TextureLoader alone fires every
+// request immediately, and a horizon view can want hundreds of WMS
+// composites at once — that starved the whole server (2026-07-06 phone
+// report: "925 načítá", flat parent tiles everywhere).
+let orthoInflight = 0;
+const orthoBacklog = [];
+function loadOrtho(url, onOk, onErr) {
+  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr]); return; }
+  orthoInflight++;
+  const next = () => {
+    orthoInflight--;
+    const q = orthoBacklog.shift();
+    if (q) loadOrtho(q[0], q[1], q[2]);
+  };
+  texLoader.load(url,
+    (t) => { next(); onOk(t); },
+    undefined,
+    (e) => { next(); onErr(e); });
+}
+
 const tiles = new Map();   // key "z/x/y" → Tile
 const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
 
@@ -328,11 +348,11 @@ class Tile {
         mat.uniforms.uHasOrtho.value = 1;
         this.orthoDone = true;
       };
-      texLoader.load(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
-        undefined, () => {
+      loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
+        () => {
           const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
           if (!wms) { this.orthoDone = true; return; }
-          texLoader.load(wms, applyOrtho, undefined, () => {
+          loadOrtho(wms, applyOrtho, () => {
             console.warn('ortho load failed', this.key);
             this.orthoDone = true;
           });
@@ -373,6 +393,14 @@ function enqueue(tile, prio) {
 }
 function pump() {
   if (!pending.length || inflight >= MAX_INFLIGHT) return;
+  // Drop queued tiles the quadtree stopped asking for (camera moved on) —
+  // without this a horizon sweep piles up hundreds of stale requests.
+  for (let i = pending.length - 1; i >= 0; i--) {
+    if (frame - (pending[i].lastUsed ?? frame) > 60) {
+      pending[i].state = 'idle';
+      pending.splice(i, 1);
+    }
+  }
   pending.sort((a, b) => a.prio - b.prio);
   while (inflight < MAX_INFLIGHT && pending.length) {
     const t = pending.shift();

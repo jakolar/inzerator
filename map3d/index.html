@@ -293,6 +293,13 @@ class Tile {
     this.box = new THREE.Box3(
       new THREE.Vector3(sw.x, 0, ne.z),
       new THREE.Vector3(ne.x, 1700 * Y_SCALE, sw.z));
+    // Culling box with a quarter-tile margin: tiles just outside the view
+    // still count towards (and block) quad completion, so a small camera
+    // rotation reveals an already-loaded tile instead of downgrading the
+    // whole quad to the coarse parent while the newcomer streams in —
+    // that read as "the valley fills with another layer, then flicks back".
+    this.cullBox = this.box.clone().expandByVector(
+      new THREE.Vector3(this.sideM * 0.25, 0, this.sideM * 0.25));
     const wgs = tileToBBoxWgs(z, x, y);
     this.inCR = !(wgs.e < CR.west || wgs.w > CR.east ||
                   wgs.n < CR.south || wgs.s > CR.north);
@@ -472,7 +479,7 @@ function prio(tile) {
 // pushed tiles (or is genuinely outside coverage).
 function selectNode(tile, show) {
   if (!tile.inCR) return true;
-  if (!frustum.intersectsBox(tile.box)) return true;
+  if (!frustum.intersectsBox(tile.cullBox)) return true;
   tile.lastUsed = frame;
 
   // Hysteresis: once split, merge back only well below the split

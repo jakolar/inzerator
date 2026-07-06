@@ -106,6 +106,13 @@ const toScene = (mx, my) => ({ x: mx - ORIGIN.x, z: -(my - ORIGIN.y) });
 
 // ── three.js scaffolding ──────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true });
+// iOS GPUs can't linear-filter float32 textures (no OES_texture_float_linear)
+// — the sampler returns 0 and terrain renders flat (2026-07-06 iPhone
+// report). Half-float linear IS core WebGL2, so on such devices heights are
+// uploaded as half floats relative to the tile minimum (uHBase adds the
+// offset back in-shader; relative range keeps half precision ≤ ~0.25 m).
+const FLOAT_LINEAR = !!renderer.extensions.get('OES_texture_float_linear')
+  && P.get('half') !== '1';
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
@@ -193,12 +200,12 @@ const sharedGeo = buildTileGeometry();
 
 const VERT = /* glsl */`
   uniform sampler2D uHeight;
-  uniform float uYScale, uSkirtDrop;
+  uniform float uYScale, uSkirtDrop, uHBase;
   attribute float aSkirt;
   varying vec2 vUv;
   void main() {
     vUv = uv;
-    float h = texture2D(uHeight, uv).r;
+    float h = uHBase + texture2D(uHeight, uv).r;
     vec3 p = position;
     p.y = h * uYScale;
     if (aSkirt > 0.5) p.y -= uSkirtDrop;
@@ -210,6 +217,7 @@ const FRAG = /* glsl */`
   uniform float uTexel;     // 1/256
   uniform float uNormMul;   // Y_SCALE / (2 * texel size in mercator m)
   uniform float uHasOrtho;
+  uniform float uHBase;
   uniform float uBare;      // 1 = heights-only view (ignore ortho)
   uniform vec3 uSunDir;
   varying vec2 vUv;
@@ -224,7 +232,7 @@ const FRAG = /* glsl */`
     vec3 base = (uHasOrtho > 0.5 && uBare < 0.5)
       ? texture2D(uOrtho, vUv).rgb
       : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
-            clamp(texture2D(uHeight, vUv).r / 900.0, 0.0, 1.0));
+            clamp((uHBase + texture2D(uHeight, vUv).r) / 900.0, 0.0, 1.0));
     gl_FragColor = vec4(base * shade, 1.0);
   }
 `;
@@ -315,8 +323,16 @@ class Tile {
       for (let i = 0; i < heights.length; i++)
         if (heights[i] <= -9000) heights[i] = min;
 
-      this.heightTex = new THREE.DataTexture(heights, w, h,
-        THREE.RedFormat, THREE.FloatType);
+      let hBase = 0, texData = heights, texType = THREE.FloatType;
+      if (!FLOAT_LINEAR) {
+        hBase = min;
+        const half = new Uint16Array(heights.length);
+        for (let i = 0; i < heights.length; i++)
+          half[i] = THREE.DataUtils.toHalfFloat(heights[i] - min);
+        texData = half; texType = THREE.HalfFloatType;
+      }
+      this.heightTex = new THREE.DataTexture(texData, w, h,
+        THREE.RedFormat, texType);
       this.heightTex.magFilter = this.heightTex.minFilter = THREE.LinearFilter;
       this.heightTex.needsUpdate = true;
 
@@ -326,6 +342,7 @@ class Tile {
           uOrtho: { value: null },
           uHasOrtho: { value: 0 },
           uYScale: { value: Y_SCALE },
+          uHBase: { value: hBase },
           uBare: { value: BARE.checked ? 1 : 0 },
           uSkirtDrop: { value: Math.max(30, this.sideM * 0.01) * Y_SCALE },
           uTexel: { value: 1 / w },

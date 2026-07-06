@@ -287,6 +287,35 @@ function loadOrtho(url, onOk, onErr, stale) {
 const tiles = new Map();   // key "z/x/y" → Tile
 const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
 
+// Fill LIDAR voids from the nearest valid neighbour (row sweep, then
+// column). DMPOK has genuine nodata over water (no returns — e.g. 41% of
+// a z=16 tile on the Dalešice reservoir) plus sub-zero noise (HROT24:
+// −95 m); filling voids with the tile-global minimum carved canyon-like
+// strips into reservoirs. ČR's lowest real point is 115 m, so < 50 m is
+// treated as void too. Returns false when the tile has no valid pixel.
+function fillVoids(a, w, h) {
+  const ok = v => v > 50;
+  let any = false;
+  for (let p = 0; p < 2; p++) {              // pass 0: rows, pass 1: columns
+    const [outer, inner, oStep, iStep] = p === 0 ? [h, w, w, 1] : [w, h, 1, w];
+    for (let r = 0; r < outer; r++) {
+      let last = NaN;
+      for (let i = 0; i < inner; i++) {      // forward
+        const k = r * oStep + i * iStep;
+        if (ok(a[k])) { last = a[k]; any = true; }
+        else if (!Number.isNaN(last)) a[k] = last;
+      }
+      last = NaN;
+      for (let i = inner - 1; i >= 0; i--) { // backward (leading voids)
+        const k = r * oStep + i * iStep;
+        if (ok(a[k])) last = a[k];
+        else if (!Number.isNaN(last)) a[k] = last;
+      }
+    }
+  }
+  return any;
+}
+
 class Tile {
   constructor(z, x, y) {
     this.z = z; this.x = x; this.y = y;
@@ -331,12 +360,10 @@ class Tile {
       const decoded = Lerc.decode(new Uint8Array(await res.arrayBuffer()));
       const w = decoded.width, h = decoded.height;
       const heights = new Float32Array(decoded.pixels[0]);
+      if (!fillVoids(heights, w, h)) { this.state = 'empty'; stats.empty++; return; }
       let min = Infinity;
       for (let i = 0; i < heights.length; i++)
-        if (heights[i] > -9000 && heights[i] < min) min = heights[i];
-      if (!isFinite(min)) { this.state = 'empty'; stats.empty++; return; }
-      for (let i = 0; i < heights.length; i++)
-        if (heights[i] <= -9000) heights[i] = min;
+        if (heights[i] < min) min = heights[i];
 
       let hBase = 0, texData = heights, texType = THREE.FloatType;
       if (!FLOAT_LINEAR) {

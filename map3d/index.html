@@ -13,6 +13,14 @@
     background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
     pointer-events: none; white-space: pre;
   }
+  #ctl {
+    position: fixed; top: 10px; right: 10px; z-index: 5;
+    font: 13px system-ui, sans-serif; color: #dfe7f0;
+    background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
+    display: flex; align-items: center; gap: 7px; cursor: pointer;
+    user-select: none;
+  }
+  #ctl input { accent-color: #7fae6b; }
   #attrib {
     position: fixed; bottom: 8px; right: 10px; z-index: 5;
     font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
@@ -30,6 +38,7 @@
 <body>
 <div id="app"></div>
 <div id="hud">načítám…</div>
+<label id="ctl"><input type="checkbox" id="bareToggle"> jen výšky</label>
 <div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
 <div id="loading"><div id="loadmsg">ČR 3D mapa — načítám dlaždice…</div></div>
 
@@ -79,6 +88,8 @@ function tileToBBoxWgs(z, x, y) {
 
 // ── View state / URL params ───────────────────────────────────────────
 const P = new URLSearchParams(location.search);
+const BARE = document.getElementById('bareToggle');
+BARE.checked = P.get('bare') === '1';
 const startLat = parseFloat(P.get('lat') ?? '49.82');   // ČR centroid-ish
 const startLon = parseFloat(P.get('lon') ?? '15.47');
 const startZ   = parseFloat(P.get('z') ?? '8');
@@ -199,6 +210,7 @@ const FRAG = /* glsl */`
   uniform float uTexel;     // 1/256
   uniform float uNormMul;   // Y_SCALE / (2 * texel size in mercator m)
   uniform float uHasOrtho;
+  uniform float uBare;      // 1 = heights-only view (ignore ortho)
   uniform vec3 uSunDir;
   varying vec2 vUv;
   void main() {
@@ -209,7 +221,7 @@ const FRAG = /* glsl */`
     float hD = texture2D(uHeight, vUv + vec2(0., t)).r;
     vec3 nrm = normalize(vec3((hL - hR) * uNormMul, 1.0, (hU - hD) * uNormMul));
     float shade = 0.4 + 0.6 * max(dot(nrm, uSunDir), 0.0);
-    vec3 base = uHasOrtho > 0.5
+    vec3 base = (uHasOrtho > 0.5 && uBare < 0.5)
       ? texture2D(uOrtho, vUv).rgb
       : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
             clamp(texture2D(uHeight, vUv).r / 900.0, 0.0, 1.0));
@@ -314,6 +326,7 @@ class Tile {
           uOrtho: { value: null },
           uHasOrtho: { value: 0 },
           uYScale: { value: Y_SCALE },
+          uBare: { value: BARE.checked ? 1 : 0 },
           uSkirtDrop: { value: Math.max(30, this.sideM * 0.01) * Y_SCALE },
           uTexel: { value: 1 / w },
           uNormMul: { value: Y_SCALE / (2 * this.sideM / w) },
@@ -525,6 +538,12 @@ let frame = 0, firstRendered = false;
 
 await Lerc.load();
 window.__map3d = { tiles, stats, camera, controls };   // debug console handle
+
+BARE.addEventListener('change', () => {
+  const v = BARE.checked ? 1 : 0;
+  for (const t of tiles.values())
+    if (t.mesh) t.mesh.material.uniforms.uBare.value = v;
+});
 
 function tick() {
   requestAnimationFrame(tick);

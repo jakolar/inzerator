@@ -132,6 +132,7 @@ controls.dampingFactor = 0.12;
 controls.maxPolarAngle = 1.45;                 // keep camera above horizon
 controls.minDistance = 150;
 controls.maxDistance = 900000;
+controls.zoomToCursor = true;   // zoom onto what the cursor/finger points at
 controls.update();
 
 addEventListener('resize', () => {
@@ -263,13 +264,16 @@ const texLoader = new THREE.TextureLoader();
 // report: "925 načítá", flat parent tiles everywhere).
 let orthoInflight = 0;
 const orthoBacklog = [];
-function loadOrtho(url, onOk, onErr) {
-  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr]); return; }
+function loadOrtho(url, onOk, onErr, stale) {
+  // stale() → the tile was disposed while queued; drop silently instead
+  // of firing a WMS composite the server (mid-bake) pays for anyway.
+  if (stale && stale()) return;
+  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr, stale]); return; }
   orthoInflight++;
   const next = () => {
     orthoInflight--;
     const q = orthoBacklog.shift();
-    if (q) loadOrtho(q[0], q[1], q[2]);
+    if (q) loadOrtho(q[0], q[1], q[2], q[3]);
   };
   texLoader.load(url,
     (t) => { next(); onOk(t); },
@@ -319,7 +323,8 @@ class Tile {
     stats.fetches++;
     try {
       const res = await fetch(HEIGHT_URL(this.z, this.x, this.y));
-      if (!res.ok) { this.state = 'empty'; stats.empty++; return; }
+      if (res.status === 404) { this.state = 'empty'; stats.empty++; return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const decoded = Lerc.decode(new Uint8Array(await res.arrayBuffer()));
       const w = decoded.width, h = decoded.height;
       const heights = new Float32Array(decoded.pixels[0]);
@@ -371,33 +376,54 @@ class Tile {
       this.state = 'ready';
       stats.ready++;
 
-      // orthoDone gates LOD refinement: a parent showing ortho must not be
-      // swapped for children still waiting on their texture — that reads
-      // as the whole area flashing to hillshade and back. Set on success
-      // AND on final failure (hillshade fallback is then the tile's look).
-      const applyOrtho = (tex) => {
-        if (!this.mesh) { tex.dispose(); return; }
-        tex.flipY = false;               // raster row 0 = north = uv.v 0
-        tex.colorSpace = THREE.NoColorSpace;  // passthrough shader, no composer
-        tex.anisotropy = 4;
-        this.orthoTex = tex;
-        mat.uniforms.uOrtho.value = tex;
-        mat.uniforms.uHasOrtho.value = 1;
-        this.orthoDone = true;
-      };
-      loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
-        () => {
-          const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
-          if (!wms) { this.orthoDone = true; return; }
-          loadOrtho(wms, applyOrtho, () => {
-            console.warn('ortho load failed', this.key);
-            this.orthoDone = true;
-          });
-        });
+      // Bare (heights-only) mode skips the ortho fetch entirely — it used
+      // to fire a 404 + an expensive WMS composite per tile against the
+      // same server running the z=17/18 bake, for a texture the shader
+      // never samples. Toggling bare off calls requestOrtho() later.
+      if (BARE.checked) this.orthoDone = true;
+      else this.requestOrtho();
     } catch (err) {
-      console.warn('tile load failed', this.key, err);
-      this.state = 'empty'; stats.failed++;
+      // Only a 404 is a durable "no data here". Network hiccups and 5xx
+      // (on-demand build congestion, Tailscale dropouts) back off and
+      // retry — marking those 'empty' froze the area coarse until reload.
+      this.retries = (this.retries ?? 0) + 1;
+      if (this.retries > 3) {
+        console.warn('tile load failed', this.key, err);
+        this.state = 'empty'; stats.failed++;
+        return;
+      }
+      setTimeout(() => { if (this.state === 'loading') this.state = 'idle'; },
+                 1500 * this.retries);
     }
+  }
+  // orthoDone gates LOD refinement: a parent showing ortho must not be
+  // swapped for children still waiting on their texture — that reads as
+  // the whole area flashing to hillshade and back. Set on success AND on
+  // final failure (hillshade fallback is then the tile's look).
+  requestOrtho() {
+    if (this.orthoRequested || !this.mesh) return;
+    this.orthoRequested = true;
+    const stale = () => !this.mesh;   // disposed while queued → drop
+    const applyOrtho = (tex) => {
+      if (!this.mesh) { tex.dispose(); return; }
+      tex.flipY = false;               // raster row 0 = north = uv.v 0
+      tex.colorSpace = THREE.NoColorSpace;  // passthrough shader, no composer
+      tex.anisotropy = 4;
+      this.orthoTex = tex;
+      const u = this.mesh.material.uniforms;
+      u.uOrtho.value = tex;
+      u.uHasOrtho.value = 1;
+      this.orthoDone = true;
+    };
+    loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
+      () => {
+        const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
+        if (!wms) { this.orthoDone = true; return; }
+        loadOrtho(wms, applyOrtho, () => {
+          console.warn('ortho load failed', this.key);
+          this.orthoDone = true;
+        }, stale);
+      }, stale);
   }
   dispose() {
     if (this.mesh) {
@@ -407,6 +433,7 @@ class Tile {
     }
     this.heightTex?.dispose(); this.orthoTex?.dispose();
     this.heightTex = this.orthoTex = null;
+    this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     if (this.state !== 'empty') this.state = 'idle';
     stats.ready = Math.max(0, stats.ready - 1);
   }
@@ -423,9 +450,9 @@ function getTile(z, x, y) {
 const MAX_INFLIGHT = 4;
 let inflight = 0;
 const pending = [];
-function enqueue(tile, prio) {
+function enqueue(tile, bias = 0) {
   if (tile.state !== 'idle') return;
-  tile.state = 'queued'; tile.prio = prio;
+  tile.state = 'queued'; tile.prioBias = bias;
   pending.push(tile);
 }
 function pump() {
@@ -438,6 +465,10 @@ function pump() {
       pending.splice(i, 1);
     }
   }
+  // Live priorities: recompute from the current camera on every dispatch —
+  // an enqueue-time prio from two seconds ago orders loads around where
+  // the camera used to be. Bias: -100 fallback parents, +1e6 prefetch.
+  for (const t of pending) t.prio = prio(t) + (t.prioBias ?? 0);
   pending.sort((a, b) => a.prio - b.prio);
   while (inflight < MAX_INFLIGHT && pending.length) {
     const t = pending.shift();
@@ -496,7 +527,7 @@ function selectNode(tile, show) {
       show.push(tile);
       return true;
     }
-    if (tile.state === 'idle') enqueue(tile, prio(tile));
+    if (tile.state === 'idle') enqueue(tile);
     // Not coverable (loading, or 404-empty inside ČR — e.g. beyond the
     // populated-mask data depth): ancestor keeps covering. Empty tiles
     // used to return "covered", which punched holes in the terrain.
@@ -516,7 +547,7 @@ function selectNode(tile, show) {
   if (covered) { show.push(...kids); return true; }
   // children incomplete → discard the partial set, cover with self
   if (tile.state === 'ready') { show.push(tile); return true; }
-  if (tile.state === 'idle') enqueue(tile, prio(tile) - 100);  // fallback loads first
+  if (tile.state === 'idle') enqueue(tile, -100);  // fallback loads first
   return false;
 }
 
@@ -536,18 +567,15 @@ function applyVisibility(show) {
   shown = next;
 }
 
-// Predictive prefetch: when the fetch queue is idle, warm the tiles the
-// camera is heading towards (~1.5 s ahead at the current LOD) at low
-// priority, so panning reveals ready tiles instead of loading ones.
+// Predictive prefetch: when the fetch queue is idle, warm tiles the camera
+// is heading towards at low priority, so movement reveals ready tiles
+// instead of loading ones. Two predictors: pan (target velocity, ~1.5 s
+// ahead) and zoom-in (camera distance shrinking → next-finer level under
+// the view centre; the pan predictor never fires for zoom because the
+// target barely moves during the most common gesture).
 const prevTarget = new THREE.Vector3();
-function prefetch() {
-  const v = controls.target.clone().sub(prevTarget);
-  prevTarget.copy(controls.target);
-  if (pending.length || inflight > 1) return;   // only when idle
-  if (v.length() < 2) return;                   // camera not really moving
-  const ahead = controls.target.clone().addScaledVector(v, 90); // ~1.5 s @60fps
-  const mx = ahead.x + ORIGIN.x, my = ORIGIN.y - ahead.z;
-  const z = Math.min(visZMax || ZMIN, ZMAX);
+let prevDist = 0;
+function warm3x3(z, mx, my) {
   const n = 2 ** z;
   const tx = Math.floor((mx + WMERC) / (2 * WMERC) * n);
   const ty = Math.floor((WMERC - my) / (2 * WMERC) * n);
@@ -557,6 +585,21 @@ function prefetch() {
       if (t.state === 'idle' && t.inCR) enqueue(t, 1e6);  // behind real work
     }
   }
+}
+function prefetch() {
+  const v = controls.target.clone().sub(prevTarget);
+  prevTarget.copy(controls.target);
+  const dist = camera.position.distanceTo(controls.target);
+  const zoomIn = prevDist > 0 && dist < prevDist * 0.997;
+  prevDist = dist;
+  if (pending.length || inflight > 1) return;   // only when idle
+  if (zoomIn && visZMax && visZMax < ZMAX)
+    warm3x3(visZMax + 1,
+            controls.target.x + ORIGIN.x, ORIGIN.y - controls.target.z);
+  if (v.length() < 2) return;                   // camera not really panning
+  const ahead = controls.target.clone().addScaledVector(v, 90); // ~1.5 s @60fps
+  warm3x3(Math.min(visZMax || ZMIN, ZMAX),
+          ahead.x + ORIGIN.x, ORIGIN.y - ahead.z);
 }
 
 // Evict ready tiles untouched for ~5 s once over the mesh budget (roots
@@ -584,7 +627,10 @@ window.__map3d = { tiles, stats, camera, controls };   // debug console handle
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;
   for (const t of tiles.values())
-    if (t.mesh) t.mesh.material.uniforms.uBare.value = v;
+    if (t.mesh) {
+      t.mesh.material.uniforms.uBare.value = v;
+      if (!BARE.checked) t.requestOrtho();  // bare mode skipped the fetch
+    }
 });
 
 function tick() {

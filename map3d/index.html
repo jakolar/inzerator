@@ -451,6 +451,7 @@ const roots = [];
 const frustum = new THREE.Frustum();
 const projView = new THREE.Matrix4();
 const SPLIT_PX = 384;
+const MERGE_PX = 269;   // SPLIT_PX * 0.7 — split/merge hysteresis
 
 function screenPx(tile) {
   const dist = Math.max(tile.box.distanceToPoint(camera.position), 1);
@@ -461,58 +462,71 @@ function prio(tile) {
   return tile.center.distanceTo(controls.target) / tile.sideM;
 }
 
-// Walk the desired tree. Returns true when the node's area is fully
-// covered (rendered, or empty = nothing to render). A parent stays
-// visible until every non-empty child is ready — replacement refinement,
-// no holes and no parent+child double-draw.
-function updateNode(tile) {
-  // Out-of-coverage: permanently nothing. 404-empty tiles inside ČR still
-  // recurse — children may exist server-side (pre-bake in progress).
+// Walk the desired tree, pushing tiles to display into `show`. Nothing is
+// made visible during the walk — visibility is applied afterwards as a
+// set-diff (applyVisibility), so a frame either keeps the parent or swaps
+// in the complete set of children, never both. The old walk marked ready
+// children visible while siblings still streamed AND kept the parent as
+// cover — two near-coincident surfaces z-fighting ("mapa problikává",
+// 2026-07-06). Returns true when the node's area is fully covered by
+// pushed tiles (or is genuinely outside coverage).
+function selectNode(tile, show) {
   if (!tile.inCR) return true;
-  if (!frustum.intersectsBox(tile.box)) { hideSubtree(tile); return true; }
+  if (!frustum.intersectsBox(tile.box)) return true;
+  tile.lastUsed = frame;
 
-  const wantSplit = tile.z < ZMAX && screenPx(tile) > SPLIT_PX;
+  // Hysteresis: once split, merge back only well below the split
+  // threshold — a camera hovering at the boundary otherwise flips
+  // parent/children every few frames.
+  const wantSplit = tile.z < ZMAX &&
+    screenPx(tile) > (tile._split ? MERGE_PX : SPLIT_PX);
+  tile._split = wantSplit;
+
   if (!wantSplit) {
-    hideKids(tile);
-    if (tile.state === 'ready' && tile.orthoDone) {
-      markVisible(tile); tile.lastUsed = frame; return true;
+    // Ortho gate only matters when ortho is actually drawn — in bare
+    // (heights-only) mode refinement must not wait on WMS composites.
+    if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) {
+      show.push(tile);
+      return true;
     }
-    if (tile.state === 'ready') {
-      // Heights ready, ortho still streaming — stay hidden so the parent
-      // keeps covering; showing now would flash hillshade over its ortho.
-      tile.lastUsed = frame; return false;
+    if (tile.state === 'idle') enqueue(tile, prio(tile));
+    // Not coverable (loading, or 404-empty inside ČR — e.g. beyond the
+    // populated-mask data depth): ancestor keeps covering. Empty tiles
+    // used to return "covered", which punched holes in the terrain.
+    // Stale finer children from before a zoom-out may still cover:
+    if (tile._kids) {
+      const kids = [];
+      let covered = true;
+      for (const c of tile._kids) if (!selectNode(c, kids)) covered = false;
+      if (covered) { show.push(...kids); return true; }
     }
-    if (tile.state === 'empty') return true;
-    enqueue(tile, prio(tile));
-    tile.lastUsed = frame;
     return false;
   }
+
+  const kids = [];
   let covered = true;
-  for (const c of tile.children()) if (!updateNode(c)) covered = false;
-  if (covered) {
-    if (tile.mesh) tile.mesh.visible = false;
-    return true;
-  }
-  // children not ready yet → keep showing self while they stream in
-  if (tile.state === 'ready') { markVisible(tile); tile.lastUsed = frame; return true; }
+  for (const c of tile.children()) if (!selectNode(c, kids)) covered = false;
+  if (covered) { show.push(...kids); return true; }
+  // children incomplete → discard the partial set, cover with self
+  if (tile.state === 'ready') { show.push(tile); return true; }
   if (tile.state === 'idle') enqueue(tile, prio(tile) - 100);  // fallback loads first
-  tile.lastUsed = frame;
-  return tile.state === 'empty';
+  return false;
 }
+
 let visZMin = 99, visZMax = 0, visCount = 0;
-function markVisible(tile) {
-  tile.mesh.visible = true;
-  visCount++;
-  if (tile.z < visZMin) visZMin = tile.z;
-  if (tile.z > visZMax) visZMax = tile.z;
-}
-function hideKids(tile) {
-  if (!tile._kids) return;
-  for (const c of tile._kids) hideSubtree(c);
-}
-function hideSubtree(tile) {
-  if (tile.mesh) tile.mesh.visible = false;
-  hideKids(tile);
+let shown = new Set();
+function applyVisibility(show) {
+  const next = new Set(show);
+  for (const t of shown) if (!next.has(t) && t.mesh) t.mesh.visible = false;
+  visZMin = 99; visZMax = 0; visCount = 0;
+  for (const t of next) {
+    if (!t.mesh) continue;
+    t.mesh.visible = true;
+    visCount++;
+    if (t.z < visZMin) visZMin = t.z;
+    if (t.z > visZMax) visZMax = t.z;
+  }
+  shown = next;
 }
 
 // Predictive prefetch: when the fetch queue is idle, warm the tiles the
@@ -538,14 +552,18 @@ function prefetch() {
   }
 }
 
-// Evict tiles untouched for a while once over budget (roots stay).
+// Evict ready tiles untouched for ~5 s once over the mesh budget (roots
+// stay). Budget counts READY tiles — the tiles map also holds thousands
+// of idle/empty metadata stubs, and budgeting on tiles.size meant every
+// ready tile idle >2 s was disposed each sweep: constant refetch churn
+// (HUD "fetche 2612" for ~200 visible tiles, 2026-07-06).
 const CACHE_MAX = 300;
 function evict() {
-  if (tiles.size <= CACHE_MAX) return;
+  if (stats.ready <= CACHE_MAX) return;
   const candidates = [...tiles.values()]
-    .filter(t => t.z > ZMIN && t.state === 'ready' && frame - (t.lastUsed ?? 0) > 120)
+    .filter(t => t.z > ZMIN && t.state === 'ready' && frame - (t.lastUsed ?? 0) > 300)
     .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
-  for (const t of candidates.slice(0, tiles.size - CACHE_MAX)) t.dispose();
+  for (const t of candidates.slice(0, stats.ready - CACHE_MAX)) t.dispose();
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────
@@ -568,8 +586,9 @@ function tick() {
   controls.update();
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
-  visZMin = 99; visZMax = 0; visCount = 0;
-  for (const r of roots) updateNode(r);
+  const show = [];
+  for (const r of roots) selectNode(r, show);
+  applyVisibility(show);
   prefetch();
   pump();
   if (frame % 120 === 0) evict();

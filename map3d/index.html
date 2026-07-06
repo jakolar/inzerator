@@ -275,8 +275,15 @@ function loadOrtho(url, onOk, onErr, stale) {
   orthoInflight++;
   const next = () => {
     orthoInflight--;
-    const q = orthoBacklog.shift();
-    if (q) loadOrtho(q[0], q[1], q[2], q[3]);
+    // Drain past stale entries until one actually starts — handing the
+    // freed slot to a single stale entry (which no-ops) stalled the rest
+    // of the backlog until some future request kicked it again.
+    while (orthoBacklog.length) {
+      const q = orthoBacklog.shift();
+      if (q[3] && q[3]()) continue;
+      loadOrtho(q[0], q[1], q[2], q[3]);
+      break;
+    }
   };
   texLoader.load(url,
     (t) => { next(); onOk(t); },
@@ -404,6 +411,7 @@ class Tile {
       this.mesh.frustumCulled = false;   // we cull tiles ourselves
       scene.add(this.mesh);
       this.state = 'ready';
+      this.retries = 0;   // transient-failure budget is per load attempt
       stats.ready++;
 
       // Bare (heights-only) mode skips the ortho fetch entirely — it used
@@ -460,12 +468,12 @@ class Tile {
       scene.remove(this.mesh);
       this.mesh.material.dispose();
       this.mesh = null;
+      stats.ready = Math.max(0, stats.ready - 1);
     }
     this.heightTex?.dispose(); this.orthoTex?.dispose();
     this.heightTex = this.orthoTex = null;
     this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     if (this.state !== 'empty') this.state = 'idle';
-    stats.ready = Math.max(0, stats.ready - 1);
   }
 }
 function getTile(z, x, y) {

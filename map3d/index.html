@@ -510,7 +510,18 @@ function prio(tile) {
 // pushed tiles (or is genuinely outside coverage).
 function selectNode(tile, show) {
   if (!tile.inCR) return true;
-  if (!frustum.intersectsBox(tile.cullBox)) return true;
+  if (!frustum.intersectsBox(tile.cullBox)) {
+    // Off-view nodes still gate their parent quad's completion: ready →
+    // covered, otherwise load and report not-covered — they just aren't
+    // rendered. Completion is therefore frustum-independent and MONOTONIC:
+    // camera rotation can never flip a refined quad back to its coarse
+    // parent, which used to read as edge-of-screen layer flicker while a
+    // newly entering child streamed in.
+    tile.lastUsed = frame;
+    if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) return true;
+    if (tile.state === 'idle') enqueue(tile);
+    return false;
+  }
   tile.lastUsed = frame;
 
   // Hysteresis: once split, merge back only well below the split

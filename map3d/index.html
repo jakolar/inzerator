@@ -201,7 +201,7 @@ const sharedGeo = buildTileGeometry();
 
 const VERT = /* glsl */`
   uniform sampler2D uHeight;
-  uniform float uYScale, uSkirtDrop, uHBase;
+  uniform float uYScale, uSkirtFloor, uHBase;
   attribute float aSkirt;
   varying vec2 vUv;
   void main() {
@@ -209,7 +209,10 @@ const VERT = /* glsl */`
     float h = uHBase + texture2D(uHeight, uv).r;
     vec3 p = position;
     p.y = h * uYScale;
-    if (aSkirt > 0.5) p.y -= uSkirtDrop;
+    // Skirt drops to an absolute floor below the tile's own minimum — a
+    // relative drop (1% of tile side) left see-through gaps at steep LOD
+    // boundaries (dam canyons, state-border cliffs).
+    if (aSkirt > 0.5) p.y = uSkirtFloor;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
@@ -356,7 +359,7 @@ class Tile {
           uYScale: { value: Y_SCALE },
           uHBase: { value: hBase },
           uBare: { value: BARE.checked ? 1 : 0 },
-          uSkirtDrop: { value: Math.max(30, this.sideM * 0.01) * Y_SCALE },
+          uSkirtFloor: { value: (min - 30) * Y_SCALE },
           uTexel: { value: 1 / w },
           uNormMul: { value: Y_SCALE / (2 * this.sideM / w) },
           uSunDir: { value: SUN_DIR },

@@ -9,9 +9,10 @@ Kroky níže zůstávají jako fronta práce, nic z nich teď nespouštět.
 - [x] Rozhodnutí: produkce plně online na Hetzner VPS, archiv doma
   (amendment D5 ve spec `docs/superpowers/specs/2026-07-02-cr-3d-map-design.md`)
 - [x] Deploy tooling hotové: `deploy_hetzner.sh`, `deploy/Caddyfile`, tento runbook
-- [x] Pyramida: heightmap z=8..14 kompletní; ortho z=16 + vysoké zoomy
-  dopočítává F3 chain (`f3_chain.sh`, logy `~/Library/Logs/inzerator/f3-*.log`)
-- [ ] Objednat VPS (CX32, Ubuntu 24.04, Falkenstein/Norimberk)
+- [x] Pyramida KOMPLETNÍ (2026-07-07): výšky i ortho z=8..16 celá ČR
+  + z=17/18 populated, border backfill hotový. **265 GB / 11,0 M dlaždic**
+  (dmpok 172 GB / 5 489 281 LERC; ortho 93 GB / 5 503 455 JPEG).
+- [ ] Objednat VPS (CX32 + 300GB Volume, Ubuntu 24.04, Falkenstein/Norimberk)
 - [ ] DNS A záznam domény → IP serveru
 - [ ] Setup serveru (blok níže)
 - [ ] První push: `./deploy_hetzner.sh deploy@<host>`
@@ -23,11 +24,16 @@ se nikdy nekopíruje). Mac po dopočtu F3 jen pushuje delty přes rsync.
 
 ## Volba serveru
 
-**CX32** (4 vCPU, 8 GB, **160 GB NVMe**, ~€7,6/měs) — pyramida má dnes ~4 GB,
-po F3 odhadem 10–40 GB; 160 GB nechává rezervu na KTX2 vedle JPEGů, případné
-z=19/20 populated a další vrstvy. (CX22 s 80 GB by dnes stačil, ale rezerva
-za €3,5 stojí za to. Object Storage netřeba — €6/měs paušál za statiku,
-kterou VPS obslouží levněji a s vlastní doménou bez CDN mezikroku.)
+Finální pyramida měří **265 GB** (změřeno 2026-07-07 po doběhnutí F3 +
+border backfillu) — původní odhad 10–40 GB a CX32/160 GB NVMe nestačí.
+
+**CX32 (4 vCPU, 8 GB, ~€7,6/měs) + 300 GB Volume (~€14/měs) ≈ €22/měs** —
+doporučeno. Volume lze zvětšovat za běhu (z=19/20 populated, KTX2 vedle
+JPEGů); statika sype z disku, výkon Volume (SSD, síťový) na tile serving
+bohatě stačí. Alternativa CX52 (360 GB NVMe, ~€32/měs) je dražší a strop
+360 GB je blízko — další vrstva by stejně vynutila Volume. Object Storage
+netřeba — VPS obslouží statiku levněji a s vlastní doménou bez CDN
+mezikroku.
 
 Latence Falkenstein/Norimberk → ČR ~20–30 ms; CDN pro českou audienci
 neřešíme.
@@ -56,9 +62,11 @@ systemctl reload caddy
 ./deploy_hetzner.sh deploy@mapa.example.com
 ```
 
-- rsync = delta sync; pouštět opakovaně, jak F3 dopočítává (finálně po
-  doběhnutí řetězu). První plný push ~4 GB dnes / desítky GB po F3 —
-  na 100Mbit uploadu hodiny, ne dny.
+- rsync = delta sync. První plný push je **265 GB v 11 M souborech** — na
+  100Mbit uploadu ~6–8 h čistého přenosu, ale metadata scan 11 M souborů
+  je znát: pouštět po vrstvách/úrovních (`rsync .../dmpok/`, pak
+  `.../ortho/16/`, …), ať jde přerušit a navázat. Následné delta syncy
+  jsou levné.
 - Viewer se nahrává se zapečenou tile base `/v1` — produkce nepotřebuje
   žádné URL parametry.
 

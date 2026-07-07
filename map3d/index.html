@@ -294,6 +294,42 @@ function loadOrtho(url, onOk, onErr, stale) {
 const tiles = new Map();   // key "z/x/y" → Tile
 const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
 
+// ── CZ border (simplified ~100 m, mercator) ───────────────────────────
+// Distinguishes two kinds of 404: beyond the data coverage (abroad —
+// nothing will ever be there, the quad counts as covered) vs inside it
+// (populated-mask depth limit — the parent must keep covering). Without
+// this, one abroad child blocked its quad's completion forever and the
+// whole border strip stayed stuck at z=8. Fully-out tiles are also
+// never fetched. Until the polygon loads, everything is 'cross' (fetch
+// and block — the safe default).
+let BORDER = null;
+fetch('cz-border.json').then(r => r.json()).then(p => { BORDER = p; })
+  .catch(e => console.warn('cz-border.json missing', e));
+function pointInBorder(x, y) {
+  let inside = false;
+  for (let i = 0, j = BORDER.length - 1; i < BORDER.length; j = i++) {
+    const [xi, yi] = BORDER[i], [xj, yj] = BORDER[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+      inside = !inside;
+  }
+  return inside;
+}
+function coverage(tile) {
+  if (tile._cov) return tile._cov;
+  if (!BORDER) return 'cross';
+  const b = tileToBBoxMerc(tile.z, tile.x, tile.y);
+  const M = 200;   // safety margin: borderline → 'cross', never 'out'
+  let ins = 0;
+  for (const [px, py] of [[b.w, b.s], [b.w, b.n], [b.e, b.s], [b.e, b.n],
+                          [(b.w + b.e) / 2, (b.s + b.n) / 2]])
+    if (pointInBorder(px, py)) ins++;
+  if (ins > 0 && ins < 5) return (tile._cov = 'cross');
+  for (const [px, py] of BORDER)
+    if (px > b.w - M && px < b.e + M && py > b.s - M && py < b.n + M)
+      return (tile._cov = 'cross');
+  return (tile._cov = ins === 5 ? 'in' : 'out');
+}
+
 // Fill LIDAR voids from the nearest valid neighbour (row sweep, then
 // column). DMPOK has genuine nodata over water (no returns — e.g. 41% of
 // a z=16 tile on the Dalešice reservoir) plus sub-zero noise (HROT24:
@@ -526,6 +562,7 @@ let inflight = 0;
 const pending = [];
 function enqueue(tile, bias = 0) {
   if (tile.state !== 'idle') return;
+  if (coverage(tile) === 'out') { tile.state = 'empty'; return; }  // abroad: no fetch
   tile.state = 'queued'; tile.prioBias = bias;
   pending.push(tile);
 }
@@ -597,6 +634,7 @@ function selectNode(tile, show) {
     // newly entering child streamed in.
     tile.lastUsed = frame;
     if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) return true;
+    if (tile.state === 'empty' && coverage(tile) === 'out') return true;
     if (tile.state === 'idle') enqueue(tile, 50);   // after all in-view work
     return false;
   }
@@ -616,6 +654,9 @@ function selectNode(tile, show) {
       show.push(tile);
       return true;
     }
+    // Abroad: genuinely nothing to render — covered. An empty tile
+    // INSIDE the coverage keeps returning false (ancestor covers).
+    if (tile.state === 'empty' && coverage(tile) === 'out') return true;
     if (tile.state === 'idle') enqueue(tile);
     // Not coverable (loading, or 404-empty inside ČR — e.g. beyond the
     // populated-mask data depth): ancestor keeps covering. Empty tiles

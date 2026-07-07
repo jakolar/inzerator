@@ -176,7 +176,9 @@ def build_ortho_tile(z: int, x: int, y: int,
     if not sheets:
         return False
 
-    k = pick_draft_k(_ground_mpp(z, x, y))
+    # _ground_mpp assumes TILE_PX; larger tiles need a proportionally finer
+    # draft (512^2 @ z=18 → k=1, full-res sheet decode).
+    k = pick_draft_k(_ground_mpp(z, x, y) * TILE_PX / size)
     dst = np.empty((3, size, size), dtype=np.uint8)
     dst[0], dst[1], dst[2] = FILL_RGB[0], FILL_RGB[1], FILL_RGB[2]
     dst_transform = from_bounds(*tile_bounds_3857(z, x, y), size, size)

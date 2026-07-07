@@ -106,12 +106,13 @@ def _build_agg(z: int, x: int, y: int, out_dir: Path) -> str:
 
 
 def _build_base(z: int, x: int, y: int, bulk_dir: Path, out_dir: Path,
-                inv: dict) -> str:
+                inv: dict, size: int = TILE_PX, overwrite: bool = False) -> str:
     out = ortho_out_path(out_dir, z, x, y)
-    if out.exists():
+    if out.exists() and not overwrite:
         return "skip"
     try:
-        ok = build_ortho_tile(z, x, y, bulk_dir, out_dir, inv=inv)
+        ok = build_ortho_tile(z, x, y, bulk_dir, out_dir, inv=inv,
+                              size=size, overwrite=overwrite)
         return "ok" if ok else "empty"
     except Exception as e:                                     # noqa: BLE001
         _log(out_dir, f"FAIL base z={z} x={x} y={y} {e!r}")
@@ -119,7 +120,8 @@ def _build_base(z: int, x: int, y: int, bulk_dir: Path, out_dir: Path,
 
 
 def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
-               workers: int, base_z: int, inv: dict, mask=None) -> None:
+               workers: int, base_z: int, inv: dict, mask=None,
+               size: int = TILE_PX, overwrite: bool = False) -> None:
     x0, x1, y0, y1 = tile_range(bbox, z)
     total = (x1 - x0 + 1) * (y1 - y0 + 1)
     is_base = (z == base_z)
@@ -146,8 +148,8 @@ def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
         if stop_event.is_set():
             return
         x, y = xy
-        r = (_build_base(z, x, y, bulk_dir, out_dir, inv) if is_base
-             else _build_agg(z, x, y, out_dir))
+        r = (_build_base(z, x, y, bulk_dir, out_dir, inv, size, overwrite)
+             if is_base else _build_agg(z, x, y, out_dir))
         _bump(r)
 
     done = 0
@@ -184,6 +186,10 @@ def main() -> int:
                     help="smoke window half-size in base-level tiles")
     ap.add_argument("--mask", help="populated.json — build only tiles "
                     "intersecting the populated mask (spec D3/F3)")
+    ap.add_argument("--size", type=int, default=TILE_PX,
+                    help="base-tile pixel size (512 = @2x quality pass)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="rebuild base tiles that already exist")
     a = ap.parse_args()
     bulk_dir, out_dir = Path(a.bulk_dir), Path(a.out)
 
@@ -220,7 +226,8 @@ def main() -> int:
     for z in range(a.zmax, a.zmin - 1, -1):
         if stop_event.is_set():
             break
-        _run_level(z, bbox, bulk_dir, out_dir, a.workers, a.zmax, inv, mask)
+        _run_level(z, bbox, bulk_dir, out_dir, a.workers, a.zmax, inv, mask,
+                   a.size, a.overwrite)
 
     with _counters_lock:
         c = dict(_counters)

@@ -252,7 +252,11 @@ const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc`;
 // then per-tile WMS cut from local bulk sheets for z>=14 not yet baked,
 // then the shader's hypsometric fallback. Below z=14 the WMS composite
 // would mosaic hundreds of sheets per request → pyramid or nothing.
-const ORTHO_TILE_URL = (z, x, y) => `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg`;
+// ?v= busts the browser's day-long tile cache after an in-place rebake of
+// a level (v=2: z=18 @2x pass started 2026-07-07; bump after it ENDs so
+// areas rebaked later than the first fetch refresh too).
+const ORTHO_TILE_URL = (z, x, y) =>
+  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg${z === 18 ? '?v=2' : ''}`;
 const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);
@@ -850,8 +854,13 @@ function tick() {
     const jsHeap = performance.memory
       ? ` · JS ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB`
       : '';
+    // HD = on-screen tiles with a 512^2 texture (0.20 m/px @2x pass or
+    // hires WMS cut) — quick check that the rebaked tiles actually render.
+    let hd = 0;
+    for (const t of shown) if ((t.orthoTex?.image?.width ?? 0) >= 512) hd++;
     hud.textContent =
-      `zoom ${zInfo} · ${visCount} dlaždic na obrazovce\n` +
+      `zoom ${zInfo} · ${visCount} dlaždic na obrazovce` +
+      (hd ? ` · ${hd} HD` : '') + `\n` +
       `${stats.ready} ready · ${pending.length + inflight} načítá` +
       ` · ${stats.empty} prázdné\n` +
       `cache ${tiles.size} · fetche ${stats.fetches}` +

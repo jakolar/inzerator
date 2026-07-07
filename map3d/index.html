@@ -302,25 +302,61 @@ const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
 // treated as void too. Returns false when the tile has no valid pixel.
 function fillVoids(a, w, h) {
   const ok = v => v > 50;
+  const n = a.length;
+  const voidIdx = [];
   let any = false;
-  for (let p = 0; p < 2; p++) {              // pass 0: rows, pass 1: columns
-    const [outer, inner, oStep, iStep] = p === 0 ? [h, w, w, 1] : [w, h, 1, w];
+  for (let i = 0; i < n; i++) {
+    if (ok(a[i])) any = true;
+    else voidIdx.push(i);
+  }
+  if (!any) return false;
+  if (!voidIdx.length) return true;
+
+  const sweep = (b, outer, inner, oStep, iStep) => {
     for (let r = 0; r < outer; r++) {
       let last = NaN;
-      for (let i = 0; i < inner; i++) {      // forward
+      for (let i = 0; i < inner; i++) {
         const k = r * oStep + i * iStep;
-        if (ok(a[k])) { last = a[k]; any = true; }
-        else if (!Number.isNaN(last)) a[k] = last;
+        if (ok(b[k])) last = b[k];
+        else if (!Number.isNaN(last)) b[k] = last;
       }
       last = NaN;
-      for (let i = inner - 1; i >= 0; i--) { // backward (leading voids)
+      for (let i = inner - 1; i >= 0; i--) {
         const k = r * oStep + i * iStep;
-        if (ok(a[k])) last = a[k];
-        else if (!Number.isNaN(last)) a[k] = last;
+        if (ok(b[k])) last = b[k];
+        else if (!Number.isNaN(last)) b[k] = last;
       }
     }
+  };
+  // Average of horizontal and vertical stretch — a single row sweep
+  // painted barcode-like stripes across large voids (DMPOK correlation
+  // gaps can span half a tile).
+  const H = a.slice(), V = a.slice();
+  sweep(H, h, w, w, 1);
+  sweep(V, w, h, 1, w);
+  for (const k of voidIdx) {
+    const hv = H[k], vv = V[k];
+    a[k] = ok(hv) ? (ok(vv) ? (hv + vv) / 2 : hv) : vv;
   }
-  return any;
+  // Corner blobs whose whole row AND column were void: cascade in place
+  // (after the row sweep every row with any valid pixel is fully valid,
+  // so the column sweep is guaranteed to reach the rest).
+  sweep(a, h, w, w, 1);
+  sweep(a, w, h, 1, w);
+  // A few Gauss-Seidel relaxation passes anchored by the real-data rim
+  // soften the remaining directional banding into a smooth membrane.
+  for (let it = 0; it < 8; it++) {
+    for (const k of voidIdx) {
+      const x = k % w;
+      let s = 0, c = 0;
+      if (x > 0) { s += a[k - 1]; c++; }
+      if (x < w - 1) { s += a[k + 1]; c++; }
+      if (k >= w) { s += a[k - w]; c++; }
+      if (k < n - w) { s += a[k + w]; c++; }
+      a[k] = s / c;
+    }
+  }
+  return true;
 }
 
 class Tile {

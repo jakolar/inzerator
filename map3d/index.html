@@ -617,11 +617,17 @@ function screenPx(tile) {
          (2 * dist * Math.tan(camera.fov * Math.PI / 360));
 }
 function prio(tile) {
-  // Order by screen impact: distance from the CAMERA over tile size
+  // Level-major (breadth-first): all of level z loads before any z+1, so
+  // the view refines evenly one LOD step at a time — pure dist/sideM let
+  // the quad under the camera stream to z=16 while a neighbour sat at
+  // z=11 ("jeden tile detail, vedle hrubý", 2026-07-07). Within a level,
+  // order by screen impact: distance from the CAMERA over tile size
   // (~1/screenPx). Distance to controls.target misordered tilted views —
   // the orbit target sits far ahead, so the large tiles right in front
-  // of the camera loaded last.
-  return Math.max(tile.box.distanceToPoint(camera.position), 1) / tile.sideM;
+  // of the camera loaded last. The 1e4 level stride keeps biases
+  // level-local (±100) except prefetch (1e6), which stays last overall.
+  return tile.z * 1e4 +
+         Math.max(tile.box.distanceToPoint(camera.position), 1) / tile.sideM;
 }
 
 // Walk the desired tree, pushing tiles to display into `show`. Nothing is
@@ -644,7 +650,7 @@ function selectNode(tile, show) {
     tile.lastUsed = frame;
     if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) return true;
     if (tile.state === 'empty' && coverage(tile) === 'out') return true;
-    if (tile.state === 'idle') enqueue(tile, 50);   // after all in-view work
+    if (tile.state === 'idle') enqueue(tile, 50);   // after in-view work of the same level
     return false;
   }
   tile.lastUsed = frame;

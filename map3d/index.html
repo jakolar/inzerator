@@ -444,6 +444,15 @@ class Tile {
       for (let i = 0; i < heights.length; i++)
         if (heights[i] < min) min = heights[i];
 
+      // Coarse CPU copy for the camera ground clamp (4 kB per tile).
+      const G = 32, step = Math.max(1, Math.floor(w / G));
+      this.hGrid = new Float32Array(G * G);
+      for (let gy = 0; gy < G; gy++)
+        for (let gx = 0; gx < G; gx++)
+          this.hGrid[gy * G + gx] =
+            heights[Math.min(h - 1, gy * step + (step >> 1)) * w +
+                    Math.min(w - 1, gx * step + (step >> 1))];
+
       let hBase = 0, texData = heights, texType = THREE.FloatType;
       if (!FLOAT_LINEAR) {
         hBase = min;
@@ -543,7 +552,7 @@ class Tile {
       stats.ready = Math.max(0, stats.ready - 1);
     }
     this.heightTex?.dispose(); this.orthoTex?.dispose();
-    this.heightTex = this.orthoTex = null;
+    this.heightTex = this.orthoTex = this.hGrid = null;
     this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     if (this.state !== 'empty') this.state = 'idle';
   }
@@ -733,6 +742,25 @@ function prefetch() {
           ahead.x + ORIGIN.x, ORIGIN.y - ahead.z);
 }
 
+// Terrain height (m) under a scene-space point, from the finest cached
+// tile — nearest sample of the 32² CPU grids kept for this purpose.
+function terrainH(sx, sz) {
+  const mx = sx + ORIGIN.x, my = ORIGIN.y - sz;
+  for (let z = Math.min(visZMax || ZMIN, ZMAX); z >= ZMIN; z--) {
+    const n = 2 ** z;
+    const tx = Math.floor((mx + WMERC) / (2 * WMERC) * n);
+    const ty = Math.floor((WMERC - my) / (2 * WMERC) * n);
+    const t = tiles.get(`${z}/${tx}/${ty}`);
+    if (!t?.hGrid) continue;
+    const b = tileToBBoxMerc(z, tx, ty);
+    const G = 32;
+    const gx = Math.min(G - 1, Math.floor((mx - b.w) / (b.e - b.w) * G));
+    const gy = Math.min(G - 1, Math.floor((b.n - my) / (b.n - b.s) * G));
+    return t.hGrid[gy * G + gx];
+  }
+  return null;
+}
+
 // Evict ready tiles untouched for ~5 s once over the mesh budget (roots
 // stay). Budget counts READY tiles — the tiles map also holds thousands
 // of idle/empty metadata stubs, and budgeting on tiles.size meant every
@@ -768,6 +796,12 @@ function tick() {
   requestAnimationFrame(tick);
   frame++;
   controls.update();
+  // Ground clamp: flying under the map showed mesh undersides/skirts and
+  // flickered during movement (2026-07-07 report). DSM includes canopy
+  // and buildings, so +20 m clears local obstacles too.
+  const th = terrainH(camera.position.x, camera.position.z);
+  const floorY = th === null ? 5 : (th + 20) * Y_SCALE;
+  if (camera.position.y < floorY) camera.position.y = floorY;
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
   const show = [];

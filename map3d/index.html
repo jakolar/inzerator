@@ -766,7 +766,10 @@ function terrainH(sx, sz) {
 // of idle/empty metadata stubs, and budgeting on tiles.size meant every
 // ready tile idle >2 s was disposed each sweep: constant refetch churn
 // (HUD "fetche 2612" for ~200 visible tiles, 2026-07-06).
-const CACHE_MAX = 300;
+// Scaled by device RAM where the browser reports it (Chrome; Safari gets
+// the 4 GB default): 150 tiles on a 2 GB phone, 600 on an 8 GB desktop.
+const CACHE_MAX = Math.round(
+  300 * Math.min(2, Math.max(0.5, (navigator.deviceMemory ?? 4) / 4)));
 function evict() {
   if (stats.ready <= CACHE_MAX) return;
   const candidates = [...tiles.values()]

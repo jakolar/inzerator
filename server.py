@@ -824,8 +824,34 @@ DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
 
 class ProxyHandler(http.server.SimpleHTTPRequestHandler):
+    # HTTP/1.1 keep-alive: the 3D viewer streams thousands of small tiles
+    # and paid a TCP handshake per tile under the HTTP/1.0 default
+    # (audited 2026-07-07: every send_response block sets Content-Length,
+    # which keep-alive requires). timeout reaps parked idle connections.
+    protocol_version = "HTTP/1.1"
+    timeout = 75
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIRECTORY, **kwargs)
+
+    def send_response(self, code, message=None):
+        self._last_status = code
+        super().send_response(code, message)
+
+    def end_headers(self):
+        # Central cache policy for the tile pyramid + viewer assets.
+        # Tiles are immutable-ish (rebuilds are rare) → a day of caching;
+        # viewer HTML/JSON must revalidate on every load (no-cache means
+        # "revalidate", not "don't store") so code changes arrive without
+        # hard reloads. Never attach caching to non-200s (a cached 404
+        # would outlive the on-demand build that later fills the tile).
+        if getattr(self, "_last_status", None) == 200:
+            p = (self.path or "").split("?", 1)[0]
+            if "/cuzk-pyramid/" in p:
+                self.send_header("Cache-Control", "public, max-age=86400")
+            elif p.endswith((".html", ".json")) or p.endswith("/"):
+                self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
 
     def _proxy_ortofoto_vhr(self, query):
         """Fetch ČÚZK ortofoto at 0.125 m/px native via the public WMS at

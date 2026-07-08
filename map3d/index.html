@@ -288,6 +288,8 @@ const FRAG = /* glsl */`
   uniform float uHBase;
   uniform float uBare;      // 1 = heights-only view (ignore ortho)
   uniform vec3 uSunDir;
+  uniform vec3 uOrthoUv;    // xy offset + z scale: sub-window when the
+                            // texture is inherited from an ancestor tile
   varying vec2 vUv;
   void main() {
     float t = uTexel;
@@ -298,7 +300,7 @@ const FRAG = /* glsl */`
     vec3 nrm = normalize(vec3((hL - hR) * uNormMul, 1.0, (hU - hD) * uNormMul));
     float shade = 0.4 + 0.6 * max(dot(nrm, uSunDir), 0.0);
     vec3 base = (uHasOrtho > 0.5 && uBare < 0.5)
-      ? texture2D(uOrtho, vUv).rgb
+      ? texture2D(uOrtho, uOrthoUv.xy + vUv * uOrthoUv.z).rgb
       : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
             clamp((uHBase + texture2D(uHeight, vUv).r) / 900.0, 0.0, 1.0));
     gl_FragColor = vec4(base * shade, 1.0);
@@ -335,21 +337,26 @@ const texLoader = new THREE.TextureLoader();
 // report: "925 načítá", flat parent tiles everywhere).
 let orthoInflight = 0;
 const orthoBacklog = [];
-function loadOrtho(url, onOk, onErr, stale) {
+function loadOrtho(url, onOk, onErr, stale, tile) {
   // stale() → the tile was disposed while queued; drop silently instead
   // of firing a WMS composite the server (mid-bake) pays for anyway.
   if (stale && stale()) return;
-  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr, stale]); return; }
+  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr, stale, tile]); return; }
   orthoInflight++;
   const next = () => {
     orthoInflight--;
+    // Backlog is priority-ordered like the height queue (level-major +
+    // screen impact) — FIFO sharpened random far tiles before the ones
+    // on screen. Sorted per freed slot: backlog is small (≤ hundreds).
+    orthoBacklog.sort((a, b) =>
+      (a[4] ? prio(a[4]) : 0) - (b[4] ? prio(b[4]) : 0));
     // Drain past stale entries until one actually starts — handing the
     // freed slot to a single stale entry (which no-ops) stalled the rest
     // of the backlog until some future request kicked it again.
     while (orthoBacklog.length) {
       const q = orthoBacklog.shift();
       if (q[3] && q[3]()) continue;
-      loadOrtho(q[0], q[1], q[2], q[3]);
+      loadOrtho(q[0], q[1], q[2], q[3], q[4]);
       break;
     }
   };
@@ -539,6 +546,7 @@ class Tile {
           uHeight: { value: this.heightTex },
           uOrtho: { value: null },
           uHasOrtho: { value: 0 },
+          uOrthoUv: { value: new THREE.Vector3(0, 0, 1) },
           uYScale: { value: Y_SCALE },
           uHBase: { value: hBase },
           uBare: { value: BARE.checked ? 1 : 0 },
@@ -583,10 +591,9 @@ class Tile {
                  1500 * this.retries);
     }
   }
-  // orthoDone gates LOD refinement: a parent showing ortho must not be
-  // swapped for children still waiting on their texture — that reads as
-  // the whole area flashing to hillshade and back. Set on success AND on
-  // final failure (hillshade fallback is then the tile's look).
+  // orthoDone no longer gates refinement (ancestor-texture inheritance
+  // covers the wait); it still marks "this tile's ortho stream finished",
+  // set on success AND on final failure (hillshade is then the look).
   requestOrtho() {
     if (this.orthoRequested || !this.mesh) return;
     this.orthoRequested = true;
@@ -600,6 +607,7 @@ class Tile {
       const u = this.mesh.material.uniforms;
       u.uOrtho.value = tex;
       u.uHasOrtho.value = 1;
+      u.uOrthoUv.value.set(0, 0, 1);   // own texture: full window
       this.orthoDone = true;
     };
     loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
@@ -609,8 +617,8 @@ class Tile {
         loadOrtho(wms, applyOrtho, () => {
           console.warn('ortho load failed', this.key);
           this.orthoDone = true;
-        }, stale);
-      }, stale);
+        }, stale, this);
+      }, stale, this);
   }
   dispose() {
     if (this.mesh) {
@@ -716,7 +724,7 @@ function selectNode(tile, show) {
     // parent, which used to read as edge-of-screen layer flicker while a
     // newly entering child streamed in.
     tile.lastUsed = frame;
-    if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) return true;
+    if (tile.state === 'ready') return true;
     if (tile.state === 'empty' && coverage(tile) === 'out') return true;
     if (tile.state === 'idle') enqueue(tile, 50);   // after in-view work of the same level
     return false;
@@ -731,9 +739,11 @@ function selectNode(tile, show) {
   tile._split = wantSplit;
 
   if (!wantSplit) {
-    // Ortho gate only matters when ortho is actually drawn — in bare
-    // (heights-only) mode refinement must not wait on WMS composites.
-    if (tile.state === 'ready' && (tile.orthoDone || BARE.checked)) {
+    // No ortho gate: a ready tile without its own texture renders with an
+    // inherited ancestor sub-window (applyVisibility) — visually identical
+    // to the parent it replaces, so refinement never waits on the (slower,
+    // unprioritised) ortho stream. It sharpens in place when its JPEG lands.
+    if (tile.state === 'ready') {
       show.push(tile);
       return true;
     }
@@ -777,6 +787,26 @@ function applyVisibility(show) {
     visCount++;
     if (t.z < visZMin) visZMin = t.z;
     if (t.z > visZMax) visZMax = t.z;
+    // Ancestor-texture inheritance: until this tile's own JPEG arrives,
+    // sample the nearest ancestor's texture through a uv sub-window —
+    // pixel-identical to the parent it replaced, so no visible pop.
+    // Re-resolved every frame: an evicted ancestor is swapped for a
+    // higher one on the next pass.
+    if (!t.orthoTex && !BARE.checked) {
+      let anc = null, az = t.z;
+      while (--az >= ZMIN) {
+        const c = tiles.get(`${az}/${t.x >> (t.z - az)}/${t.y >> (t.z - az)}`);
+        if (c?.orthoTex) { anc = c; break; }
+      }
+      const u = t.mesh.material.uniforms;
+      if (anc) {
+        const k = t.z - anc.z, s = 1 / 2 ** k;
+        u.uOrtho.value = anc.orthoTex;
+        u.uHasOrtho.value = 1;
+        u.uOrthoUv.value.set((t.x - (anc.x << k)) * s,
+                             (t.y - (anc.y << k)) * s, s);
+      } else u.uHasOrtho.value = 0;
+    }
   }
   shown = next;
 }
@@ -934,6 +964,7 @@ function tick() {
       `zoom ${zInfo} · ${visCount} dlaždic na obrazovce` +
       (hd ? ` · ${hd} HD` : '') + `\n` +
       `${stats.ready} ready · ${pending.length + inflight} načítá` +
+      ` · ortho ${orthoInflight + orthoBacklog.length}` +
       ` · ${stats.empty} prázdné\n` +
       `cache ${tiles.size} · fetche ${stats.fetches}` +
       (stats.failed ? ` · chyby ${stats.failed}` : '') +

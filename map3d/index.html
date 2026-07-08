@@ -135,6 +135,70 @@ controls.maxDistance = 900000;
 controls.zoomToCursor = true;   // zoom onto what the cursor/finger points at
 controls.update();
 
+// ── Standard mobile-map touch gestures ────────────────────────────────
+// MapControls' built-in TWO = dolly+pan: no rotate/tilt on touch at all,
+// and twist does nothing ("ovládání přes touch není standardní",
+// 2026-07-08). Replace with the map convention: pinch = zoom, two-finger
+// twist = rotate, two-finger vertical drag = tilt, double-tap = zoom in.
+controls.touches.TWO = -1;      // unknown value → controls ignore 2-finger
+{
+  const el = renderer.domElement;
+  const tp = new Map();         // pointerId → [x, y]
+  let gPrev = null;             // {d, a, cy} of the previous 2-finger frame
+  let lastTap = null;           // {t, x, y} for double-tap detection
+  el.addEventListener('pointerdown', e => {
+    if (e.pointerType !== 'touch') return;
+    tp.set(e.pointerId, [e.clientX, e.clientY]);
+    gPrev = null;
+  });
+  el.addEventListener('pointermove', e => {
+    if (!tp.has(e.pointerId)) return;
+    tp.set(e.pointerId, [e.clientX, e.clientY]);
+    if (tp.size !== 2) return;
+    const [p1, p2] = [...tp.values()];
+    const d = Math.max(Math.hypot(p1[0] - p2[0], p1[1] - p2[1]), 1);
+    const a = Math.atan2(p2[1] - p1[1], p2[0] - p1[0]);
+    const cy = (p1[1] + p2[1]) / 2;
+    if (gPrev) {
+      const off = camera.position.clone().sub(controls.target);
+      const sph = new THREE.Spherical().setFromVector3(off);
+      sph.radius = Math.min(Math.max(sph.radius * gPrev.d / d,
+                                     controls.minDistance),
+                            controls.maxDistance);
+      let da = a - gPrev.a;      // twist, wrapped to ±π
+      if (da > Math.PI) da -= 2 * Math.PI;
+      if (da < -Math.PI) da += 2 * Math.PI;
+      sph.theta += da;
+      // two fingers up = tilt towards the horizon (Google convention)
+      sph.phi = Math.min(Math.max(sph.phi - (cy - gPrev.cy) * 0.005, 0.05),
+                         controls.maxPolarAngle);
+      camera.position.copy(controls.target)
+                     .add(new THREE.Vector3().setFromSpherical(sph));
+      camera.lookAt(controls.target);
+    }
+    gPrev = { d, a, cy };
+  });
+  const endTp = e => {
+    if (!tp.has(e.pointerId)) return;
+    const wasSingle = tp.size === 1;
+    const [x, y] = tp.get(e.pointerId);
+    tp.delete(e.pointerId);
+    gPrev = null;
+    if (!wasSingle) { lastTap = null; return; }
+    const now = performance.now();
+    if (lastTap && now - lastTap.t < 300 &&
+        Math.hypot(x - lastTap.x, y - lastTap.y) < 30) {
+      zoomAnim = { from: camera.position.distanceTo(controls.target),
+                   start: now };
+      lastTap = null;
+    } else lastTap = { t: now, x, y };
+  };
+  el.addEventListener('pointerup', endTp);
+  el.addEventListener('pointercancel', e => { tp.delete(e.pointerId); gPrev = null; });
+}
+// Double-tap zoom: halve the orbit distance over 250 ms (applied in tick).
+let zoomAnim = null;
+
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
@@ -809,6 +873,14 @@ function tick() {
   requestAnimationFrame(tick);
   frame++;
   controls.update();
+  if (zoomAnim) {
+    const k = Math.min((performance.now() - zoomAnim.start) / 250, 1);
+    const dist = zoomAnim.from * (1 - 0.5 * (1 - (1 - k) ** 2));  // ease-out to /2
+    camera.position.sub(controls.target)
+          .setLength(Math.max(dist, controls.minDistance))
+          .add(controls.target);
+    if (k >= 1) zoomAnim = null;
+  }
   // Ground clamp: flying under the map showed mesh undersides/skirts and
   // flickered during movement (2026-07-07 report). DSM includes canopy
   // and buildings, so +20 m clears local obstacles too.

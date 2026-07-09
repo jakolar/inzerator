@@ -319,10 +319,9 @@ const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc`;
 // then the shader's hypsometric fallback. Below z=14 the WMS composite
 // would mosaic hundreds of sheets per request → pyramid or nothing.
 // ?v= busts the browser's day-long tile cache after an in-place rebake of
-// a level (v=2: z=18 @2x pass started 2026-07-07; bump after it ENDs so
-// areas rebaked later than the first fetch refresh too).
+// a level (v=3: z=18 @2x pass finished 2026-07-09 — whole level is 512^2).
 const ORTHO_TILE_URL = (z, x, y) =>
-  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg${z === 18 ? '?v=2' : ''}`;
+  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg${z === 18 ? '?v=3' : ''}`;
 const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);

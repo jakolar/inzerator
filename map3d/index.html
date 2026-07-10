@@ -705,6 +705,22 @@ function prio(tile) {
          Math.max(tile.box.distanceToPoint(camera.position), 1) / tile.sideM;
 }
 
+// "Ortho on" invariant: a tile may only be displayed when the shader has
+// something to drape — its own JPEG, an ancestor texture to inherit
+// (applyVisibility sub-window), or a finished-failed stream (hillshade is
+// then the deliberate look). Otherwise the coarser parent keeps covering:
+// briefly blurrier, never height-only. Post-startup this is almost always
+// true via the z=8 roots (never evicted), so refinement speed is unchanged.
+function hasOrthoPath(t) {
+  if (BARE.checked || t.orthoTex || t.orthoDone) return true;
+  let az = t.z;
+  while (--az >= ZMIN) {
+    const c = tiles.get(`${az}/${t.x >> (t.z - az)}/${t.y >> (t.z - az)}`);
+    if (c?.orthoTex) return true;
+  }
+  return false;
+}
+
 // Walk the desired tree, pushing tiles to display into `show`. Nothing is
 // made visible during the walk — visibility is applied afterwards as a
 // set-diff (applyVisibility), so a frame either keeps the parent or swaps
@@ -738,11 +754,12 @@ function selectNode(tile, show) {
   tile._split = wantSplit;
 
   if (!wantSplit) {
-    // No ortho gate: a ready tile without its own texture renders with an
-    // inherited ancestor sub-window (applyVisibility) — visually identical
-    // to the parent it replaces, so refinement never waits on the (slower,
-    // unprioritised) ortho stream. It sharpens in place when its JPEG lands.
-    if (tile.state === 'ready') {
+    // A ready tile without its own texture renders with an inherited
+    // ancestor sub-window (applyVisibility) — visually identical to the
+    // parent it replaces, so refinement doesn't wait on its own JPEG.
+    // hasOrthoPath only blocks the no-ancestor-texture case (startup /
+    // freshly entered z=8 root): height-only tiles must never show.
+    if (tile.state === 'ready' && hasOrthoPath(tile)) {
       show.push(tile);
       return true;
     }
@@ -768,7 +785,7 @@ function selectNode(tile, show) {
   for (const c of tile.children()) if (!selectNode(c, kids)) covered = false;
   if (covered) { show.push(...kids); return true; }
   // children incomplete → discard the partial set, cover with self
-  if (tile.state === 'ready') { show.push(tile); return true; }
+  if (tile.state === 'ready' && hasOrthoPath(tile)) { show.push(tile); return true; }
   if (tile.state === 'idle') enqueue(tile, -100);  // fallback loads first
   return false;
 }
@@ -926,7 +943,10 @@ function tick() {
   if (frame % 120 === 0) evict();
   renderer.render(scene, camera);
 
-  if (!firstRendered && stats.ready > 0) {
+  // visCount, not stats.ready: heights decode before the first ortho JPEG
+  // lands, and hasOrthoPath keeps those tiles hidden — overlay would drop
+  // onto a black screen.
+  if (!firstRendered && visCount > 0) {
     firstRendered = true;
     loading.classList.add('hidden');
   }

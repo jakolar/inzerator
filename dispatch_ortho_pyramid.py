@@ -73,6 +73,8 @@ def downsample_children(children: dict) -> Image.Image | None:
     quad = Image.new("RGB", (2 * TILE_PX, 2 * TILE_PX), FILL_RGB)
     for (qy, qx), im in children.items():
         if im is not None:
+            if im.size != (TILE_PX, TILE_PX):   # @2x 512^2 z=18 children
+                im = im.resize((TILE_PX, TILE_PX), Image.LANCZOS)
             quad.paste(im, (qx * TILE_PX, qy * TILE_PX))
     return quad.resize((TILE_PX, TILE_PX), Image.LANCZOS)
 

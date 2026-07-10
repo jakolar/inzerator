@@ -21,6 +21,15 @@
     user-select: none;
   }
   #ctl input { accent-color: #7fae6b; }
+  #nav {
+    position: fixed; top: 58px; right: 10px; z-index: 5;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #nav button {
+    width: 42px; height: 42px; border-radius: 50%; border: 0;
+    background: rgba(12, 18, 26, .72); color: #dfe7f0;
+    font-size: 20px; cursor: pointer; padding: 0;
+  }
   #attrib {
     position: fixed; bottom: 8px; right: 10px; z-index: 5;
     font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
@@ -39,6 +48,10 @@
 <div id="app"></div>
 <div id="hud">načítám…</div>
 <label id="ctl"><input type="checkbox" id="bareToggle"> jen výšky</label>
+<div id="nav">
+  <button id="northBtn" title="Sever + nadhled">🧭</button>
+  <button id="homeBtn" title="Výchozí pohled">🏠</button>
+</div>
 <div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
 <div id="loading"><div id="loadmsg">ČR 3D mapa — načítám dlaždice…</div></div>
 
@@ -103,6 +116,12 @@ const ZMIN = 8, ZMAX = 18;
 // fp32 precision. Terrain Y = height * Y_SCALE above y=0 globally.
 const ORIGIN = { x: lonToMercX(startLon), y: latToMercY(startLat) };
 const toScene = (mx, my) => ({ x: mx - ORIGIN.x, z: -(my - ORIGIN.y) });
+// Scene-space ČR bbox for the pan clamp (tick).
+const CR_SCENE = {
+  minX: lonToMercX(CR.west) - ORIGIN.x, maxX: lonToMercX(CR.east) - ORIGIN.x,
+  minZ: -(latToMercY(CR.north) - ORIGIN.y),
+  maxZ: -(latToMercY(CR.south) - ORIGIN.y),
+};
 
 // ── three.js scaffolding ──────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -358,6 +377,26 @@ function startZoomAnim(f, anchor = null) {
     mode = null; g = null; panAnchor = null; press = null;
   });
 }
+// Recovery buttons ("ztratil jsem se", 2026-07-10): compass = north-up
+// with a sane tilt, keeping the place; home = fly back to the start view.
+document.getElementById('northBtn').addEventListener('click', () => {
+  const sph = new THREE.Spherical()
+    .setFromVector3(camera.position.clone().sub(controls.target));
+  sph.theta = 0;
+  sph.phi = Math.min(sph.phi, 0.85);
+  camAnim = { cam0: camera.position.clone(), tgt0: controls.target.clone(),
+              cam1: controls.target.clone()
+                      .add(new THREE.Vector3().setFromSpherical(sph)),
+              tgt1: controls.target.clone(),
+              start: performance.now(), dur: 400 };
+});
+document.getElementById('homeBtn').addEventListener('click', () => {
+  const d = 450000 * 2 ** (8 - startZ);
+  camAnim = { cam0: camera.position.clone(), tgt0: controls.target.clone(),
+              cam1: new THREE.Vector3(0, d * 0.85, d * 0.55),
+              tgt1: new THREE.Vector3(0, 0, 0),
+              start: performance.now(), dur: 800 };
+});
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -1083,8 +1122,8 @@ function tick() {
   const dt = Math.min((nowT - lastTick) / 1000, 0.1);
   lastTick = nowT;
   controls.update();
-  if (camAnim) {          // double-tap / two-finger-tap zoom, 250 ms ease-out
-    const k = Math.min((nowT - camAnim.start) / 250, 1);
+  if (camAnim) {          // tap-zoom / compass / home flight, ease-out
+    const k = Math.min((nowT - camAnim.start) / (camAnim.dur ?? 250), 1);
     const ease = 1 - (1 - k) ** 2;
     camera.position.lerpVectors(camAnim.cam0, camAnim.cam1, ease);
     controls.target.lerpVectors(camAnim.tgt0, camAnim.tgt1, ease);
@@ -1097,6 +1136,19 @@ function tick() {
     panVel.multiplyScalar(Math.exp(-dt * 5));
     if (panVel.length() < camera.position.distanceTo(controls.target) * 0.02)
       panVel = null;
+  }
+  // Keep the view over the data: panning/flicking beyond the ČR bbox left
+  // the user stranded over the void ("úplně jsem se ztratil", 2026-07-10).
+  // Clamp the orbit target and drag the camera along by the same delta.
+  {
+    const cx = Math.min(Math.max(controls.target.x, CR_SCENE.minX), CR_SCENE.maxX);
+    const cz = Math.min(Math.max(controls.target.z, CR_SCENE.minZ), CR_SCENE.maxZ);
+    if (cx !== controls.target.x || cz !== controls.target.z) {
+      camera.position.x += cx - controls.target.x;
+      camera.position.z += cz - controls.target.z;
+      controls.target.x = cx; controls.target.z = cz;
+      panVel = null;
+    }
   }
   // Ground clamp: flying under the map showed mesh undersides/skirts and
   // flickered during movement (2026-07-07 report). DSM includes canopy

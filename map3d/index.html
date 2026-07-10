@@ -50,6 +50,10 @@
 <label id="ctl"><input type="checkbox" id="bareToggle"> jen výšky</label>
 <div id="nav">
   <button id="northBtn" title="Sever + nadhled">🧭</button>
+  <button id="rotL" title="Otočit vlevo">⟲</button>
+  <button id="rotR" title="Otočit vpravo">⟳</button>
+  <button id="tiltUp" title="Více shora">⇱</button>
+  <button id="tiltDown" title="Více z úhlu">⇲</button>
   <button id="homeBtn" title="Výchozí pohled">🏠</button>
 </div>
 <div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
@@ -245,7 +249,10 @@ function startZoomAnim(f, anchor = null) {
       const d = Math.max(Math.hypot(p1[0] - p2[0], p1[1] - p2[1]), 1);
       const a = Math.atan2(p2[1] - p1[1], p2[0] - p1[0]);
       g = { d, a, mx, my, start: new Map([...tp].map(([k, v]) => [k, [...v]])),
-            anchor: terrainPoint(mx, my), t0: performance.now(), moved: false };
+            // near-horizon rays miss the ground → fall back to the orbit
+            // target so pinch/twist never go dead
+            anchor: terrainPoint(mx, my) ?? controls.target.clone(),
+            t0: performance.now(), moved: false };
       mode = null;                    // undecided: pinch vs tilt vs 2-finger tap
       panAnchor = null; press = null;
     } else { mode = null; g = null; }
@@ -292,14 +299,18 @@ function startZoomAnim(f, anchor = null) {
         const s = g.start.get(id) ?? p;
         return [p[0] - s[0], p[1] - s[1]];
       });
-      const l1 = Math.hypot(...v1), l2 = Math.hypot(...v2);
       const rel = Math.hypot(v1[0] - v2[0], v1[1] - v2[1]);
       const ax = (v1[0] + v2[0]) / 2, ay = (v1[1] + v2[1]) / 2;
-      if (l1 > 8 && l2 > 8 &&
-          (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2) > 0.7 &&
-          Math.abs(ay) > 1.5 * Math.abs(ax) && rel < 0.6 * Math.hypot(ax, ay))
+      const avg = Math.hypot(ax, ay);
+      // Tilt is tested FIRST and with slack: a real vertical two-finger
+      // drag is sloppy (fingers converge a bit, one leads) and kept
+      // falling into pinch mode where it reads as pan ("interpretuje
+      // náklon jako pohyb", 2026-07-10). Same vertical direction + mostly
+      // vertical + relative motion clearly smaller than common motion.
+      if (v1[1] * v2[1] > 0 && Math.abs(ay) > 8 &&
+          Math.abs(ay) > 1.2 * Math.abs(ax) && rel < 0.8 * avg)
         mode = 'tilt';
-      else if (rel > 12 || Math.hypot(ax, ay) > 14) mode = 'pinch';
+      else if (rel > 15 || avg > 20) mode = 'pinch';
       if (mode) g.moved = true;
     }
     if (mode === 'tilt') {
@@ -377,19 +388,31 @@ function startZoomAnim(f, anchor = null) {
     mode = null; g = null; panAnchor = null; press = null;
   });
 }
-// Recovery buttons ("ztratil jsem se", 2026-07-10): compass = north-up
-// with a sane tilt, keeping the place; home = fly back to the start view.
-document.getElementById('northBtn').addEventListener('click', () => {
+// Recovery + view buttons ("ztratil jsem se" / "UI pro natočení",
+// 2026-07-10): compass = north-up with a sane tilt; ⟲⟳ rotate 45°;
+// ⇱⇲ tilt in 15° steps; home = fly back to the start view.
+function orbitTo(mut, dur = 350) {
   const sph = new THREE.Spherical()
     .setFromVector3(camera.position.clone().sub(controls.target));
-  sph.theta = 0;
-  sph.phi = Math.min(sph.phi, 0.85);
+  mut(sph);
+  sph.phi = Math.min(Math.max(sph.phi, 0.05), controls.maxPolarAngle);
   camAnim = { cam0: camera.position.clone(), tgt0: controls.target.clone(),
               cam1: controls.target.clone()
                       .add(new THREE.Vector3().setFromSpherical(sph)),
               tgt1: controls.target.clone(),
-              start: performance.now(), dur: 400 };
-});
+              start: performance.now(), dur };
+}
+const STEP = Math.PI / 4, TILT = Math.PI / 12;
+document.getElementById('northBtn').addEventListener('click', () =>
+  orbitTo(s => { s.theta = 0; s.phi = Math.min(s.phi, 0.85); }, 400));
+document.getElementById('rotL').addEventListener('click', () =>
+  orbitTo(s => { s.theta -= STEP; }));
+document.getElementById('rotR').addEventListener('click', () =>
+  orbitTo(s => { s.theta += STEP; }));
+document.getElementById('tiltUp').addEventListener('click', () =>
+  orbitTo(s => { s.phi -= TILT; }));
+document.getElementById('tiltDown').addEventListener('click', () =>
+  orbitTo(s => { s.phi += TILT; }));
 document.getElementById('homeBtn').addEventListener('click', () => {
   const d = 450000 * 2 ** (8 - startZ);
   camAnim = { cam0: camera.position.clone(), tgt0: controls.target.clone(),
@@ -554,6 +577,12 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
     while (orthoBacklog.length) {
       const q = orthoBacklog.shift();
       if (q[3] && q[3]()) continue;
+      // Abandoned by the quadtree walk (camera moved on) → drop and allow
+      // a re-request if the tile ever re-enters the view (applyVisibility).
+      if (q[4] && frame - (q[4].lastUsed ?? 0) > 60) {
+        q[4].orthoRequested = false;
+        continue;
+      }
       loadOrtho(q[0], q[1], q[2], q[3], q[4]);
       break;
     }
@@ -900,7 +929,13 @@ function prio(tile) {
   // the orbit target sits far ahead, so the large tiles right in front
   // of the camera loaded last. The 1e4 level stride keeps biases
   // level-local (±100) except prefetch (1e6), which stays last overall.
+  // Off-frustum work (quad-gating siblings, backlogged ortho of tiles that
+  // rotated out of view) sorts after ALL in-view work of the same level —
+  // on a portrait phone the frustum is narrow and distance alone ranked
+  // behind-the-camera tiles equal to on-screen ones. 2000 < the 1e4 level
+  // stride, so the penalty stays level-local.
   return tile.z * 1e4 +
+         (frustum.intersectsBox(tile.cullBox) ? 0 : 2000) +
          Math.max(tile.box.distanceToPoint(camera.position), 1) / tile.sideM;
 }
 
@@ -1008,6 +1043,7 @@ function applyVisibility(show) {
     // Re-resolved every frame: an evicted ancestor is swapped for a
     // higher one on the next pass.
     if (!t.orthoTex && !BARE.checked) {
+      t.requestOrtho();   // no-op unless a backlog drop reset the request
       let anc = null, az = t.z;
       while (--az >= ZMIN) {
         const c = tiles.get(`${az}/${t.x >> (t.z - az)}/${t.y >> (t.z - az)}`);

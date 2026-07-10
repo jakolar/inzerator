@@ -542,8 +542,10 @@ const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc`;
 // would mosaic hundreds of sheets per request → pyramid or nothing.
 // ?v= busts the browser's day-long tile cache after an in-place rebake of
 // a level (v=3: z=18 @2x pass finished 2026-07-09 — whole level is 512^2).
+// ?v= busts the day-long browser tile cache after data rebuilds
+// (v=3: z=18 @2x pass; v=4: z=15..8 re-aggregation, 2026-07-10).
 const ORTHO_TILE_URL = (z, x, y) =>
-  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg${z === 18 ? '?v=3' : ''}`;
+  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg?v=4`;
 const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);

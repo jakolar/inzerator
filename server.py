@@ -2330,7 +2330,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 continue
         if best is None or best_dist > 5.0:  # accept up to 5m off-edge
-            self._send_json({"found": False, "reason": "Žádná budova v okolí 5 m"})
+            self._send_json(200, {"found": False, "reason": "Žádná budova v okolí 5 m"})
             return
         feat, poly = best
         a = feat["attributes"]
@@ -2611,17 +2611,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             "geom": geom,
             "roof": roof_data,
         }
-        self._send_json(out)
-
-    def _send_json(self, obj):
-        import json
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json(200, out)
 
     def _api_roads(self):
         """Fetch OSM roads via Overpass API, return in local coords."""

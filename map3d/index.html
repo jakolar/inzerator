@@ -42,6 +42,22 @@
     font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
     background: rgba(12, 18, 26, .55); border-radius: 6px; padding: 3px 8px;
   }
+  #bsheet {
+    position: fixed; left: 10px; right: 10px; bottom: 10px; z-index: 6;
+    max-width: 420px; max-height: 45%; overflow-y: auto;
+    font: 13px/1.5 system-ui, sans-serif; color: #dfe7f0;
+    background: rgba(12, 18, 26, .88); border-radius: 12px;
+    padding: 12px 14px; touch-action: pan-y;
+  }
+  #bsheet.hidden { display: none; }
+  #bsheet table { border-collapse: collapse; margin-top: 6px; }
+  #bsheet td { padding: 1px 10px 1px 0; vertical-align: top; }
+  #bsheet td:first-child { color: rgba(223, 231, 240, .65); white-space: nowrap; }
+  #bsheet a { color: #9ec7ff; }
+  #bclose {
+    position: absolute; top: 6px; right: 8px; border: 0; background: none;
+    color: #dfe7f0; font-size: 18px; cursor: pointer; padding: 4px;
+  }
   #loading {
     position: fixed; inset: 0; z-index: 10; display: flex;
     align-items: center; justify-content: center;
@@ -63,6 +79,7 @@
   <button id="tiltDown" title="Více z úhlu">⇲</button>
   <button id="homeBtn" title="Výchozí pohled">🏠</button>
 </div>
+<div id="bsheet" class="hidden"><button id="bclose">×</button><div id="bbody"></div></div>
 <div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
 <div id="loading"><div id="loadmsg">ČR 3D mapa — načítám dlaždice…</div></div>
 
@@ -230,6 +247,7 @@ function startZoomAnim(f, anchor = null) {
 {
   const el = renderer.domElement;
   const tp = new Map();     // pointerId → [x, y]
+  let tapTimer = 0;         // pending single-tap → building info
   let mode = null;          // 'pan' | 'tilt' | 'pinch' | 'dtd' | null
   let panAnchor = null;     // grabbed ground point (one-finger pan)
   let panTrace = [];        // recent [t, dx, dz] world deltas → flick inertia
@@ -250,6 +268,7 @@ function startZoomAnim(f, anchor = null) {
           Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {
         mode = 'dtd';                 // second tap: zoom on release, or
         dtdY = e.clientY; dtdMoved = false;   // drag-to-zoom if it moves
+        clearTimeout(tapTimer);       // it's a double-tap, not an info tap
       } else {
         mode = 'pan';
         panAnchor = terrainPoint(e.clientX, e.clientY);
@@ -382,7 +401,14 @@ function startZoomAnim(f, anchor = null) {
     if (mode === 'pan') {
       const isTap = press && now - press.t < 250 &&
         Math.hypot(e.clientX - press.x, e.clientY - press.y) < 10;
-      if (isTap) lastTap = { t: now, x: e.clientX, y: e.clientY };
+      if (isTap) {
+        lastTap = { t: now, x: e.clientX, y: e.clientY };
+        // Single tap = building info — but only once the double-tap window
+        // has passed (a second tap cancels this and zooms instead).
+        const tx = e.clientX, ty = e.clientY;
+        clearTimeout(tapTimer);
+        tapTimer = setTimeout(() => showBuildingInfo(tx, ty), 320);
+      }
       // Flick → inertia; a drag-hold-release must NOT fire it (the trace
       // then only holds stale deltas from before the hold).
       else if (panTrace.length >= 2 &&
@@ -435,6 +461,89 @@ document.getElementById('homeBtn').addEventListener('click', () => {
               tgt1: new THREE.Vector3(0, 0, 0),
               start: performance.now(), dur: 800 };
 });
+
+// ── Building info (tap / click → RÚIAN detail card + footprint) ───────
+// Phase 1 of "klikni na budovu": the tap point is raycast to the terrain,
+// converted to WGS and answered by the existing /api/building-detail
+// (RÚIAN attrs + DSM height + footprint). No 3D picking, no baked vectors.
+const bsheet = document.getElementById('bsheet');
+const bbody = document.getElementById('bbody');
+let bOutline = null, bReq = 0;
+function clearOutline() {
+  if (!bOutline) return;
+  scene.remove(bOutline);
+  bOutline.geometry.dispose();
+  bOutline.material.dispose();
+  bOutline = null;
+}
+function hideBInfo() { bsheet.classList.add('hidden'); clearOutline(); }
+document.getElementById('bclose').addEventListener('click', hideBInfo);
+
+async function showBuildingInfo(px, py) {
+  const p = terrainPoint(px, py);
+  if (!p) return;
+  const lon = (p.x + ORIGIN.x) / WMERC * 180;
+  const lat = mercYToLat(ORIGIN.y - p.z);
+  const req = ++bReq;
+  bsheet.classList.remove('hidden');
+  bbody.textContent = 'Načítám informace o budově…';
+  let d = null;
+  try {
+    const r = await fetch(
+      `/api/building-detail?lon=${lon.toFixed(7)}&lat=${lat.toFixed(7)}`);
+    if (r.ok) d = await r.json();
+  } catch { /* offline / backend-less deploy */ }
+  if (req !== bReq) return;               // superseded by a newer tap
+  if (!d) {
+    bbody.textContent = 'Informace o budovách nejsou dostupné (backend neběží).';
+    clearOutline();
+    return;
+  }
+  if (!d.found) {
+    bbody.textContent = 'V místě není žádná budova (RÚIAN, okruh 5 m).';
+    clearOutline();
+    return;
+  }
+  const rows = [
+    ['Využití', d.zpusob_vyuziti],
+    ['Zastavěná plocha', `${d.plocha_zastavena_m2 ?? d.plocha_polygon_m2} m²`],
+    d.height_m != null ? ['Výška (DSM)', `${d.height_m} m`] : null,
+    d.terrain_slope_pct != null ? ['Sklon terénu', `${d.terrain_slope_pct} %`] : null,
+    ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/stavebniobjekty/` +
+              `${d.ruian_id}" target="_blank" rel="noopener">${d.ruian_id}</a>`],
+  ].filter(Boolean);
+  bbody.innerHTML =
+    `<b>Budova${d.cisladomovni ? ' č. ' + d.cisladomovni : ''}</b><table>` +
+    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('') +
+    '</table>';
+  // Footprint outline draped just above the terrain.
+  clearOutline();
+  const pts = d.footprint_wgs.map(([lo, la]) => {
+    const s = toScene(lonToMercX(lo), latToMercY(la));
+    return new THREE.Vector3(s.x, ((terrainH(s.x, s.z) ?? 0) + 2) * Y_SCALE, s.z);
+  });
+  bOutline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0xffd54a, depthTest: false }));
+  bOutline.renderOrder = 10;
+  scene.add(bOutline);
+}
+// Desktop: a non-drag left click queries directly (no double-click zoom
+// to disambiguate against).
+{
+  const el = renderer.domElement;
+  let mDown = null;
+  el.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button === 0)
+      mDown = [e.clientX, e.clientY];
+  });
+  el.addEventListener('pointerup', e => {
+    if (e.pointerType !== 'mouse' || !mDown) return;
+    const moved = Math.hypot(e.clientX - mDown[0], e.clientY - mDown[1]);
+    mDown = null;
+    if (moved < 5) showBuildingInfo(e.clientX, e.clientY);
+  });
+}
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;

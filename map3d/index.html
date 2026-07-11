@@ -383,7 +383,10 @@ function startZoomAnim(f, anchor = null) {
       const isTap = press && now - press.t < 250 &&
         Math.hypot(e.clientX - press.x, e.clientY - press.y) < 10;
       if (isTap) lastTap = { t: now, x: e.clientX, y: e.clientY };
-      else if (panTrace.length >= 2) {      // flick → inertia (applied in tick)
+      // Flick → inertia; a drag-hold-release must NOT fire it (the trace
+      // then only holds stale deltas from before the hold).
+      else if (panTrace.length >= 2 &&
+               now - panTrace[panTrace.length - 1][0] < 100) {
         let sx = 0, sz = 0;
         for (const [, dx, dz] of panTrace) { sx += dx; sz += dz; }
         const dt = Math.max((now - panTrace[0][0]) / 1000, 0.02);
@@ -514,9 +517,11 @@ const VERT = /* glsl */`
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
-// Ortho brightness: gain + hillshade softening, URL-tunable.
-const OGAIN = parseFloat(P.get('gain') ?? '1.12');
-const OSHADE = parseFloat(P.get('shade') ?? '0.6');
+// Ortho brightness: gain + hillshade softening, URL-tunable. Guard NaN —
+// it would be interpolated into the shader source and kill compilation.
+const _num = (v, dflt) => Number.isFinite(parseFloat(v)) ? parseFloat(v) : dflt;
+const OGAIN = _num(P.get('gain'), 1.12);
+const OSHADE = _num(P.get('shade'), 0.6);
 const FRAG = /* glsl */`
   uniform sampler2D uHeight, uOrtho;
   uniform float uTexel;     // 1/256

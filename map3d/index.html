@@ -524,11 +524,15 @@ const VERT = /* glsl */`
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
-// Ortho brightness: gain + hillshade softening, URL-tunable. Guard NaN —
-// it would be interpolated into the shader source and kill compilation.
+// Ortho grading, URL-tunable (?gain= ?shade= ?gamma= ?sat=). Gamma lifts
+// shadows/mids without clipping highlights the way plain gain does; a
+// touch of saturation counters the flat ČÚZK summer look. Guard NaN — it
+// would be interpolated into the shader source and kill compilation.
 const _num = (v, dflt) => Number.isFinite(parseFloat(v)) ? parseFloat(v) : dflt;
-const OGAIN = _num(P.get('gain'), 1.12);
-const OSHADE = _num(P.get('shade'), 0.6);
+const OGAIN = _num(P.get('gain'), 1.05);
+const OSHADE = _num(P.get('shade'), 0.45);
+const OGAMMA = _num(P.get('gamma'), 1.15);
+const OSAT = _num(P.get('sat'), 1.1);
 const FRAG = /* glsl */`
   uniform sampler2D uHeight, uOrtho;
   uniform float uTexel;     // 1/256
@@ -555,10 +559,17 @@ const FRAG = /* glsl */`
             clamp((uHBase + texture2D(uHeight, vUv).r) / 900.0, 0.0, 1.0));
     // Ortho already carries natural shading — full hillshade on top double-
     // darkened it ("zvýšit brightness orto?", 2026-07-11): soften the
-    // hillshade and add a small gain. Tune via ?gain= and ?shade=.
+    // hillshade, then grade: gamma lift for shadows/mids (no highlight
+    // clipping) + gentle saturation against the flat summer look.
     float sh = ortho ? mix(1.0, shade, ${OSHADE.toFixed(3)}) * ${OGAIN.toFixed(3)}
                      : shade;
-    gl_FragColor = vec4(base * sh, 1.0);
+    vec3 col = base * sh;
+    if (ortho) {
+      col = pow(clamp(col, 0.0, 1.0), vec3(${(1 / OGAMMA).toFixed(4)}));
+      float l = dot(col, vec3(0.299, 0.587, 0.114));
+      col = clamp(mix(vec3(l), col, ${OSAT.toFixed(3)}), 0.0, 1.0);
+    }
+    gl_FragColor = vec4(col, 1.0);
   }
 `;
 const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();

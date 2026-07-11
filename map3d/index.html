@@ -742,10 +742,27 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
       break;
     }
   };
-  texLoader.load(url,
-    (t) => { next(); onOk(t); },
-    undefined,
-    (e) => { next(); onErr(e); });
+  // createImageBitmap decodes the JPEG off the main thread — TextureLoader's
+  // <img> path decodes synchronously at upload and visibly hitched the phone
+  // while a burst of tiles landed. Baked tiles carry no EXIF/alpha, so the
+  // defaults are safe.
+  if (window.createImageBitmap) {
+    fetch(url)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
+      .then(b => createImageBitmap(b))
+      .then(bmp => {
+        next();
+        const t = new THREE.Texture(bmp);
+        t.needsUpdate = true;
+        onOk(t);
+      })
+      .catch(e => { next(); onErr(e); });
+  } else {
+    texLoader.load(url,
+      (t) => { next(); onOk(t); },
+      undefined,
+      (e) => { next(); onErr(e); });
+  }
 }
 
 const tiles = new Map();   // key "z/x/y" → Tile

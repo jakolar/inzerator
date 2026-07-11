@@ -447,7 +447,14 @@ addEventListener('resize', () => {
 // uv.v = 0 at the north edge = LERC/JPEG raster row 0 (flipY=false).
 // Perimeter ring duplicated with aSkirt=1; the vertex shader drops those
 // below the terrain to curtain cracks between neighbouring zoom levels.
-const SEG = 128;   // ponytail: 128 segs for a 256px heightmap; bump to 256 if visuals demand
+// Hi-DPI budget ("telefon má menší rozlišení", 2026-07-11): on a dpr≥2
+// display (phone/retina) the 384 css-px split threshold means 768 device
+// px over a 512^2 texture — refining 1.8× more tiles than the eye can
+// resolve. 288 css px is ~1:1 texel per device px: same sharpness, fewer
+// tiles/fetches/triangles. SEG scales along so the quad density stays
+// ~3 css px on both tiers. dpr-1 desktops are unchanged.
+const HIDPI = devicePixelRatio >= 2;
+const SEG = HIDPI ? 96 : 128;   // segs for a 256px heightmap; texture carries the detail
 function buildTileGeometry() {
   const n = SEG + 1;
   const gridCount = n * n;
@@ -939,8 +946,8 @@ const roots = [];
 
 const frustum = new THREE.Frustum();
 const projView = new THREE.Matrix4();
-const SPLIT_PX = 384;
-const MERGE_PX = 269;   // SPLIT_PX * 0.7 — split/merge hysteresis
+const SPLIT_PX = HIDPI ? 288 : 384;
+const MERGE_PX = Math.round(SPLIT_PX * 0.7);   // split/merge hysteresis
 
 function screenPx(tile) {
   const dist = Math.max(tile.box.distanceToPoint(camera.position), 1);

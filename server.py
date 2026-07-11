@@ -848,7 +848,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if getattr(self, "_last_status", None) == 200:
             p = (self.path or "").split("?", 1)[0]
             if "/cuzk-pyramid/" in p:
-                self.send_header("Cache-Control", "public, max-age=86400")
+                # Tiles are immutable per URL: in-place rebuilds bump the
+                # viewer's ?v= version, so a month-long cache is safe and
+                # saves re-fetches across phone sessions.
+                self.send_header("Cache-Control",
+                                 "public, max-age=2592000, immutable")
             elif p.endswith((".html", ".json")) or p.endswith("/"):
                 self.send_header("Cache-Control", "no-cache")
         super().end_headers()

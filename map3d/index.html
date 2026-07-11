@@ -597,7 +597,7 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
   // stale() → the tile was disposed while queued; drop silently instead
   // of firing a WMS composite the server (mid-bake) pays for anyway.
   if (stale && stale()) return;
-  if (orthoInflight >= 6) { orthoBacklog.push([url, onOk, onErr, stale, tile]); return; }
+  if (orthoInflight >= (H2 ? 12 : 6)) { orthoBacklog.push([url, onOk, onErr, stale, tile]); return; }
   orthoInflight++;
   const next = () => {
     orthoInflight--;
@@ -904,7 +904,13 @@ function getTile(z, x, y) {
 
 // ── Fetch queue (bounded; server has _CUZK_SEM=6 and shares the box
 //    with the running dispatch) ─────────────────────────────────────────
-const MAX_INFLIGHT = 6;   // matches Chrome's per-host connection cap
+// Over HTTP/1.1 the browser multiplexes nothing — 6 matches its per-host
+// connection cap and more would just queue. Over h2/h3 (Tailscale Serve
+// HTTPS, or any TLS proxy) requests share one multiplexed connection, and
+// on a high-latency phone link the depth is what hides the RTT.
+const H2 = /^h[23]/.test(
+  performance.getEntriesByType?.('navigation')?.[0]?.nextHopProtocol ?? '');
+const MAX_INFLIGHT = H2 ? 24 : 6;
 let inflight = 0;
 const pending = [];
 function enqueue(tile, bias = 0) {

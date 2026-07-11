@@ -262,6 +262,10 @@ function startZoomAnim(f, anchor = null) {
     if (e.pointerType !== 'touch') return;
     tp.set(e.pointerId, [e.clientX, e.clientY]);
     camAnim = panVel = null;          // a touch interrupts any animation
+    // Any new touch cancels a pending info-tap — otherwise a pan/pinch
+    // started within the 320 ms window pops the card mid-gesture at the
+    // old tap point. (The dtd branch re-clears; harmless.)
+    clearTimeout(tapTimer);
     if (tp.size === 1) {
       press = { t: performance.now(), x: e.clientX, y: e.clientY };
       if (lastTap && press.t - lastTap.t < 300 &&
@@ -640,7 +644,9 @@ const VERT = /* glsl */`
 const _num = (v, dflt) => Number.isFinite(parseFloat(v)) ? parseFloat(v) : dflt;
 const OGAIN = _num(P.get('gain'), 1.05);
 const OSHADE = _num(P.get('shade'), 0.45);
-const OGAMMA = _num(P.get('gamma'), 1.15);
+// Gamma is inverted into the shader (1/g) — clamp so ?gamma=0 can't
+// interpolate "Infinity" into GLSL and kill the compile.
+const OGAMMA = Math.min(10, Math.max(0.1, _num(P.get('gamma'), 1.15)));
 const OSAT = _num(P.get('sat'), 1.1);
 const FRAG = /* glsl */`
   uniform sampler2D uHeight, uOrtho;
@@ -688,15 +694,15 @@ const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
 // builds missing high zooms on demand); a CDN deploy passes
 // ?tiles=https://<host>/v1 — 404s there just mean "parent tile covers it".
 const TILE_BASE = P.get('tiles') ?? '/cuzk-pyramid';
-const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc`;
+// ?v= busts the (now month-long, immutable) browser cache after in-place
+// height rebuilds — bump to v=2 when the full-CR chain re-aggregates z=17.
+const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc?v=1`;
 // Ortho: pre-baked pyramid JPEG first (F1, dispatch_ortho_pyramid.py),
 // then per-tile WMS cut from local bulk sheets for z>=14 not yet baked,
 // then the shader's hypsometric fallback. Below z=14 the WMS composite
 // would mosaic hundreds of sheets per request → pyramid or nothing.
-// ?v= busts the browser's day-long tile cache after an in-place rebake of
-// a level (v=3: z=18 @2x pass finished 2026-07-09 — whole level is 512^2).
-// ?v= busts the day-long browser tile cache after data rebuilds
-// (v=3: z=18 @2x pass; v=4: z=15..8 re-aggregation, 2026-07-10).
+// ?v= busts the month-long immutable browser tile cache after data
+// rebuilds (v=3: z=18 @2x pass; v=4: z=15..8 re-aggregation, 2026-07-10).
 const ORTHO_TILE_URL = (z, x, y) =>
   `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg?v=4`;
 const ORTHO_WMS_URL = (z, x, y) => {

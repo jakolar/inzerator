@@ -5,7 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>ČR 3D mapa</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #10151c; }
+  /* iOS Safari ignores user-scalable=no: a pinch/double-tap starting on
+     the HUD or escaping the canvas zoomed the WHOLE page incl. UI
+     (2026-07-11 report). touch-action:none + gesturestart preventDefault
+     (script below) kill page zoom; buttons keep taps via manipulation. */
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10151c;
+               touch-action: none; overscroll-behavior: none;
+               -webkit-user-select: none; user-select: none; }
+  #ctl, #nav button { touch-action: manipulation; }
   #app { position: fixed; inset: 0; }
   #hud {
     position: fixed; top: 10px; left: 10px; z-index: 5;
@@ -70,6 +77,11 @@
 import * as THREE from 'three';
 import { MapControls } from 'three/addons/controls/MapControls.js';
 import * as Lerc from 'https://cdn.jsdelivr.net/npm/lerc@4/+esm';
+
+// iOS Safari page-pinch (proprietary gesture events) + double-tap zoom.
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend'])
+  document.addEventListener(ev, e => e.preventDefault());
+document.addEventListener('dblclick', e => e.preventDefault());
 
 // Surface module-level failures in the overlay instead of a stuck spinner.
 window.addEventListener('error', (e) => {
@@ -502,6 +514,9 @@ const VERT = /* glsl */`
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
+// Ortho brightness: gain + hillshade softening, URL-tunable.
+const OGAIN = parseFloat(P.get('gain') ?? '1.12');
+const OSHADE = parseFloat(P.get('shade') ?? '0.6');
 const FRAG = /* glsl */`
   uniform sampler2D uHeight, uOrtho;
   uniform float uTexel;     // 1/256
@@ -521,11 +536,17 @@ const FRAG = /* glsl */`
     float hD = texture2D(uHeight, vUv + vec2(0., t)).r;
     vec3 nrm = normalize(vec3((hL - hR) * uNormMul, 1.0, (hU - hD) * uNormMul));
     float shade = 0.4 + 0.6 * max(dot(nrm, uSunDir), 0.0);
-    vec3 base = (uHasOrtho > 0.5 && uBare < 0.5)
+    bool ortho = uHasOrtho > 0.5 && uBare < 0.5;
+    vec3 base = ortho
       ? texture2D(uOrtho, uOrthoUv.xy + vUv * uOrthoUv.z).rgb
       : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
             clamp((uHBase + texture2D(uHeight, vUv).r) / 900.0, 0.0, 1.0));
-    gl_FragColor = vec4(base * shade, 1.0);
+    // Ortho already carries natural shading — full hillshade on top double-
+    // darkened it ("zvýšit brightness orto?", 2026-07-11): soften the
+    // hillshade and add a small gain. Tune via ?gain= and ?shade=.
+    float sh = ortho ? mix(1.0, shade, ${OSHADE.toFixed(3)}) * ${OGAIN.toFixed(3)}
+                     : shade;
+    gl_FragColor = vec4(base * sh, 1.0);
   }
 `;
 const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();

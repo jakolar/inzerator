@@ -187,8 +187,10 @@ def _log(out_dir: Path, line: str) -> None:
 
 def _run_level(z: int, bbox: tuple, bulk_dir: Path, out_dir: Path,
                max_z_error: float, workers: int, base_z: int,
-               mask=None) -> None:
+               mask=None, x_start=None) -> None:
     x0, x1, y0, y1 = tile_range(bbox, z)
+    if x_start is not None:
+        x0 = max(x0, x_start)   # resume: columns west of x_start are done
     total = (x1 - x0 + 1) * (y1 - y0 + 1)
     is_base = (z == base_z)
     print(f"[{_now()}] level z={z}: {total:,} tiles "
@@ -252,6 +254,10 @@ def main() -> int:
                     help="window half-size in base-zoom tiles (with --center)")
     ap.add_argument("--mask", help="populated.json — build only tiles "
                     "intersecting the populated mask (spec D3/F3)")
+    ap.add_argument("--x-start", type=int, default=None,
+                    help="resume: skip tile columns west of this base-zoom x "
+                    "(enumeration is column-major, so columns < x-start are "
+                    "already fully processed). Single-level runs only.")
     args = ap.parse_args()
 
     base_z = args.zmax
@@ -301,7 +307,7 @@ def main() -> int:
         if stop_event.is_set():
             break
         _run_level(z, bbox, bulk_dir, out_dir, args.max_z_error,
-                   args.workers, base_z, mask)
+                   args.workers, base_z, mask, args.x_start)
 
     with _counters_lock:
         c = dict(_counters)

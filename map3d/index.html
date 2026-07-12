@@ -488,10 +488,18 @@ function applyMask() {
     u.uHasMask.value = maskOn;
   });
 }
+let bGhost = null;
+function clearGhost() {
+  if (!bGhost) return;
+  scene.remove(bGhost);
+  bGhost.children.forEach(o => { o.geometry.dispose(); o.material.dispose(); });
+  bGhost = null;
+}
 function clearMask() {
   if (maskTex !== MASK_EMPTY) maskTex.dispose();
   maskTex = MASK_EMPTY; maskOn = 0;
   applyMask();
+  clearGhost();
 }
 function setBuildingMask(fp) {
   const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
@@ -522,6 +530,30 @@ function setBuildingMask(fp) {
   MASK_RECT.set(x0, z0, 1 / (x1 - x0), 1 / (z1 - z0));
   maskOn = 1;
   applyMask();
+  // X-ray ghost: the DSM blob often leans past the KN footprint and hides
+  // the draped highlight from the far side. GreaterDepth draws the flat
+  // footprint ONLY where the mesh occludes it — visible surfaces keep the
+  // crisp draped mask, hidden parts glow through the building.
+  const gy = ((terrainH(cx, cz) ?? 0) + 1.5) * Y_SCALE;
+  const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, p.z)));
+  const fillGeo = new THREE.ShapeGeometry(shape);
+  fillGeo.rotateX(Math.PI / 2);
+  const fill = new THREE.Mesh(fillGeo, new THREE.MeshBasicMaterial({
+    color: 0xffd54a, transparent: true, opacity: 0.22,
+    depthWrite: false, depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide,
+  }));
+  const line = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(
+      pts.map(p => new THREE.Vector3(p.x, 0, p.z))),
+    new THREE.LineBasicMaterial({
+      color: 0xffd54a, transparent: true, opacity: 0.85,
+      depthWrite: false, depthFunc: THREE.GreaterDepth,
+    }));
+  fill.renderOrder = line.renderOrder = 10;
+  bGhost = new THREE.Group();
+  bGhost.add(fill, line);
+  bGhost.position.y = gy;
+  scene.add(bGhost);
 }
 function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }
 document.getElementById('bclose').addEventListener('click', hideBInfo);

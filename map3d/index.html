@@ -472,15 +472,58 @@ document.getElementById('homeBtn').addEventListener('click', () => {
 // (RÚIAN attrs + DSM height + footprint). No 3D picking, no baked vectors.
 const bsheet = document.getElementById('bsheet');
 const bbody = document.getElementById('bbody');
-let bOutline = null, bReq = 0;
-function clearOutline() {
-  if (!bOutline) return;
-  scene.remove(bOutline);
-  bOutline.geometry.dispose();
-  bOutline.material.dispose();
-  bOutline = null;
+let bReq = 0;
+// Highlight = footprint rasterised into a small world-space canvas (stroke
+// + translucent fill) and projected top-down by the tile shader — it drapes
+// over the DSM building mass instead of cutting through it like a 3D line.
+const MASK_EMPTY = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+MASK_EMPTY.needsUpdate = true;
+const MASK_RECT = new THREE.Vector4(0, 0, 0, 0);
+let maskTex = MASK_EMPTY, maskOn = 0;
+function applyMask() {
+  tiles.forEach(t => {
+    if (!t.mesh) return;
+    const u = t.mesh.material.uniforms;
+    u.uMask.value = maskTex;
+    u.uHasMask.value = maskOn;
+  });
 }
-function hideBInfo() { bsheet.classList.add('hidden'); clearOutline(); }
+function clearMask() {
+  if (maskTex !== MASK_EMPTY) maskTex.dispose();
+  maskTex = MASK_EMPTY; maskOn = 0;
+  applyMask();
+}
+function setBuildingMask(fp) {
+  const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (const p of pts) {
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
+    z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z);
+  }
+  const pad = Math.max(x1 - x0, z1 - z0) * 0.15 + 4;   // room for the stroke
+  x0 -= pad; x1 += pad; z0 -= pad; z1 += pad;
+  // Square the rect so the stroke width is isotropic in world units.
+  const side = Math.max(x1 - x0, z1 - z0);
+  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  x0 = cx - side / 2; x1 = cx + side / 2;
+  z0 = cz - side / 2; z1 = cz + side / 2;
+  const S = 512, c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  g.beginPath();
+  pts.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](
+    (p.x - x0) / (x1 - x0) * S, (p.z - z0) / (z1 - z0) * S));
+  g.closePath();
+  g.fillStyle = 'rgba(255, 213, 74, 0.28)'; g.fill();
+  g.lineWidth = 5; g.strokeStyle = 'rgba(255, 213, 74, 0.95)'; g.stroke();
+  clearMask();
+  maskTex = new THREE.CanvasTexture(c);
+  maskTex.flipY = false;   // canvas row 0 = north (min z) = mask v 0
+  MASK_RECT.set(x0, z0, 1 / (x1 - x0), 1 / (z1 - z0));
+  maskOn = 1;
+  applyMask();
+}
+function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }
 document.getElementById('bclose').addEventListener('click', hideBInfo);
 
 async function showBuildingInfo(px, py) {
@@ -500,12 +543,12 @@ async function showBuildingInfo(px, py) {
   if (req !== bReq) return;               // superseded by a newer tap
   if (!d) {
     bbody.textContent = 'Informace o budovách nejsou dostupné (backend neběží).';
-    clearOutline();
+    clearMask();
     return;
   }
   if (!d.found) {
     bbody.textContent = 'V místě není žádná budova (RÚIAN, okruh 5 m).';
-    clearOutline();
+    clearMask();
     return;
   }
   const rows = [
@@ -520,17 +563,7 @@ async function showBuildingInfo(px, py) {
     `<b>Budova${d.cisladomovni ? ' č. ' + d.cisladomovni : ''}</b><table>` +
     rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('') +
     '</table>';
-  // Footprint outline draped just above the terrain.
-  clearOutline();
-  const pts = d.footprint_wgs.map(([lo, la]) => {
-    const s = toScene(lonToMercX(lo), latToMercY(la));
-    return new THREE.Vector3(s.x, ((terrainH(s.x, s.z) ?? 0) + 2) * Y_SCALE, s.z);
-  });
-  bOutline = new THREE.LineLoop(
-    new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: 0xffd54a, depthTest: false }));
-  bOutline.renderOrder = 10;
-  scene.add(bOutline);
+  setBuildingMask(d.footprint_wgs);
 }
 // Desktop: a non-drag left click queries directly (no double-click zoom
 // to disambiguate against).
@@ -625,6 +658,7 @@ const VERT = /* glsl */`
   uniform float uYScale, uSkirtFloor, uHBase;
   attribute float aSkirt;
   varying vec2 vUv;
+  varying vec2 vWXZ;
   void main() {
     vUv = uv;
     float h = uHBase + texture2D(uHeight, uv).r;
@@ -634,6 +668,7 @@ const VERT = /* glsl */`
     // relative drop (1% of tile side) left see-through gaps at steep LOD
     // boundaries (dam canyons, state-border cliffs).
     if (aSkirt > 0.5) p.y = uSkirtFloor;
+    vWXZ = (modelMatrix * vec4(p, 1.0)).xz;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
@@ -658,7 +693,14 @@ const FRAG = /* glsl */`
   uniform vec3 uSunDir;
   uniform vec3 uOrthoUv;    // xy offset + z scale: sub-window when the
                             // texture is inherited from an ancestor tile
+  // Building-highlight mask projected top-down in scene XZ: rect.xy =
+  // origin, rect.zw = 1/size. Draped in the shader so the stroke hugs the
+  // DSM building mass — a 3D line at terrain height cut through it.
+  uniform sampler2D uMask;
+  uniform vec4 uMaskRect;
+  uniform float uHasMask;
   varying vec2 vUv;
+  varying vec2 vWXZ;
   void main() {
     float t = uTexel;
     float hL = texture2D(uHeight, vUv - vec2(t, 0.)).r;
@@ -683,6 +725,13 @@ const FRAG = /* glsl */`
       col = pow(clamp(col, 0.0, 1.0), vec3(${(1 / OGAMMA).toFixed(4)}));
       float l = dot(col, vec3(0.299, 0.587, 0.114));
       col = clamp(mix(vec3(l), col, ${OSAT.toFixed(3)}), 0.0, 1.0);
+    }
+    if (uHasMask > 0.5) {
+      vec2 mu = (vWXZ - uMaskRect.xy) * uMaskRect.zw;
+      if (mu.x >= 0.0 && mu.x <= 1.0 && mu.y >= 0.0 && mu.y <= 1.0) {
+        vec4 mk = texture2D(uMask, mu);
+        col = mix(col, mk.rgb, mk.a);
+      }
     }
     gl_FragColor = vec4(col, 1.0);
   }
@@ -959,6 +1008,9 @@ class Tile {
           uTexel: { value: 1 / w },
           uNormMul: { value: Y_SCALE / (2 * this.sideM / w) },
           uSunDir: { value: SUN_DIR },
+          uMask: { value: maskTex },
+          uMaskRect: { value: MASK_RECT },   // shared instance — set() propagates
+          uHasMask: { value: maskOn },
         },
         vertexShader: VERT, fragmentShader: FRAG,
         // DoubleSide: the perimeter skirt quads must render from every

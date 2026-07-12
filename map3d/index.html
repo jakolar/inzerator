@@ -730,6 +730,12 @@ const FRAG = /* glsl */`
       vec2 mu = (vWXZ - uMaskRect.xy) * uMaskRect.zw;
       if (mu.x >= 0.0 && mu.x <= 1.0 && mu.y >= 0.0 && mu.y <= 1.0) {
         vec4 mk = texture2D(uMask, mu);
+        // Top-down projection smears the opaque stroke down vertical
+        // walls (whole wall strip sits inside the thin stroke band in
+        // XZ). Clamp mask alpha to the fill level on steep surfaces —
+        // walls get the uniform tint, the crisp line stays on roofs.
+        float wall = 1.0 - smoothstep(0.35, 0.65, nrm.y);
+        mk.a = min(mk.a, mix(1.0, 0.30, wall));
         col = mix(col, mk.rgb, mk.a);
       }
     }

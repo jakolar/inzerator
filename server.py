@@ -2968,6 +2968,14 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             size = 4096
         style = query.get("style", ["normal"])[0]
         bg = query.get("bg", ["transparent"])[0]
+        # SRS: default S-JTSK (heightfield viewer sends 5514 bboxes). map3d
+        # sends its Web-Mercator tile bbox as EPSG:3857 so the PNG drapes
+        # pixel-aligned over the ortho with no reprojection. ČÚZK WMS renders
+        # both natively. Whitelist to keep it out of the URL as an injection.
+        srs = query.get("SRS", query.get("srs", ["EPSG:5514"]))[0]
+        if srs not in ("EPSG:5514", "EPSG:3857", "EPSG:4326"):
+            self.send_error(400, "Invalid SRS")
+            return
         # ČÚZK WMS caps each request at 4096² ("Size of requested map is
         # larger then MaxClientSize"). For larger outputs we fetch a k×k grid
         # of sub-tiles at 4096² each and stitch. k = ceil(size/4096) gives
@@ -3001,7 +3009,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     sub_url = (
                         f"https://services.cuzk.cz/wms/wms.asp?"
                         f"SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
-                        f"&LAYERS={layer}&SRS=EPSG:5514&BBOX={sub_bbox}"
+                        f"&LAYERS={layer}&SRS={srs}&BBOX={sub_bbox}"
                         f"&WIDTH={sub_size}&HEIGHT={sub_size}"
                         f"&FORMAT=image/png&TRANSPARENT=TRUE&STYLES="
                     )

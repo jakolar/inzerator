@@ -196,8 +196,16 @@ function skyTexture() {
   return t;
 }
 scene.background = skyTexture();
-const _fogD = parseFloat(P.get('fog'));   // ?fog=0 disables; default light haze
-scene.fog = new THREE.FogExp2(SKY_HAZE, Number.isFinite(_fogD) ? _fogD : 0.00008);
+// Fog density is recomputed every frame from the camera's orbit distance
+// (see tick). A FIXED FogExp2 density that looked right up close washed the
+// WHOLE country to solid haze when zoomed out — the camera is then 10s–100s
+// of km from terrain, past the e-fold distance, so every tile renders as the
+// haze colour ("mapa nejde vidět"). Scaling density ~ FOG_K/dist keeps the
+// e-fold a constant fraction of the view distance at any zoom. ?fog= tunes
+// the coefficient, ?fog=0 disables.
+const _fogK = parseFloat(P.get('fog'));
+const FOG_K = Number.isFinite(_fogK) ? _fogK : 0.07;
+scene.fog = new THREE.FogExp2(SKY_HAZE, 0);
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 5, 4.0e6);
 // Distance heuristic: z=8 frames all of ČR, each zoom halves it.
@@ -1636,6 +1644,14 @@ function tick() {
   const th = terrainH(camera.position.x, camera.position.z);
   const floorY = th === null ? 5 : (th + 20) * Y_SCALE;
   if (camera.position.y < floorY) camera.position.y = floorY;
+  // Distance-scaled haze: e-fold at a fixed fraction of the orbit distance,
+  // so a zoomed-out country view stays clear while a close/tilted view melts
+  // the far terrain into the horizon. Capped so a street-level view can't
+  // over-haze.
+  if (FOG_K > 0) {
+    const camDist = camera.position.distanceTo(controls.target);
+    scene.fog.density = Math.min(3e-4, FOG_K / Math.max(camDist, 1));
+  }
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
   const show = [];

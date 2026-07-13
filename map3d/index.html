@@ -39,6 +39,33 @@
     background: rgba(12, 18, 26, .72); color: #dfe7f0;
     font-size: 20px; cursor: pointer; padding: 0;
   }
+  #search {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 7; width: min(92vw, 460px); display: none;
+  }
+  #search.open { display: block; }
+  #search input, #search-results { touch-action: manipulation; }
+  #search input {
+    width: 100%; box-sizing: border-box; user-select: text;
+    -webkit-user-select: text; font: 15px system-ui, sans-serif; color: #dfe7f0;
+    background: rgba(12, 18, 26, .94); border: 1px solid rgba(223, 231, 240, .25);
+    border-radius: 8px; padding: 10px 12px; outline: none;
+  }
+  #search input:focus { border-color: #7fae6b; }
+  #search-results {
+    margin-top: 6px; background: rgba(12, 18, 26, .96);
+    border-radius: 8px; overflow-y: auto; max-height: 55vh;
+  }
+  #search-results:empty { display: none; }
+  #search-results .row {
+    padding: 9px 12px; cursor: pointer; color: #dfe7f0;
+    font: 13px/1.35 system-ui, sans-serif; border-bottom: 1px solid rgba(255, 255, 255, .06);
+  }
+  #search-results .row.sel, #search-results .row:hover { background: rgba(127, 174, 107, .22); }
+  #search-results .row small { color: rgba(223, 231, 240, .6); }
+  #search-results .msg {
+    padding: 9px 12px; color: rgba(223, 231, 240, .7); font: 12px system-ui, sans-serif;
+  }
   #attrib {
     position: fixed; bottom: 8px; right: 10px; z-index: 5;
     font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
@@ -74,7 +101,13 @@
 <div id="hud">načítám…</div>
 <label id="ctl"><input type="checkbox" id="bareToggle"> jen výšky</label>
 <label id="ctl2"><input type="checkbox" id="cadToggle"> katastr</label>
+<div id="search">
+  <input id="searchInput" type="text" autocomplete="off"
+         placeholder="Hledat obec, adresu, parcelu…">
+  <div id="search-results"></div>
+</div>
 <div id="nav">
+  <button id="searchBtn" title="Hledat místo">🔍</button>
   <button id="northBtn" title="Sever + nadhled">🧭</button>
   <button id="rotL" title="Otočit vlevo">⟲</button>
   <button id="rotR" title="Otočit vpravo">⟳</button>
@@ -533,6 +566,77 @@ document.getElementById('homeBtn').addEventListener('click', () => {
               cam1: new THREE.Vector3(0, d * 0.85, d * 0.55),
               tgt1: new THREE.Vector3(0, 0, 0),
               start: performance.now(), dur: 800 };
+});
+
+// ── Place search (RÚIAN) → fly the camera to any obec/address/parcel ────
+// Reuses the same camAnim ease-out as the home flight; ORIGIN is fixed at
+// load but toScene + the global tile pyramid cover all of ČR, so flying to a
+// far place just gives it large scene coords (Y_SCALE drift across the ČR
+// latitude band is imperceptible). URL is kept in sync so the view is shareable.
+function flyTo(lon, lat, z = 15) {
+  const p = toScene(lonToMercX(lon), latToMercY(lat));
+  const d = 450000 * 2 ** (8 - z);
+  camAnim = { cam0: camera.position.clone(), tgt0: controls.target.clone(),
+              cam1: new THREE.Vector3(p.x, d * 0.85, p.z + d * 0.55),
+              tgt1: new THREE.Vector3(p.x, 0, p.z),
+              start: performance.now(), dur: 1000 };
+  panVel = null;
+  const u = new URL(location.href);
+  u.searchParams.set('lat', lat.toFixed(5));
+  u.searchParams.set('lon', lon.toFixed(5));
+  u.searchParams.set('z', z);
+  history.replaceState(null, '', u);
+}
+const searchBox = document.getElementById('search');
+const searchInput = document.getElementById('searchInput');
+const searchResults = document.getElementById('search-results');
+let searchHits = [], searchSel = -1, searchTimer = 0;
+function renderSearch() {
+  searchResults.innerHTML = searchHits.map((h, i) =>
+    `<div class="row${i === searchSel ? ' sel' : ''}" data-i="${i}">${h.label}${
+      h.obec && !h.label.includes(h.obec) ? ` <small>${h.obec}</small>` : ''}</div>`
+  ).join('');
+}
+function pickHit(i) {
+  const h = searchHits[i];
+  if (!h) return;
+  flyTo(h.wgs_lon, h.wgs_lat);
+  searchBox.classList.remove('open');
+  searchResults.innerHTML = '';
+  searchInput.blur();
+}
+document.getElementById('searchBtn').addEventListener('click', () => {
+  const open = searchBox.classList.toggle('open');
+  if (open) searchInput.focus();
+  else searchResults.innerHTML = '';
+});
+searchResults.addEventListener('click', e => {
+  const row = e.target.closest('.row');
+  if (row) pickHit(+row.dataset.i);
+});
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = searchInput.value.trim();
+  if (q.length < 2) { searchHits = []; searchResults.innerHTML = ''; return; }
+  searchTimer = setTimeout(async () => {
+    searchResults.innerHTML = '<div class="msg">Hledám…</div>';
+    try {
+      const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=all`);
+      if (!r.ok) { searchResults.innerHTML = '<div class="msg">ČÚZK nedostupné.</div>'; return; }
+      searchHits = (await r.json()).slice(0, 12); searchSel = -1;
+      if (!searchHits.length) searchResults.innerHTML = '<div class="msg">Nic nenalezeno.</div>';
+      else renderSearch();
+    } catch { searchResults.innerHTML = '<div class="msg">Chyba hledání.</div>'; }
+  }, 250);
+});
+searchInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); pickHit(searchSel < 0 ? 0 : searchSel); }
+  else if (e.key === 'Escape') { searchBox.classList.remove('open'); searchInput.blur(); }
+  else if (e.key === 'ArrowDown' && searchHits.length) {
+    e.preventDefault(); searchSel = Math.min(searchSel + 1, searchHits.length - 1); renderSearch();
+  } else if (e.key === 'ArrowUp' && searchHits.length) {
+    e.preventDefault(); searchSel = Math.max(searchSel - 1, 0); renderSearch();
+  }
 });
 
 // ── Building info (tap / click → RÚIAN detail card + footprint) ───────

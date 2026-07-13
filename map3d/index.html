@@ -171,9 +171,33 @@ const FLOAT_LINEAR = !!renderer.extensions.get('OES_texture_float_linear')
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x10151c);
+// Sky: a vertical gradient (zenith blue → horizon haze) as an equirect
+// background, so tilting up shows sky instead of the old black. Paired with
+// haze fog (below) so distant terrain melts into the horizon band rather
+// than ending on a hard edge. Zero download — procedural canvas, unlike
+// gtaol's 5 MB HDR (too heavy for the phone path).
+const SKY_HAZE = 0xc4d6e6;
+function skyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 4; c.height = 512;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 512);
+  grd.addColorStop(0.00, '#c9d8e6');   // (below horizon, canvas bottom after flipY)
+  grd.addColorStop(0.48, '#bcd4e6');   // horizon haze — matches fog colour
+  grd.addColorStop(0.55, '#8fb6da');
+  grd.addColorStop(1.00, '#4a80c4');   // zenith
+  g.fillStyle = grd; g.fillRect(0, 0, 4, 512);
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+scene.background = skyTexture();
+const _fogD = parseFloat(P.get('fog'));   // ?fog=0 disables; default light haze
+scene.fog = new THREE.FogExp2(SKY_HAZE, Number.isFinite(_fogD) ? _fogD : 0.00008);
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 5, 4.0e6);
 // Distance heuristic: z=8 frames all of ČR, each zoom halves it.
@@ -728,6 +752,7 @@ const VERT = /* glsl */`
   attribute float aSkirt;
   varying vec2 vUv;
   varying vec2 vWXZ;
+  #include <fog_pars_vertex>
   void main() {
     vUv = uv;
     float h = uHBase + texture2D(uHeight, uv).r;
@@ -738,7 +763,9 @@ const VERT = /* glsl */`
     // boundaries (dam canyons, state-border cliffs).
     if (aSkirt > 0.5) p.y = uSkirtFloor;
     vWXZ = (modelMatrix * vec4(p, 1.0)).xz;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+    #include <fog_vertex>
+    gl_Position = projectionMatrix * mvPosition;
   }
 `;
 // Ortho grading, URL-tunable (?gain= ?shade= ?gamma= ?sat=). Gamma lifts
@@ -768,12 +795,15 @@ const FRAG = /* glsl */`
   uniform sampler2D uMask;
   uniform vec4 uMaskRect;
   uniform float uHasMask;
-  // Cadastre (KN) overlay: transparent PNG covering this tile's exact bbox
-  // (EPSG:3857), so it samples on vUv like the tile's own ortho.
+  // Cadastre (KN) overlay: transparent PNG. uCadUv is a sub-window like
+  // uOrthoUv so a finer tile can sample a coarser ancestor's cadastre while
+  // its own WMS load is in flight — no pop-in flicker during LOD churn.
   uniform sampler2D uCad;
   uniform float uHasCad;
+  uniform vec3 uCadUv;
   varying vec2 vUv;
   varying vec2 vWXZ;
+  #include <fog_pars_fragment>
   void main() {
     float t = uTexel;
     float hL = texture2D(uHeight, vUv - vec2(t, 0.)).r;
@@ -800,7 +830,7 @@ const FRAG = /* glsl */`
       col = clamp(mix(vec3(l), col, ${OSAT.toFixed(3)}), 0.0, 1.0);
     }
     if (uHasCad > 0.5) {
-      vec4 cad = texture2D(uCad, vUv);
+      vec4 cad = texture2D(uCad, uCadUv.xy + vUv * uCadUv.z);
       col = mix(col, cad.rgb, cad.a);
     }
     if (uHasMask > 0.5) {
@@ -817,6 +847,7 @@ const FRAG = /* glsl */`
       }
     }
     gl_FragColor = vec4(col, 1.0);
+    #include <fog_fragment>
   }
 `;
 const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
@@ -1133,8 +1164,11 @@ class Tile {
           uHasMask: { value: maskOn },
           uCad: { value: null },
           uHasCad: { value: 0 },
+          uCadUv: { value: new THREE.Vector3(0, 0, 1) },
+          ...THREE.UniformsLib.fog,          // fogColor/fogDensity, refreshed by renderer
         },
         vertexShader: VERT, fragmentShader: FRAG,
+        fog: true,                           // include fog chunks + refresh uniforms
         // DoubleSide: the perimeter skirt quads must render from every
         // viewing direction — FrontSide culled them from half the angles,
         // which read as black cracks along LOD boundaries.
@@ -1204,15 +1238,18 @@ class Tile {
     this.cadRequested = true;
     const stale = () => !this.mesh || !CAD.checked;
     loadCad(CAD_URL(this.z, this.x, this.y), (bmp) => {
-      if (!this.mesh || !CAD.checked) return;
+      if (!this.mesh) return;
       const tex = new THREE.Texture(bmp);
       tex.flipY = false;               // raster row 0 = north = uv.v 0
       tex.colorSpace = THREE.NoColorSpace;
+      // Thin high-contrast parcel lines alias badly when the tile is minified
+      // (viewed from afar/oblique) — they shimmered/flickered. Mipmaps +
+      // full anisotropy stabilise them; applyVisibility binds the uniforms.
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.generateMipmaps = true;
+      tex.anisotropy = MAX_ANISO;
       tex.needsUpdate = true;
       this.cadTex = tex;
-      const u = this.mesh.material.uniforms;
-      u.uCad.value = tex;
-      u.uHasCad.value = CAD.checked ? 1 : 0;
     }, stale);
   }
   dispose() {
@@ -1417,7 +1454,29 @@ function applyVisibility(show) {
     // pixel-identical to the parent it replaced, so no visible pop.
     // Re-resolved every frame: an evicted ancestor is swapped for a
     // higher one on the next pass.
-    if (CAD.checked && !t.cadTex) t.requestCad();   // z<16 → no-op
+    // Cadastre: mirror the ortho inheritance so a finer tile shows a coarser
+    // ancestor's parcel overlay through a uv sub-window until its own WMS PNG
+    // lands — kills the pop-in flicker during LOD splits at high zoom.
+    {
+      const u = t.mesh.material.uniforms;
+      if (CAD.checked) {
+        if (t.z >= CAD_MIN_Z && !t.cadTex) t.requestCad();
+        if (t.cadTex) {
+          u.uCad.value = t.cadTex; u.uHasCad.value = 1; u.uCadUv.value.set(0, 0, 1);
+        } else {
+          let anc = null, az = t.z;
+          while (--az >= CAD_MIN_Z) {
+            const c = tiles.get(`${az}/${t.x >> (t.z - az)}/${t.y >> (t.z - az)}`);
+            if (c?.cadTex) { anc = c; break; }
+          }
+          if (anc) {
+            const k = t.z - anc.z, s = 1 / 2 ** k;
+            u.uCad.value = anc.cadTex; u.uHasCad.value = 1;
+            u.uCadUv.value.set((t.x - (anc.x << k)) * s, (t.y - (anc.y << k)) * s, s);
+          } else u.uHasCad.value = 0;
+        }
+      } else if (u.uHasCad.value) u.uHasCad.value = 0;
+    }
     if (!t.orthoTex && !BARE.checked) {
       t.requestOrtho();   // no-op unless a backlog drop reset the request
       let anc = null, az = t.z;
@@ -1527,15 +1586,12 @@ BARE.addEventListener('change', () => {
 });
 
 CAD.addEventListener('change', () => {
-  for (const t of tiles.values()) {
-    if (!t.mesh) continue;
-    if (CAD.checked) {
-      if (t.cadTex) t.mesh.material.uniforms.uHasCad.value = 1;
-      else if (t.mesh.visible) t.requestCad();   // fetch for on-screen tiles
-    } else {
-      t.mesh.material.uniforms.uHasCad.value = 0;   // keep tex for re-toggle
-    }
-  }
+  // applyVisibility binds/unbinds uCad and resolves inheritance each frame;
+  // just kick fetches for on-screen tiles now so the overlay appears without
+  // waiting for the next camera move.
+  if (CAD.checked)
+    for (const t of tiles.values())
+      if (t.mesh?.visible && !t.cadTex) t.requestCad();
 });
 
 let lastTick = performance.now();

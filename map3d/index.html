@@ -1559,21 +1559,41 @@ function terrainH(sx, sz) {
   return null;
 }
 
-// Evict ready tiles untouched for ~5 s once over the mesh budget (roots
-// stay). Budget counts READY tiles — the tiles map also holds thousands
-// of idle/empty metadata stubs, and budgeting on tiles.size meant every
-// ready tile idle >2 s was disposed each sweep: constant refetch churn
-// (HUD "fetche 2612" for ~200 visible tiles, 2026-07-06).
-// Scaled by device RAM where the browser reports it (Chrome; Safari gets
-// the 4 GB default): 150 tiles on a 2 GB phone, 600 on an 8 GB desktop.
-const CACHE_MAX = Math.round(
-  300 * Math.min(2, Math.max(0.5, (navigator.deviceMemory ?? 4) / 4)));
+// Budget counts READY tiles (the tiles map also holds thousands of
+// idle/empty metadata stubs). Chrome scales it by reported RAM; Safari never
+// reports deviceMemory — assume a PHONE (tight budget), not the old 4 GB
+// default that let a tilted/wide view balloon past 300 tiles / 600 MB and
+// reload the tab.
+const CACHE_MAX = navigator.deviceMemory
+  ? Math.round(300 * Math.min(2, Math.max(0.5, navigator.deviceMemory / 4)))
+  : 180;
+// Camera-settled gate: disposing tiles WHILE the camera moves is what caused
+// rotate flicker + reloads — a tile briefly off-frustum gets evicted, then has
+// to re-stream (coarse-ancestor pop) when it swings back into view. So hold all
+// tiles during a gesture and reclaim only once the camera stops (~0.4 s still),
+// which is exactly when a stationary deep view actually needs the memory back.
+let stillFrames = 0;
+const _camPrev = new THREE.Vector3();
+function cameraMoving() {
+  const dist = camera.position.distanceTo(controls.target) || 1;
+  const moved = !!camAnim || !!panVel
+    || _camPrev.distanceTo(camera.position) > dist * 1e-3;
+  _camPrev.copy(camera.position);
+  return moved;
+}
 function evict() {
   if (stats.ready <= CACHE_MAX) return;
-  const candidates = [...tiles.values()]
-    .filter(t => t.z > ZMIN && t.state === 'ready' && frame - (t.lastUsed ?? 0) > 300)
+  // Dispose only tiles NOT visible this frame AND idle >~2.5 s, oldest first,
+  // down to CACHE_MAX. The `visible` + idle guards matter: the live LOD walk
+  // touches ancestor tiles (hidden but lastUsed=frame) every frame, so a
+  // deep tilted view's 300+ "hidden" tiles are the genuine working set, not
+  // garbage — evicting them just makes selectNode reload them (churn). Only
+  // tiles that have truly left the walk for >2.5 s are safe to drop.
+  const stale = [...tiles.values()]
+    .filter(t => t.z > ZMIN && t.state === 'ready' && t.mesh && !t.mesh.visible
+                 && frame - (t.lastUsed ?? 0) > 150)
     .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
-  for (const t of candidates.slice(0, stats.ready - CACHE_MAX)) t.dispose();
+  for (const t of stale.slice(0, stats.ready - CACHE_MAX)) t.dispose();
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────
@@ -1659,7 +1679,10 @@ function tick() {
   applyVisibility(show);
   prefetch();
   pump();
-  if (frame % 120 === 0) evict();
+  stillFrames = cameraMoving() ? 0 : stillFrames + 1;
+  // Reclaim only after the camera has been still ~0.4 s — never mid-gesture,
+  // so rotating never disposes a tile that then swings back into view.
+  if (stillFrames > 24 && frame % 30 === 0) evict();
   renderer.render(scene, camera);
 
   // visCount, not stats.ready: heights decode before the first ortho JPEG
@@ -1690,6 +1713,7 @@ function tick() {
         const im = t.orthoTex.image;
         gpu += (im?.width ?? 512) * (im?.height ?? 512) * 4 * 1.33;
       }
+      if (t.cadTex) gpu += 512 * 512 * 4 * 1.33;   // KN overlay texture
     }
     const jsHeap = performance.memory
       ? ` · JS ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB`

@@ -223,6 +223,40 @@ function terrainPoint(px, py) {
   if (th !== null) p = groundPoint(px, py, th * Y_SCALE) ?? p;
   return p;
 }
+// Surface pick for building selection: ray-march the DSM heightfield so a
+// tap on a tall building hits its NEAR FACE, not the ground plane behind it
+// (the plane intersect terrainPoint() uses sails over a tilted building).
+// The mesh is displaced GPU-side — CPU geometry is flat — so intersectObjects
+// can't see the blobs; we march terrainH() (coarse hGrid, includes buildings)
+// instead. The hit point's x/z IS the plumb drop to the footprint; the
+// building-detail query's 5 m tolerance absorbs the DSM blob's slight lean.
+function pickSurface(px, py) {
+  gestureRay.setFromCamera(new THREE.Vector2(px / innerWidth * 2 - 1,
+                                             1 - py / innerHeight * 2), camera);
+  const o = gestureRay.ray.origin, d = gestureRay.ray.direction;
+  const plane = terrainPoint(px, py);            // fallback + distance bound
+  const tMax = plane ? Math.min(o.distanceTo(plane) * 1.25, 6e5) : 6e5;
+  const step = Math.max(3, tMax / 3000);         // <~building width, ≤3000 steps
+  const surfY = (t) => {
+    const h = terrainH(o.x + d.x * t, o.z + d.z * t);
+    return h === null ? null : h * Y_SCALE;
+  };
+  let prev = 0;
+  for (let t = step; t <= tMax; t += step) {
+    const sy = surfY(t);
+    if (sy === null) { prev = t; continue; }     // no tile data → keep marching
+    if (o.y + d.y * t <= sy) {                    // ray went under surface in (prev,t]
+      let lo = prev, hi = t;
+      for (let i = 0; i < 14; i++) {
+        const m = (lo + hi) / 2, msy = surfY(m);
+        if (msy === null || o.y + d.y * m > msy) lo = m; else hi = m;
+      }
+      return o.clone().addScaledVector(d, hi);
+    }
+    prev = t;
+  }
+  return plane;                                   // no blob hit → plane result
+}
 function clampView() {
   const sph = new THREE.Spherical()
     .setFromVector3(camera.position.clone().sub(controls.target));
@@ -562,7 +596,7 @@ function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }
 document.getElementById('bclose').addEventListener('click', hideBInfo);
 
 async function showBuildingInfo(px, py) {
-  const p = terrainPoint(px, py);
+  const p = pickSurface(px, py);
   if (!p) return;
   const lon = (p.x + ORIGIN.x) / WMERC * 180;
   const lat = mercYToLat(ORIGIN.y - p.z);

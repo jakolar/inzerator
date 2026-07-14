@@ -937,6 +937,21 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         native_w = int(round(bbox_w / 0.125))
         native_h = int(round(bbox_h / 0.125))
 
+        # XYZ-tile fallback clamp: a ≤1024px output (map3d z>=14 tiles ask
+        # for 512) must not composite at native 0.125 m/px — a z=14 tile is
+        # ~12.5k px native → 16 WMS GetMaps + a ~475 MB PIL image for a 512²
+        # JPEG whose useful resolution is 3 m/px. 2× target keeps Lanczos
+        # supersampling quality; big renders (refresh_ortho size=4096/8192)
+        # are above the guard and byte-identical.
+        try:
+            _tgt = int(query.get("size", ["0"])[0] or 0)
+        except ValueError:
+            _tgt = 0
+        if 0 < _tgt <= 1024:
+            _k = min(1.0, 2 * _tgt / max(native_w, native_h, 1))
+            native_w = max(64, int(round(native_w * _k)))
+            native_h = max(64, int(round(native_h * _k)))
+
         # Cap pixels we ever ask the WMS for — bbox > 5×5 km is silly here.
         MAX_TILE = 4000
         n_x = (native_w + MAX_TILE - 1) // MAX_TILE
@@ -1224,6 +1239,21 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         ref_px_x, ref_px_y = sheets[0][1][0], sheets[0][1][1]
         abs_px_x = abs(ref_px_x)
         abs_px_y = abs(ref_px_y)
+        # Same XYZ-tile fallback clamp as the VHR branch: a ≤1024px output
+        # doesn't need a native 12.5 cm/px composite (z=14 tile ≈ 12.5k px,
+        # ~475 MB PIL image). Implemented by inflating the composite pixel
+        # size — paste positions and the reproject transform scale with it.
+        try:
+            _tgt = int(query.get("size", ["0"])[0] or 0)
+        except ValueError:
+            _tgt = 0
+        scale_k = 1.0
+        if 0 < _tgt <= 1024:
+            _nat = max((sjtsk_xmax - sjtsk_xmin) / abs_px_x,
+                       (sjtsk_ymax - sjtsk_ymin) / abs_px_y, 1.0)
+            scale_k = min(1.0, 2 * _tgt / _nat)
+            abs_px_x /= scale_k
+            abs_px_y /= scale_k
         crop_x0 = sjtsk_xmin
         crop_y0 = sjtsk_ymax           # top edge (px_y < 0 means rows scan down)
         out_w = max(1, int(round((sjtsk_xmax - sjtsk_xmin) / abs_px_x)))
@@ -1259,6 +1289,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 continue
             with Image.open(jpg) as src_img:
                 src_crop = src_img.crop((spl, spt, spr, spb)).copy()
+            if scale_k < 1.0:
+                src_crop = src_crop.resize(
+                    (max(1, int(round(src_crop.width * scale_k))),
+                     max(1, int(round(src_crop.height * scale_k)))),
+                    Image.LANCZOS)
             # Destination pixel position in composite (anchor top-left of crop)
             dpl = int(round((ox_lo - crop_x0) / abs_px_x))
             dpt = int(round((crop_y0 - oy_hi) / abs_px_y))
@@ -1294,8 +1329,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 src_arr = np.stack([src_arr]*3, axis=-1)
             src_chw = src_arr.transpose(2, 0, 1).copy()
             src_h, src_w = src_arr.shape[:2]
+            # abs_px_*, not abs(px_*): the clamp above may have inflated the
+            # composite pixel size, and the transform must match the pixels.
             src_transform = rasterio.transform.from_origin(
-                crop_x0, crop_y0, abs(px_x), abs(px_y),
+                crop_x0, crop_y0, abs_px_x, abs_px_y,
             )
             # Output size — square to match what the area viewer asks for.
             try:

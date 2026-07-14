@@ -1007,6 +1007,7 @@ const texLoader = new THREE.TextureLoader();
 // 24+12+4 dead transfers hogging the (phone: high-latency) link while the
 // tiles now on screen queued behind them.
 const liveFetches = new Set();   // { t: Tile, ctl: AbortController }
+const decodeQueue = [];          // [Tile, ArrayBuffer] fetched, awaiting CPU finalize
 
 // Cadastre fetch gate — its own small budget so the toggle-driven overlay
 // never starves the ortho stream. WMS is slower than baked tiles, so keep
@@ -1270,7 +1271,42 @@ class Tile {
                               { signal: ctl.signal });
       if (res.status === 404) { this.state = 'empty'; stats.empty++; return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const decoded = Lerc.decode(new Uint8Array(await res.arrayBuffer()));
+      const buf = await res.arrayBuffer();
+      // CPU finalize (LERC decode + void fill + half-float + mesh build,
+      // ~2-10 ms/tile on a phone) is deferred to tick()'s per-frame budget
+      // — an h2 burst of 24 simultaneous arrivals used to run it all
+      // inside one frame and visibly hitch. State stays 'loading' until
+      // finalized; the network slot frees as soon as we return.
+      decodeQueue.push([this, buf]);
+    } catch (err) {
+      // Aborted by pump()'s stale sweep (camera moved on) — not a failure:
+      // back to idle so the tile requeues if the walk ever wants it again,
+      // retry budget untouched.
+      if (err && err.name === 'AbortError') {
+        if (this.state === 'loading') this.state = 'idle';
+        return;
+      }
+      this._fail(err);
+    } finally {
+      liveFetches.delete(live);
+    }
+  }
+  _fail(err) {
+    // Only a 404 is a durable "no data here". Network hiccups and 5xx
+    // (on-demand build congestion, Tailscale dropouts) back off and
+    // retry — marking those 'empty' froze the area coarse until reload.
+    this.retries = (this.retries ?? 0) + 1;
+    if (this.retries > 3) {
+      console.warn('tile load failed', this.key, err);
+      this.state = 'empty'; stats.failed++;
+      return;
+    }
+    setTimeout(() => { if (this.state === 'loading') this.state = 'idle'; },
+               1500 * this.retries);
+  }
+  finalize(buf) {
+    try {
+      const decoded = Lerc.decode(new Uint8Array(buf));
       const w = decoded.width, h = decoded.height;
       const heights = new Float32Array(decoded.pixels[0]);
       if (!fillVoids(heights, w, h)) { this.state = 'empty'; stats.empty++; return; }
@@ -1345,26 +1381,7 @@ class Tile {
       if (BARE.checked) this.orthoDone = true;
       else this.requestOrtho();
     } catch (err) {
-      // Aborted by pump()'s stale sweep (camera moved on) — not a failure:
-      // back to idle so the tile requeues if the walk ever wants it again,
-      // retry budget untouched.
-      if (err && err.name === 'AbortError') {
-        if (this.state === 'loading') this.state = 'idle';
-        return;
-      }
-      // Only a 404 is a durable "no data here". Network hiccups and 5xx
-      // (on-demand build congestion, Tailscale dropouts) back off and
-      // retry — marking those 'empty' froze the area coarse until reload.
-      this.retries = (this.retries ?? 0) + 1;
-      if (this.retries > 3) {
-        console.warn('tile load failed', this.key, err);
-        this.state = 'empty'; stats.failed++;
-        return;
-      }
-      setTimeout(() => { if (this.state === 'loading') this.state = 'idle'; },
-                 1500 * this.retries);
-    } finally {
-      liveFetches.delete(live);
+      this._fail(err);   // decode/build failure → same backoff as network
     }
   }
   // orthoDone no longer gates refinement (ancestor-texture inheritance
@@ -1764,7 +1781,7 @@ const loading = document.getElementById('loading');
 let frame = 0, firstRendered = false;
 
 await Lerc.load();
-window.__map3d = { tiles, stats, camera, controls, liveFetches };   // debug console handle
+window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue };   // debug console handle
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;
@@ -1836,6 +1853,17 @@ function tick() {
   }
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
+  // Height finalize budget: LERC decode + void fill + (iOS) half-float
+  // conversion cost ~2-10 ms per tile; drain under ~4 ms/frame so a
+  // 24-deep h2 burst spreads over a few frames instead of freezing one.
+  // Before selectNode so tiles finalized this frame are pickable now.
+  if (decodeQueue.length) {
+    const t0 = performance.now();
+    do {
+      const [t, buf] = decodeQueue.shift();
+      t.finalize(buf);
+    } while (decodeQueue.length && performance.now() - t0 < 4);
+  }
   const show = [];
   for (const r of roots) selectNode(r, show);
   applyVisibility(show);

@@ -806,7 +806,7 @@ addEventListener('resize', () => {
 // ~3 css px on both tiers. dpr-1 desktops are unchanged.
 const HIDPI = devicePixelRatio >= 2;
 const SEG = HIDPI ? 96 : 128;   // segs for a 256px heightmap; texture carries the detail
-function buildTileGeometry() {
+function buildTileGeometry(SEG) {
   const n = SEG + 1;
   const gridCount = n * n;
   const perim = [];
@@ -856,7 +856,17 @@ function buildTileGeometry() {
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   return g;
 }
-const sharedGeo = buildTileGeometry();
+// Two shared tessellation tiers. Every tile used the full grid (~33.8k
+// tris) even at ~134 css px on screen — sub-pixel quads, and every vertex
+// pays a dependent height-texture fetch; a tilted view ran to ~12M
+// tris/frame. Small-on-screen tiles now swap to a quarter-density grid
+// (pointer assignment in applyVisibility, both geometries shared, nothing
+// rebuilt). The perimeter skirts curtain any hairline seams between
+// neighbours of different tessellation, exactly as they already do
+// across zoom levels.
+const sharedGeo = buildTileGeometry(SEG);
+const sharedGeoHalf = buildTileGeometry(SEG / 2);
+const GEO_HALF_PX = 240;   // below ~240 css px a SEG/2 grid is still ≥2px/quad
 
 const VERT = /* glsl */`
   uniform sampler2D uHeight;
@@ -1008,6 +1018,31 @@ const texLoader = new THREE.TextureLoader();
 // tiles now on screen queued behind them.
 const liveFetches = new Set();   // { t: Tile, ctl: AbortController }
 const decodeQueue = [];          // [Tile, ArrayBuffer] fetched, awaiting CPU finalize
+
+// ── GPU upload pacing + decoded-bitmap release ──────────────────────────
+// three.js uploads a texture inside the first render() that samples it, so
+// a burst of arriving JPEGs used to pay N × (texImage2D + generateMipmap)
+// in a single frame. Textures queue here instead; tick() force-uploads a
+// few per frame (renderer.initTexture) and only then binds them — until
+// their turn, tiles keep showing the inherited ancestor sub-window, which
+// is pixel-identical anyway. Right after upload the decoded ImageBitmap is
+// closed (three keeps it referenced as texture.image forever otherwise —
+// ~1 MB/tile of duplicate decoded pixels, ~2× texture memory on the
+// deviceMemory-blind iOS path); a {width,height} stub keeps HUD math alive.
+const uploadQueue = [];          // [tex, bind]
+function queueUpload(tex, bind) { uploadQueue.push([tex, bind]); }
+function drainUploads(n) {
+  while (n-- && uploadQueue.length) {
+    const [tex, bind] = uploadQueue.shift();
+    renderer.initTexture(tex);
+    const im = tex.image;
+    if (im && typeof im.close === 'function') {
+      tex.image = { width: im.width, height: im.height };
+      im.close();
+    }
+    bind();
+  }
+}
 
 // Cadastre fetch gate — its own small budget so the toggle-driven overlay
 // never starves the ortho stream. WMS is slower than baked tiles, so keep
@@ -1335,6 +1370,10 @@ class Tile {
         THREE.RedFormat, texType);
       this.heightTex.magFilter = this.heightTex.minFilter = THREE.LinearFilter;
       this.heightTex.needsUpdate = true;
+      // Pre-upload while the mesh is still invisible (siblings streaming):
+      // the atomic quad flip then costs zero texImage2D calls. Data stays
+      // referenced (DataTexture) so a GL context restore can re-upload.
+      queueUpload(this.heightTex, () => {});
 
       const mat = new THREE.ShaderMaterial({
         uniforms: {
@@ -1396,12 +1435,15 @@ class Tile {
       tex.flipY = false;               // raster row 0 = north = uv.v 0
       tex.colorSpace = THREE.NoColorSpace;  // passthrough shader, no composer
       tex.anisotropy = 4;
-      this.orthoTex = tex;
-      const u = this.mesh.material.uniforms;
-      u.uOrtho.value = tex;
-      u.uHasOrtho.value = 1;
-      u.uOrthoUv.value.set(0, 0, 1);   // own texture: full window
-      this.orthoDone = true;
+      queueUpload(tex, () => {
+        if (!this.mesh) { tex.dispose(); return; }   // disposed while queued
+        this.orthoTex = tex;
+        const u = this.mesh.material.uniforms;
+        u.uOrtho.value = tex;
+        u.uHasOrtho.value = 1;
+        u.uOrthoUv.value.set(0, 0, 1);   // own texture: full window
+        this.orthoDone = true;
+      });
     };
     loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
       () => {
@@ -1429,7 +1471,10 @@ class Tile {
       tex.generateMipmaps = true;
       tex.anisotropy = MAX_ANISO;
       tex.needsUpdate = true;
-      this.cadTex = tex;
+      queueUpload(tex, () => {
+        if (!this.mesh || !CAD.checked) { tex.dispose(); return; }
+        this.cadTex = tex;             // applyVisibility binds the uniforms
+      });
     }, stale, this);
   }
   dispose() {
@@ -1632,6 +1677,8 @@ function applyVisibility(show) {
   for (const t of next) {
     if (!t.mesh) continue;
     t.mesh.visible = true;
+    // Tessellation tier by on-screen size (pointer swap, shared buffers).
+    t.mesh.geometry = screenPx(t) < GEO_HALF_PX ? sharedGeoHalf : sharedGeo;
     t.everShown = true;   // fetch-efficiency metric (HUD console)
     visCount++;
     if (t.z < visZMin) visZMin = t.z;
@@ -1738,14 +1785,27 @@ function terrainH(sx, sz) {
   return null;
 }
 
-// Budget counts READY tiles (the tiles map also holds thousands of
-// idle/empty metadata stubs). Chrome scales it by reported RAM; Safari never
-// reports deviceMemory — assume a PHONE (tight budget), not the old 4 GB
-// default that let a tilted/wide view balloon past 300 tiles / 600 MB and
-// reload the tab.
-const CACHE_MAX = navigator.deviceMemory
-  ? Math.round(300 * Math.min(2, Math.max(0.5, navigator.deviceMemory / 4)))
-  : 180;
+// Budget is GPU BYTES, not tile count — per-tile cost varies ~20× (bare
+// 256² height ≈ 0.26 MB vs height + 512² ortho + cad ≈ 2.8 MB), so the
+// old count budget overspent exactly in the heavy z=18+katastr sessions.
+// gpuEstimate is refreshed by the HUD scan every 15 frames (same
+// arithmetic, single source of truth). Chrome scales by reported RAM;
+// Safari never reports deviceMemory — assume a phone.
+const GPU_MAX = (navigator.deviceMemory
+  ? Math.min(1024, Math.max(256, navigator.deviceMemory * 64))
+  : 192) * 1048576;
+let gpuEstimate = 0;
+const HBYTES = FLOAT_LINEAR ? 4 : 2;
+function tileGpuBytes(t) {
+  let b = 0;
+  if (t.heightTex) b += 256 * 256 * HBYTES;
+  if (t.orthoTex) {
+    const im = t.orthoTex.image;
+    b += (im?.width ?? 512) * (im?.height ?? 512) * 4 * 1.33;
+  }
+  if (t.cadTex) b += 512 * 512 * 4 * 1.33;   // KN overlay
+  return b;
+}
 // Camera-settled gate: disposing tiles WHILE the camera moves is what caused
 // rotate flicker + reloads — a tile briefly off-frustum gets evicted, then has
 // to re-stream (coarse-ancestor pop) when it swings back into view. So hold all
@@ -1761,18 +1821,24 @@ function cameraMoving() {
   return moved;
 }
 function evict() {
-  if (stats.ready <= CACHE_MAX) return;
+  if (gpuEstimate <= GPU_MAX) return;
   // Dispose only tiles NOT visible this frame AND idle >~2.5 s, oldest first,
-  // down to CACHE_MAX. The `visible` + idle guards matter: the live LOD walk
-  // touches ancestor tiles (hidden but lastUsed=frame) every frame, so a
-  // deep tilted view's 300+ "hidden" tiles are the genuine working set, not
-  // garbage — evicting them just makes selectNode reload them (churn). Only
-  // tiles that have truly left the walk for >2.5 s are safe to drop.
+  // until the byte estimate fits. The `visible` + idle guards matter: the
+  // live LOD walk touches ancestor tiles (hidden but lastUsed=frame) every
+  // frame, so a deep tilted view's 300+ "hidden" tiles are the genuine
+  // working set, not garbage — evicting them just makes selectNode reload
+  // them (churn). Only tiles off the walk for >2.5 s are safe to drop.
   const stale = [...tiles.values()]
     .filter(t => t.z > ZMIN && t.state === 'ready' && t.mesh && !t.mesh.visible
                  && frame - (t.lastUsed ?? 0) > 150)
     .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
-  for (const t of stale.slice(0, stats.ready - CACHE_MAX)) t.dispose();
+  let over = gpuEstimate - GPU_MAX;
+  for (const t of stale) {
+    if (over <= 0) break;
+    const b = tileGpuBytes(t);
+    t.dispose();
+    over -= b; gpuEstimate -= b;
+  }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────
@@ -1796,9 +1862,39 @@ CAD.addEventListener('change', () => {
   // applyVisibility binds/unbinds uCad and resolves inheritance each frame;
   // just kick fetches for on-screen tiles now so the overlay appears without
   // waiting for the next camera move.
-  if (CAD.checked)
+  if (CAD.checked) {
     for (const t of tiles.values())
       if (t.mesh?.visible && !t.cadTex) t.requestCad();
+  } else {
+    // Free the overlay NOW: a browse session leaves 30-80 cadTex alive
+    // (~1.4 MB GPU each) that evict() rightly won't touch while their
+    // tiles stay in the working set. Flag reset lets a re-toggle refetch
+    // (ČÚZK WMS + browser HTTP cache make that cheap).
+    for (const t of tiles.values()) {
+      if (t.cadTex) { t.cadTex.dispose(); t.cadTex = null; }
+      t.cadRequested = false;
+    }
+  }
+});
+
+// iOS Safari revokes WebGL contexts under memory pressure. preventDefault
+// on 'lost' opts into restoration; on 'restore' every ortho/cad texture is
+// gone AND its decoded bitmap was closed after upload, so reset the
+// streams — tiles refetch through the immutable HTTP cache. Height
+// DataTextures keep their arrays and re-upload by themselves.
+renderer.domElement.addEventListener('webglcontextlost', e => e.preventDefault());
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+  uploadQueue.length = 0;
+  for (const t of tiles.values()) {
+    if (t.orthoTex) { t.orthoTex.dispose(); t.orthoTex = null; }
+    if (t.cadTex) { t.cadTex.dispose(); t.cadTex = null; }
+    t.orthoRequested = t.orthoDone = t.cadRequested = false;
+    if (t.mesh) {
+      const u = t.mesh.material.uniforms;
+      u.uOrtho.value = null; u.uHasOrtho.value = 0;
+      u.uCad.value = null; u.uHasCad.value = 0;
+    }
+  }
 });
 
 let lastTick = performance.now();
@@ -1867,6 +1963,10 @@ function tick() {
   const show = [];
   for (const r of roots) selectNode(r, show);
   applyVisibility(show);
+  // Paced GPU uploads (texImage2D + mipgen ~1-3 ms each on a phone):
+  // 3/frame bounds the per-frame GPU-upload cost; ancestor inheritance
+  // covers the tiles still waiting.
+  drainUploads(3);
   prefetch();
   pump();
   stillFrames = cameraMoving() ? 0 : stillFrames + 1;
@@ -1895,16 +1995,10 @@ function tick() {
       : 'z=—';
     // GPU memory of the streamed model: height textures + ortho textures
     // (×1.33 for mipmaps). Shared geometry is a single ~1.3 MB buffer.
+    // This scan also refreshes gpuEstimate — the evict() byte budget.
     let gpu = 0;
-    const hBytes = FLOAT_LINEAR ? 4 : 2;
-    for (const t of tiles.values()) {
-      if (t.heightTex) gpu += 256 * 256 * hBytes;
-      if (t.orthoTex) {
-        const im = t.orthoTex.image;
-        gpu += (im?.width ?? 512) * (im?.height ?? 512) * 4 * 1.33;
-      }
-      if (t.cadTex) gpu += 512 * 512 * 4 * 1.33;   // KN overlay texture
-    }
+    for (const t of tiles.values()) gpu += tileGpuBytes(t);
+    gpuEstimate = gpu;
     const jsHeap = performance.memory
       ? ` · JS ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB`
       : '';

@@ -20,7 +20,7 @@
     background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
     pointer-events: none; white-space: pre;
   }
-  #ctl, #ctl2 {
+  #ctl, #ctl2, #ctl3 {
     position: fixed; right: 10px; z-index: 5;
     font: 13px system-ui, sans-serif; color: #dfe7f0;
     background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
@@ -29,9 +29,10 @@
   }
   #ctl { top: 10px; }
   #ctl2 { top: 52px; }
-  #ctl input, #ctl2 input { accent-color: #7fae6b; }
+  #ctl3 { top: 94px; }
+  #ctl input, #ctl2 input, #ctl3 input { accent-color: #7fae6b; }
   #nav {
-    position: fixed; top: 58px; right: 10px; z-index: 5;
+    position: fixed; top: 136px; right: 10px; z-index: 5;
     display: flex; flex-direction: column; gap: 8px;
   }
   #nav button {
@@ -101,6 +102,7 @@
 <div id="hud">načítám…</div>
 <label id="ctl"><input type="checkbox" id="bareToggle"> jen výšky</label>
 <label id="ctl2"><input type="checkbox" id="cadToggle"> katastr</label>
+<label id="ctl3"><input type="checkbox" id="osmToggle"> OSM</label>
 <div id="search">
   <input id="searchInput" type="text" autocomplete="off"
          placeholder="Hledat obec, adresu, parcelu…">
@@ -1019,6 +1021,15 @@ const ORTHO_WMS_URL = (z, x, y) => {
   return `/proxy/ortofoto?hires=1&WBBOX=${b.w},${b.s},${b.e},${b.n}` +
          `&size=512&format=jpeg`;
 };
+// OSM base-layer alternative: standard XYZ tiles proxied + disk-cached by
+// the server (no reprojection — map3d IS Web-Mercator XYZ, so the tile
+// drapes 1:1). Fills the same ortho drape slot, so the whole streaming /
+// inheritance / pacing pipeline is reused; the cadastre overlay still
+// composits on top of it.
+const OSM_TILE_URL = (z, x, y) => `/proxy/osm-tile/${z}/${x}/${y}.png`;
+const OSM = document.getElementById('osmToggle');
+OSM.checked = P.get('osm') === '1';
+let osmMode = OSM.checked;
 // Cadastre (KN) overlay: on-demand ČÚZK WMS per tile, EPSG:3857 so the
 // transparent PNG drapes pixel-aligned over the ortho (no reprojection).
 // Only z>=16 — parcel lines/numbers are illegible below that. The server
@@ -1460,6 +1471,9 @@ class Tile {
       tex.anisotropy = 4;
       queueUpload(tex, () => {
         if (!this.mesh) { tex.dispose(); return; }   // disposed while queued
+        // Dispose any previous drape (base-layer swap orto↔OSM) so the old
+        // texture stays visible until the new one is ready — no blank flash.
+        if (this.orthoTex && this.orthoTex !== tex) this.orthoTex.dispose();
         this.orthoTex = tex;
         const u = this.mesh.material.uniforms;
         u.uOrtho.value = tex;
@@ -1468,6 +1482,12 @@ class Tile {
         this.orthoDone = true;
       });
     };
+    if (osmMode) {
+      // OSM covers every zoom natively — no WMS fallback path.
+      loadOrtho(OSM_TILE_URL(this.z, this.x, this.y), applyOrtho,
+        () => { this.orthoDone = true; }, stale, this);
+      return;
+    }
     loadOrtho(ORTHO_TILE_URL(this.z, this.x, this.y), applyOrtho,
       () => {
         const wms = ORTHO_WMS_URL(this.z, this.x, this.y);
@@ -1900,6 +1920,26 @@ CAD.addEventListener('change', () => {
     for (const t of tiles.values()) {
       if (t.cadTex) { t.cadTex.dispose(); t.cadTex = null; }
       t.cadRequested = false;
+    }
+  }
+});
+
+OSM.addEventListener('change', () => {
+  // Swap the base drape orto↔OSM. Only VISIBLE tiles refetch immediately
+  // (smooth swap: old texture stays bound until the new one lands); hidden
+  // tiles drop their drape and refetch lazily when applyVisibility next
+  // shows them — keeps the toggle burst to the on-screen set, not all the
+  // ancestor/LOD-walk tiles in the map.
+  osmMode = OSM.checked;
+  for (const t of tiles.values()) {
+    if (!t.mesh) continue;
+    t.orthoRequested = t.orthoDone = false;
+    if (t.mesh.visible && !BARE.checked) {
+      t.requestOrtho();
+    } else if (t.orthoTex) {
+      t.orthoTex.dispose(); t.orthoTex = null;
+      const u = t.mesh.material.uniforms;
+      u.uOrtho.value = null; u.uHasOrtho.value = 0;
     }
   }
 });

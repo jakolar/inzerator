@@ -28,9 +28,13 @@ import locations
 _CUZK_SEM = threading.Semaphore(6)
 
 # OSM tile.openstreetmap.org has a strict TOS — modest concurrency and bulk
-# download discouraged. Global cap across server keeps us neighbourly even when
-# multiple regions are fetched concurrently.
+# download discouraged. _OSM_SEM(2) guards the reprojecting _proxy_osm, which
+# fetches a whole bbox worth of tiles per request (bulk-ish). The XYZ
+# passthrough (_proxy_osm_xyz) serves one on-demand tile per request for
+# interactive map3d viewing — the intended tile-server use case — so it gets
+# browser-like concurrency; disk cache makes revisits free.
 _OSM_SEM = threading.Semaphore(2)
+_OSM_XYZ_SEM = threading.Semaphore(6)
 
 # On-demand heightmap pyramid tiles (/cuzk-pyramid/dmpok/z/x/y.lerc). A missing
 # tile at z>=14 is built from DMPOK on first request and written to disk, so
@@ -1969,6 +1973,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self._proxy_ortofoto()
         elif self.path.startswith("/proxy/cadastre?"):
             self._proxy_cadastre()
+        elif self.path.startswith("/proxy/osm-tile/"):
+            self._proxy_osm_xyz()
         elif self.path.startswith("/proxy/osm?"):
             self._proxy_osm()
         elif self.path.startswith("/api/sjtsk-to-wgs?"):
@@ -3226,6 +3232,68 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data_bytes)
         except Exception as e:
             self.send_error(502, f"Cadastre WMS error: {e}")
+
+    def _proxy_osm_xyz(self):
+        """Passthrough + disk-cache one OSM XYZ tile (EPSG:3857) for the map3d
+        viewer, which is already Web-Mercator XYZ — no reprojection, the tile
+        drapes 1:1 on the same tile grid. Distinct from _proxy_osm (which
+        reprojects a bbox to S-JTSK for the heightfield viewer).
+
+        OSM tile usage policy: server-side disk cache (repeat views free),
+        global _OSM_SEM(2) in-flight cap, identifying User-Agent.
+        """
+        import re
+        m = re.match(r"^/proxy/osm-tile/(\d+)/(\d+)/(\d+)\.png$", self.path)
+        if not m:
+            self.send_error(404, "expected /proxy/osm-tile/{z}/{x}/{y}.png")
+            return
+        z, x, y = (int(g) for g in m.groups())
+        if not (0 <= z <= 19) or not (0 <= x < (1 << z)) or not (0 <= y < (1 << z)):
+            self.send_error(400, "tile coords out of range")
+            return
+
+        cache_dir = Path("cache/osm_xyz") / str(z) / str(x)
+        cache_path = cache_dir / f"{y}.png"
+        data = None
+        if cache_path.is_file():
+            data = cache_path.read_bytes()
+            cache_state = "hit"
+        else:
+            url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            ua = "inzerator-heightfield/1.0 (https://github.com/alacremex/inzerator)"
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            last_err = None
+            for attempt in range(3):
+                with _OSM_XYZ_SEM:
+                    try:
+                        with urllib.request.urlopen(req, timeout=20) as resp:
+                            data = resp.read()
+                        break
+                    except (urllib.error.URLError, ConnectionError,
+                            TimeoutError, OSError) as e:
+                        last_err = e
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(1 + attempt)
+            if data is None:
+                self.send_error(502, f"OSM tile {z}/{x}/{y}: {last_err}")
+                return
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".png.tmp")
+            tmp.write_bytes(data)
+            tmp.replace(cache_path)
+            cache_state = "miss"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-OSM-Cache", cache_state)
+        # Immutable-ish: OSM tiles change slowly; a week keeps the browser
+        # from re-hitting us, matching the reprojected _proxy_osm policy.
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _proxy_osm(self):
         """Fetch OSM raster reprojected from EPSG:3857 to EPSG:5514.

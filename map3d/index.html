@@ -998,9 +998,9 @@ const ORTHO_WMS_URL = (z, x, y) => {
 };
 // Cadastre (KN) overlay: on-demand ČÚZK WMS per tile, EPSG:3857 so the
 // transparent PNG drapes pixel-aligned over the ortho (no reprojection).
-// Only z>=16 — parcel lines/numbers are illegible below that and each
-// request is a live ČÚZK WMS hit through the server proxy (no server-side
-// cache or _CUZK_SEM there yet — the 4-slot gate below is the only limit).
+// Only z>=16 — parcel lines/numbers are illegible below that. The server
+// proxy disk-caches each rendered PNG (cache/cadastre) and rate-limits
+// upstream ČÚZK via _CUZK_SEM; the 4-slot gate below bounds our own burst.
 const CAD_MIN_Z = 16;
 const CAD_URL = (z, x, y) => {
   const b = tileToBBoxMerc(z, x, y);

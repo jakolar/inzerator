@@ -2016,15 +2016,35 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     404, f"tile not pre-baked (on-demand only z="
                          f"{_PYRAMID_ONDEMAND_ZMIN}..{_PYRAMID_ONDEMAND_ZMAX})")
                 return
-            with _PYRAMID_BUILD_SEM, _pyramid_tile_lock((z, x, y)):
-                if not out_path.exists():                 # another thread may have built it
+            # Negative cache: DMPOK coverage is static, so a no-coverage tile
+            # 404s forever — without the sentinel every repeat request re-ran
+            # the whole build attempt (permit + pyproj + inventory scan).
+            empty_marker = out_path.with_suffix(".empty")
+            if empty_marker.exists():
+                self.send_error(404, "no DMPOK coverage for this tile")
+                return
+            # Per-tile lock FIRST, build permit second: duplicate requests
+            # for the same missing tile (phone + desktop over one village)
+            # park on the tile lock WITHOUT each burning one of the 3 build
+            # permits — 3 waiters on a hot tile starved every other build.
+            with _pyramid_tile_lock((z, x, y)):
+                if not out_path.exists():                 # built while we waited
+                    if empty_marker.exists():             # ...or negative-cached
+                        self.send_error(404, "no DMPOK coverage for this tile")
+                        return
                     try:
-                        ok = bpt.build_tile(z, x, y, bpt.BULK_OUT_DIR, bpt.OUT_DIR,
-                                            max_z_error=0.10, overwrite=False)
+                        with _PYRAMID_BUILD_SEM:
+                            ok = bpt.build_tile(z, x, y, bpt.BULK_OUT_DIR, bpt.OUT_DIR,
+                                                max_z_error=0.10, overwrite=False)
                     except Exception as e:                # noqa: BLE001
                         self.send_error(500, f"pyramid tile build failed: {e}")
                         return
                     if not ok:
+                        try:                              # sentinel is best-effort
+                            empty_marker.parent.mkdir(parents=True, exist_ok=True)
+                            empty_marker.touch()
+                        except OSError:
+                            pass
                         self.send_error(404, "no DMPOK coverage for this tile")
                         return
         # File exists now (pre-baked or just built) — let the static handler
@@ -3013,6 +3033,29 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if srs not in ("EPSG:5514", "EPSG:3857", "EPSG:4326"):
             self.send_error(400, "Invalid SRS")
             return
+
+        # Disk cache (mirrors cache/osm): map3d fetches one live WMS PNG per
+        # z>=16 tile — browser max-age only helps one device for a day; every
+        # new session/device re-paid a 200-1000 ms ČÚZK round trip + numpy
+        # alpha-key + PNG encode. Key = the full render recipe.
+        import hashlib
+        cad_key = hashlib.sha256(
+            f"{layer}|{srs}|{bbox_str}|{size}|{style}|{bg}".encode()
+        ).hexdigest()[:16]
+        cad_cache_dir = Path("cache/cadastre")
+        cad_cache_dir.mkdir(parents=True, exist_ok=True)
+        cad_cache_path = cad_cache_dir / f"kn_{cad_key}.png"
+        if cad_cache_path.exists():
+            data_bytes = cad_cache_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Cadastre-Cache", "hit")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data_bytes)
+            return
         # ČÚZK WMS caps each request at 4096² ("Size of requested map is
         # larger then MaxClientSize"). For larger outputs we fetch a k×k grid
         # of sub-tiles at 4096² each and stitch. k = ceil(size/4096) gives
@@ -3060,7 +3103,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     last_err = None
                     for tile_attempt in range(3):
                         try:
-                            with urllib.request.urlopen(sub_req, timeout=30) as resp:
+                            # _CUZK_SEM: same courtesy cap as the ortofoto
+                            # tile path — a katastr toggle on a wide view
+                            # used to fire an unbounded burst at ČÚZK.
+                            with _CUZK_SEM, urllib.request.urlopen(
+                                    sub_req, timeout=30) as resp:
                                 sub_bytes = resp.read()
                             break
                         except (urllib.error.URLError, ConnectionError,
@@ -3124,10 +3171,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             result.save(buf, "PNG")
             data_bytes = buf.getvalue()
 
+            # Atomic cache write (same pattern as manifests / orto_render).
+            tmp = cad_cache_path.with_suffix(".png.tmp")
+            tmp.write_bytes(data_bytes)
+            tmp.replace(cad_cache_path)
+
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(data_bytes)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Cadastre-Cache", "miss")
             self.send_header("Cache-Control", "public, max-age=86400")
             self.end_headers()
             self.wfile.write(data_bytes)

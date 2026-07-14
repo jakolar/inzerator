@@ -513,7 +513,7 @@ function startZoomAnim(f, anchor = null) {
         // has passed (a second tap cancels this and zooms instead).
         const tx = e.clientX, ty = e.clientY;
         clearTimeout(tapTimer);
-        tapTimer = setTimeout(() => showBuildingInfo(tx, ty), 320);
+        tapTimer = setTimeout(() => showInfo(tx, ty), 320);
       }
       // Flick → inertia; a drag-hold-release must NOT fire it (the trace
       // then only holds stale deltas from before the hold).
@@ -639,10 +639,11 @@ searchInput.addEventListener('keydown', e => {
   }
 });
 
-// ── Building info (tap / click → RÚIAN detail card + footprint) ───────
-// Phase 1 of "klikni na budovu": the tap point is raycast to the terrain,
-// converted to WGS and answered by the existing /api/building-detail
-// (RÚIAN attrs + DSM height + footprint). No 3D picking, no baked vectors.
+// ── Parcel + building info (tap / click → RÚIAN card + highlight) ─────
+// The tap point is raycast to the terrain, converted to WGS, and answered
+// by /api/parcel-at-point (WGS mode) + /api/building-detail in parallel.
+// The parcel boundary is the highlight; the building is shown when present.
+// No 3D picking, no baked vectors.
 const bsheet = document.getElementById('bsheet');
 const bbody = document.getElementById('bbody');
 let bReq = 0;
@@ -674,7 +675,9 @@ function clearMask() {
   applyMask();
   clearGhost();
 }
-function setBuildingMask(fp) {
+// Drape a highlight over any WGS polygon (building footprint or parcel
+// boundary) — same top-down mask + x-ray ghost.
+function setMask(fp) {
   const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (const p of pts) {
@@ -731,44 +734,64 @@ function setBuildingMask(fp) {
 function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }
 document.getElementById('bclose').addEventListener('click', hideBInfo);
 
-async function showBuildingInfo(px, py) {
+const rowsHtml = (rows) => '<table>' +
+  rows.filter(Boolean).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
+    .join('') + '</table>';
+async function showInfo(px, py) {
   const p = pickSurface(px, py);
   if (!p) return;
   const lon = (p.x + ORIGIN.x) / WMERC * 180;
   const lat = mercYToLat(ORIGIN.y - p.z);
+  const q = `lon=${lon.toFixed(7)}&lat=${lat.toFixed(7)}`;
   const req = ++bReq;
   bsheet.classList.remove('hidden');
-  bbody.textContent = 'Načítám informace o budově…';
-  let d = null;
-  try {
-    const r = await fetch(
-      `/api/building-detail?lon=${lon.toFixed(7)}&lat=${lat.toFixed(7)}`);
-    if (r.ok) d = await r.json();
-  } catch { /* offline / backend-less deploy */ }
+  bbody.textContent = 'Načítám informace…';
+  // Parcel + building in parallel: the parcel is the primary subject (drives
+  // the highlight), the building is an optional extra shown when present.
+  const getJson = (u) => fetch(u).then(r => r.ok ? r.json() : null).catch(() => null);
+  const [parcel, bld] = await Promise.all([
+    getJson(`/api/parcel-at-point?${q}`),
+    getJson(`/api/building-detail?${q}`),
+  ]);
   if (req !== bReq) return;               // superseded by a newer tap
-  if (!d) {
-    bbody.textContent = 'Informace o budovách nejsou dostupné (backend neběží).';
+  if (!parcel && !bld) {
+    bbody.textContent = 'Informace nejsou dostupné (backend neběží).';
     clearMask();
     return;
   }
-  if (!d.found) {
-    bbody.textContent = 'V místě není žádná budova (RÚIAN, okruh 5 m).';
-    clearMask();
-    return;
+  // Highlight the parcel boundary; fall back to the building footprint only
+  // when the point isn't on a registered parcel (roads, public space).
+  if (parcel?.found && parcel.ring_wgs) setMask(parcel.ring_wgs);
+  else if (bld?.found && bld.footprint_wgs) setMask(bld.footprint_wgs);
+  else clearMask();
+
+  let html;
+  if (parcel?.found) {
+    const pid = String(parcel.id).replace(/\.0+$/, '');
+    html = `<b>Parcela ${parcel.label}</b>` + rowsHtml([
+      ['Výměra', `${parcel.area_m2} m²`],
+      ['Druh pozemku', parcel.use_label],
+      pid ? ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/parcely/${pid}` +
+             `" target="_blank" rel="noopener">${pid}</a>`] : null,
+    ]);
+  } else {
+    html = `<b>Parcela</b><div style="color:rgba(223,231,240,.65); margin-top:4px;">` +
+           `V místě není registrovaná parcela (RÚIAN).</div>`;
   }
-  const rows = [
-    ['Využití', d.zpusob_vyuziti],
-    ['Zastavěná plocha', `${d.plocha_zastavena_m2 ?? d.plocha_polygon_m2} m²`],
-    d.height_m != null ? ['Výška (DSM)', `${d.height_m} m`] : null,
-    d.terrain_slope_pct != null ? ['Sklon terénu', `${d.terrain_slope_pct} %`] : null,
-    ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/stavebniobjekty/` +
-              `${d.ruian_id}" target="_blank" rel="noopener">${d.ruian_id}</a>`],
-  ].filter(Boolean);
-  bbody.innerHTML =
-    `<b>Budova${d.cisladomovni ? ' č. ' + d.cisladomovni : ''}</b><table>` +
-    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('') +
-    '</table>';
-  setBuildingMask(d.footprint_wgs);
+  if (bld?.found) {
+    html += `<div style="margin-top:10px; padding-top:8px; ` +
+            `border-top:1px solid rgba(255,255,255,.12);">` +
+            `<b>Budova${bld.cisladomovni ? ' č. ' + bld.cisladomovni : ''}</b>` +
+            rowsHtml([
+              ['Využití', bld.zpusob_vyuziti],
+              ['Zastavěná plocha', `${bld.plocha_zastavena_m2 ?? bld.plocha_polygon_m2} m²`],
+              bld.height_m != null ? ['Výška (DSM)', `${bld.height_m} m`] : null,
+              bld.terrain_slope_pct != null ? ['Sklon terénu', `${bld.terrain_slope_pct} %`] : null,
+              ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/stavebniobjekty/` +
+                        `${bld.ruian_id}" target="_blank" rel="noopener">${bld.ruian_id}</a>`],
+            ]) + `</div>`;
+  }
+  bbody.innerHTML = html;
 }
 // Desktop: a non-drag left click queries directly (no double-click zoom
 // to disambiguate against).
@@ -783,7 +806,7 @@ async function showBuildingInfo(px, py) {
     if (e.pointerType !== 'mouse' || !mDown) return;
     const moved = Math.hypot(e.clientX - mDown[0], e.clientY - mDown[1]);
     mDown = null;
-    if (moved < 5) showBuildingInfo(e.clientX, e.clientY);
+    if (moved < 5) showInfo(e.clientX, e.clientY);
   });
 }
 

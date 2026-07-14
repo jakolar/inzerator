@@ -2200,14 +2200,31 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         """
         import rasterio
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        try:
-            gcx = float(query["gcx"][0])
-            gcy = float(query["gcy"][0])
-            sx = float(query["sx"][0])
-            sy = float(query["sy"][0])
-        except (KeyError, ValueError):
-            self.send_error(400, "Required params: gcx, gcy, sx, sy (S-JTSK)")
-            return
+        # Two callers: the heightfield viewer sends S-JTSK (gcx,gcy,sx,sy) and
+        # wants ring_local + DSM heights; map3d sends WGS (lon,lat, like
+        # building-detail) and wants a lightweight ring_wgs + attrs, no TIFFs.
+        wgs_mode = "lon" in query and "lat" in query
+        if wgs_mode:
+            try:
+                lon = float(query["lon"][0])
+                lat = float(query["lat"][0])
+            except (KeyError, ValueError):
+                self.send_error(400, "Required params: lon, lat (WGS84)")
+                return
+            from pyproj import Transformer
+            sx, sy = Transformer.from_crs(
+                "EPSG:4326", "EPSG:5514", always_xy=True).transform(lon, lat)
+            out_sr = "4326"     # RÚIAN returns rings in WGS → ring_wgs directly
+        else:
+            try:
+                gcx = float(query["gcx"][0])
+                gcy = float(query["gcy"][0])
+                sx = float(query["sx"][0])
+                sy = float(query["sy"][0])
+            except (KeyError, ValueError):
+                self.send_error(400, "Required params: gcx, gcy, sx, sy (S-JTSK)")
+                return
+            out_sr = "5514"
 
         try:
             url = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/5/query"
@@ -2219,7 +2236,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 "geometryType": "esriGeometryPoint",
                 "spatialRel": "esriSpatialRelIntersects",
                 "outFields": "id,kmenovecislo,poddelenicisla,druhpozemkukod,vymeraparcely",
-                "outSR": "5514", "f": "json", "returnGeometry": "true",
+                "outSR": out_sr, "f": "json", "returnGeometry": "true",
                 "resultRecordCount": "1",
             }
             raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(params), timeout=15))
@@ -2237,13 +2254,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     "geometryType": "esriGeometryEnvelope",
                     "spatialRel": "esriSpatialRelIntersects",
                     "outFields": "id,kmenovecislo,poddelenicisla,druhpozemkukod,vymeraparcely",
-                    "outSR": "5514", "f": "json", "returnGeometry": "true",
+                    "outSR": out_sr, "f": "json", "returnGeometry": "true",
                     "resultRecordCount": "10",
                 }
                 raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(env_params), timeout=15))
                 feats = raw.get("features", [])
                 if not feats:
                     # Even the 10m envelope had nothing. Probably outside village.
+                    if wgs_mode:
+                        self._send_json(200, {"found": False})
+                        return
                     self.send_error(404, "No parcel near this point")
                     return
                 # Pick the parcel whose ring centroid is closest to (sx, sy).
@@ -2261,9 +2281,29 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             attrs = f.get("attributes", {})
             rings = f["geometry"].get("rings", []) if f.get("geometry") else []
             if not rings:
+                if wgs_mode:
+                    self._send_json(200, {"found": False})
+                    return
                 self.send_error(404, "Parcel has no geometry")
                 return
             outer = rings[0]
+            if wgs_mode:
+                # Rings already in WGS (outSR=4326): x=lon, y=lat. Light
+                # response for the map3d viewer — no DSM TIFF sampling.
+                kmen = attrs.get("kmenovecislo")
+                podd = attrs.get("poddelenicisla")
+                label = f"{kmen}/{podd}" if podd else (str(kmen) if kmen else "—")
+                use_code = attrs.get("druhpozemkukod")
+                self._send_json(200, {
+                    "found": True,
+                    "id": str(attrs.get("id", "")),
+                    "label": label,
+                    "use_code": use_code,
+                    "use_label": DRUH_POZEMKU_LABELS.get(use_code, "—"),
+                    "area_m2": int(float(attrs.get("vymeraparcely") or 0)),
+                    "ring_wgs": [[round(p[0], 7), round(p[1], 7)] for p in outer],
+                })
+                return
             # Open every cached DSM TIFF once for per-vertex Y sample.
             tifs = []
             for d in sorted(Path("cache").glob("dmpok_tiff_*")):

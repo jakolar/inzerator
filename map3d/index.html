@@ -1001,6 +1001,13 @@ const CAD = document.getElementById('cadToggle');
 CAD.checked = P.get('cad') === '1';
 const texLoader = new THREE.TextureLoader();
 
+// In-flight fetch registry (height + ortho + cad). pump()'s stale sweep
+// aborts entries whose tile the quadtree walk abandoned — once dispatched
+// a download used to be uncancellable, so every pan/zoom left up to
+// 24+12+4 dead transfers hogging the (phone: high-latency) link while the
+// tiles now on screen queued behind them.
+const liveFetches = new Set();   // { t: Tile, ctl: AbortController }
+
 // Cadastre fetch gate — its own small budget so the toggle-driven overlay
 // never starves the ortho stream. WMS is slower than baked tiles, so keep
 // it shallow.
@@ -1030,12 +1037,16 @@ function loadCad(url, onOk, stale, tile) {
       break;
     }
   };
-  fetch(url)
+  const ctl = new AbortController();
+  const live = tile ? { t: tile, ctl } : null;
+  if (live) liveFetches.add(live);
+  fetch(url, { signal: ctl.signal })
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
     .then(b => createImageBitmap(b))
-    .then(bmp => { done(); onOk(bmp); })
-    // WMS hiccup → no overlay this pass, but allow a re-request
-    .catch(() => { done(); if (tile) tile.cadRequested = false; });
+    .then(bmp => { if (live) liveFetches.delete(live); done(); onOk(bmp); })
+    // WMS hiccup / stale-sweep abort → no overlay this pass, allow re-request
+    .catch(() => { if (live) liveFetches.delete(live); done();
+                   if (tile) tile.cadRequested = false; });
 }
 
 // Ortho loads go through a small gate: TextureLoader alone fires every
@@ -1078,16 +1089,30 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
   // while a burst of tiles landed. Baked tiles carry no EXIF/alpha, so the
   // defaults are safe.
   if (window.createImageBitmap) {
-    fetch(url)
+    const ctl = new AbortController();
+    const live = tile ? { t: tile, ctl } : null;
+    if (live) liveFetches.add(live);
+    fetch(url, { signal: ctl.signal })
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
       .then(b => createImageBitmap(b))
       .then(bmp => {
+        if (live) liveFetches.delete(live);
         next();
         const t = new THREE.Texture(bmp);
         t.needsUpdate = true;
         onOk(t);
       })
-      .catch(e => { next(); onErr(e); });
+      .catch(e => {
+        if (live) liveFetches.delete(live);
+        next();
+        // Stale-sweep abort: drop silently and allow a re-request — onErr
+        // would wrongly escalate a baked-tile abort into the WMS fallback.
+        if (e && e.name === 'AbortError') {
+          if (tile) tile.orthoRequested = false;
+          return;
+        }
+        onErr(e);
+      });
   } else {
     texLoader.load(url,
       (t) => { next(); onOk(t); },
@@ -1237,8 +1262,12 @@ class Tile {
   async load() {
     this.state = 'loading';
     stats.fetches++;
+    const ctl = new AbortController();
+    const live = { t: this, ctl };
+    liveFetches.add(live);
     try {
-      const res = await fetch(HEIGHT_URL(this.z, this.x, this.y));
+      const res = await fetch(HEIGHT_URL(this.z, this.x, this.y),
+                              { signal: ctl.signal });
       if (res.status === 404) { this.state = 'empty'; stats.empty++; return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const decoded = Lerc.decode(new Uint8Array(await res.arrayBuffer()));
@@ -1316,6 +1345,13 @@ class Tile {
       if (BARE.checked) this.orthoDone = true;
       else this.requestOrtho();
     } catch (err) {
+      // Aborted by pump()'s stale sweep (camera moved on) — not a failure:
+      // back to idle so the tile requeues if the walk ever wants it again,
+      // retry budget untouched.
+      if (err && err.name === 'AbortError') {
+        if (this.state === 'loading') this.state = 'idle';
+        return;
+      }
       // Only a 404 is a durable "no data here". Network hiccups and 5xx
       // (on-demand build congestion, Tailscale dropouts) back off and
       // retry — marking those 'empty' froze the area coarse until reload.
@@ -1327,6 +1363,8 @@ class Tile {
       }
       setTimeout(() => { if (this.state === 'loading') this.state = 'idle'; },
                  1500 * this.retries);
+    } finally {
+      liveFetches.delete(live);
     }
   }
   // orthoDone no longer gates refinement (ancestor-texture inheritance
@@ -1416,6 +1454,13 @@ function enqueue(tile, bias = 0) {
   pending.push(tile);
 }
 function pump() {
+  // Stale sweep over IN-FLIGHT fetches (height + ortho + cad): abort what
+  // the walk abandoned, same 60-frame threshold as the queue prune below.
+  // `?? frame` keeps prefetch warms (never walked, no lastUsed) alive —
+  // they're cheap cache warmers, not stale work. abort() is idempotent;
+  // each owner's catch unregisters its entry.
+  for (const f of liveFetches)
+    if (frame - (f.t.lastUsed ?? frame) > 60) f.ctl.abort();
   if (!pending.length || inflight >= MAX_INFLIGHT) return;
   // Drop queued tiles the quadtree stopped asking for (camera moved on) —
   // without this a horizon sweep piles up hundreds of stale requests.
@@ -1719,7 +1764,7 @@ const loading = document.getElementById('loading');
 let frame = 0, firstRendered = false;
 
 await Lerc.load();
-window.__map3d = { tiles, stats, camera, controls };   // debug console handle
+window.__map3d = { tiles, stats, camera, controls, liveFetches };   // debug console handle
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;

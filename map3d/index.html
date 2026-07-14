@@ -1516,6 +1516,10 @@ function enqueue(tile, bias = 0) {
   pending.push(tile);
 }
 function pump() {
+  // Hidden tab: rAF pauses tick(), but each load completion re-enters
+  // pump() and would keep draining the whole queue against the
+  // bake-contended server. Let in-flight finish; dispatch nothing new.
+  if (document.hidden) return;
   // Stale sweep over IN-FLIGHT fetches (height + ortho + cad): abort what
   // the walk abandoned, same 60-frame threshold as the queue prune below.
   // `?? frame` keeps prefetch warms (never walked, no lastUsed) alive —

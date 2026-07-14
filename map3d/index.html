@@ -989,7 +989,8 @@ const ORTHO_WMS_URL = (z, x, y) => {
 // Cadastre (KN) overlay: on-demand ČÚZK WMS per tile, EPSG:3857 so the
 // transparent PNG drapes pixel-aligned over the ortho (no reprojection).
 // Only z>=16 — parcel lines/numbers are illegible below that and each
-// request is a live WMS hit. The server caches + rate-limits (_CUZK_SEM).
+// request is a live ČÚZK WMS hit through the server proxy (no server-side
+// cache or _CUZK_SEM there yet — the 4-slot gate below is the only limit).
 const CAD_MIN_Z = 16;
 const CAD_URL = (z, x, y) => {
   const b = tileToBBoxMerc(z, x, y);
@@ -1005,16 +1006,27 @@ const texLoader = new THREE.TextureLoader();
 // it shallow.
 let cadInflight = 0;
 const cadBacklog = [];
-function loadCad(url, onOk, stale) {
-  if (stale && stale()) return;
-  if (cadInflight >= 4) { cadBacklog.push([url, onOk, stale]); return; }
+function loadCad(url, onOk, stale, tile) {
+  // Every drop path MUST reset cadRequested — requestCad early-returns on
+  // that flag forever, so a silent drop (toggle off→on, WMS hiccup) used to
+  // leave the tile permanently blank until eviction.
+  if (stale && stale()) { if (tile) tile.cadRequested = false; return; }
+  if (cadInflight >= 4) { cadBacklog.push([url, onOk, stale, tile]); return; }
   cadInflight++;
   const done = () => {
     cadInflight--;
+    // Mirror loadOrtho's drain: prio-order the backlog and drop stale /
+    // walk-abandoned entries with the flag reset so they can re-request.
+    cadBacklog.sort((a, b) =>
+      (a[3] ? prio(a[3]) : 0) - (b[3] ? prio(b[3]) : 0));
     while (cadBacklog.length) {
       const q = cadBacklog.shift();
-      if (q[2] && q[2]()) continue;
-      loadCad(q[0], q[1], q[2]);
+      if (q[2] && q[2]()) { if (q[3]) q[3].cadRequested = false; continue; }
+      if (q[3] && frame - (q[3].lastUsed ?? 0) > 60) {
+        q[3].cadRequested = false;
+        continue;
+      }
+      loadCad(q[0], q[1], q[2], q[3]);
       break;
     }
   };
@@ -1022,7 +1034,8 @@ function loadCad(url, onOk, stale) {
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
     .then(b => createImageBitmap(b))
     .then(bmp => { done(); onOk(bmp); })
-    .catch(() => { done(); });   // WMS hiccup → no overlay, tile stays clean
+    // WMS hiccup → no overlay this pass, but allow a re-request
+    .catch(() => { done(); if (tile) tile.cadRequested = false; });
 }
 
 // Ortho loads go through a small gate: TextureLoader alone fires every
@@ -1362,7 +1375,7 @@ class Tile {
       tex.anisotropy = MAX_ANISO;
       tex.needsUpdate = true;
       this.cadTex = tex;
-    }, stale);
+    }, stale, this);
   }
   dispose() {
     if (this.mesh) {

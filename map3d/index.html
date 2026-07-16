@@ -1069,6 +1069,11 @@ function queueUpload(tex, bind) { uploadQueue.push([tex, bind]); }
 function drainUploads(n) {
   while (n-- && uploadQueue.length) {
     const [tex, bind] = uploadQueue.shift();
+    // Tile disposed while queued (count-evict runs mid-motion): its textures
+    // are already disposed — initTexture would re-allocate the GL object with
+    // no later dispose to free it. Skip. (Ortho/cad binds self-guard, but they
+    // dispose AFTER upload; the height path had no guard at all.)
+    if (tex.__dead) { n++; continue; }
     renderer.initTexture(tex);
     const im = tex.image;
     if (im && typeof im.close === 'function') {
@@ -1375,6 +1380,10 @@ class Tile {
                1500 * this.retries);
   }
   finalize(buf) {
+    // Superseded object (evicted from the Map while the buf waited in
+    // decodeQueue): building the mesh would orphan it — in the scene and
+    // holding GPU textures, but invisible to the Map scan and to evict().
+    if (tiles.get(this.key) !== this) return;
     try {
       const decoded = Lerc.decode(new Uint8Array(buf));
       const w = decoded.width, h = decoded.height;
@@ -1528,7 +1537,9 @@ class Tile {
       this.mesh = null;
       stats.ready = Math.max(0, stats.ready - 1);
     }
-    this.heightTex?.dispose(); this.orthoTex?.dispose(); this.cadTex?.dispose();
+    for (const tex of [this.heightTex, this.orthoTex, this.cadTex]) {
+      if (tex) { tex.__dead = true; tex.dispose(); }   // __dead: skip in drainUploads
+    }
     this.heightTex = this.orthoTex = this.hGrid = this.cadTex = null;
     this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     this.cadRequested = false;
@@ -1875,7 +1886,9 @@ function cameraMoving() {
 // to multiple GB until fetch/decode OOM'd and the pipeline silently stalled
 // ("stopped loading new tiles"). Eviction now also triggers on tiles.size and
 // actually deletes the entry.
-const TILES_MAX = 2000;
+// Low-memory devices (phones; Safari hides deviceMemory) get a smaller cap —
+// each ready tile retains ~130-260 kB CPU-side (DataTexture pixels + hGrid).
+const TILES_MAX = (navigator.deviceMemory ?? 4) >= 8 ? 2000 : 1200;
 function evict() {
   let bytes = gpuEstimate - GPU_MAX;   // GPU-byte overshoot
   let count = tiles.size - TILES_MAX;  // object-count overshoot
@@ -1887,15 +1900,34 @@ function evict() {
   // makes selectNode reload them (churn). Only tiles off the walk for >2.5 s are
   // safe to drop. Already-disposed idle objects (no mesh) are included so the
   // count cap can drain them too.
+  //
+  // State guard: NEVER delete 'loading'/'queued' tiles. A loading tile's buf may
+  // sit in decodeQueue (finalize would then build an orphan mesh outside the
+  // Map), a queued one sits in pending (pump would load the deleted object). A
+  // prefetch-warmed tile has no lastUsed at all (`?? 0` → instantly stale here)
+  // while pump's abort sweep deliberately keeps its fetch alive (`?? frame`) —
+  // without this guard the two policies collide and orphan it.
   const stale = [...tiles.values()]
-    .filter(t => t.z > ZMIN && (!t.mesh || !t.mesh.visible)
+    .filter(t => t.z > ZMIN
+                 && (t.state === 'ready' || t.state === 'idle' || t.state === 'empty')
+                 && (!t.mesh || !t.mesh.visible)
                  && frame - (t.lastUsed ?? 0) > 150)
     .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
   for (const t of stale) {
     if (bytes <= 0 && count <= 0) break;
     const b = t.mesh ? tileGpuBytes(t) : 0;
     t.dispose();
-    tiles.delete(t.key);   // actually remove from the Map — this never happened
+    tiles.delete(t.key);
+    // Cut the walk's cached reference: children() memoises _kids forever and
+    // selectNode traverses through it, NOT through the Map. Left in place, the
+    // parent would keep reviving the deleted object (reload → textures held by
+    // an object the Map scan can't see or evict — the leak reborn, uncountable)
+    // while getTile handed out a duplicate under the same key. Dropping the
+    // parent's cache makes the next walk rebuild via getTile: fresh object into
+    // the Map, siblings resolve to their existing Map entries. It also unlinks
+    // the deleted tile from the root-anchored _kids chain so GC can collect it.
+    tiles.get(`${t.z - 1}/${t.x >> 1}/${t.y >> 1}`)?._kids &&
+      (tiles.get(`${t.z - 1}/${t.x >> 1}/${t.y >> 1}`)._kids = null);
     bytes -= b; gpuEstimate -= b; count--;
   }
 }

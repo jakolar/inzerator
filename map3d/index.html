@@ -1005,16 +1005,17 @@ const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.55).normalize();
 // ?tiles=https://<host>/v1 — 404s there just mean "parent tile covers it".
 const TILE_BASE = P.get('tiles') ?? '/cuzk-pyramid';
 // ?v= busts the (now month-long, immutable) browser cache after in-place
-// height rebuilds — bump to v=2 when the full-CR chain re-aggregates z=17.
-const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc?v=1`;
+// height rebuilds (v=2: full-CR z=18 base + z=17 re-agg, 2026-07-16).
+const HEIGHT_URL = (z, x, y) => `${TILE_BASE}/dmpok/${z}/${x}/${y}.lerc?v=2`;
 // Ortho: pre-baked pyramid JPEG first (F1, dispatch_ortho_pyramid.py),
 // then per-tile WMS cut from local bulk sheets for z>=14 not yet baked,
 // then the shader's hypsometric fallback. Below z=14 the WMS composite
 // would mosaic hundreds of sheets per request → pyramid or nothing.
 // ?v= busts the month-long immutable browser tile cache after data
-// rebuilds (v=3: z=18 @2x pass; v=4: z=15..8 re-aggregation, 2026-07-10).
+// rebuilds (v=3: z=18 @2x pass; v=4: z=15..8 re-aggregation, 2026-07-10;
+// v=5: full-CR z=18 @2x base + z=17 re-agg, 2026-07-16).
 const ORTHO_TILE_URL = (z, x, y) =>
-  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg?v=4`;
+  `${TILE_BASE}/ortho/${z}/${x}/${y}.jpg?v=5`;
 const ORTHO_WMS_URL = (z, x, y) => {
   if (z < 14) return null;
   const b = tileToBBoxWgs(z, x, y);

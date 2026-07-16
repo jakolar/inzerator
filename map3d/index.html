@@ -123,15 +123,15 @@
 
 <script type="importmap">
 { "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/addons/"
 }}
 </script>
 
 <script type="module">
 import * as THREE from 'three';
 import { MapControls } from 'three/addons/controls/MapControls.js';
-import * as Lerc from 'https://cdn.jsdelivr.net/npm/lerc@4/+esm';
+import * as Lerc from './vendor/lerc.js';
 
 // iOS Safari page-pinch (proprietary gesture events) + double-tap zoom.
 for (const ev of ['gesturestart', 'gesturechange', 'gestureend'])
@@ -1894,7 +1894,9 @@ const hud = document.getElementById('hud');
 const loading = document.getElementById('loading');
 let frame = 0, firstRendered = false;
 
-await Lerc.load();
+// Self-hosted wasm: the lerc +esm bundle bakes in jsdelivr's absolute path,
+// so point locateFile at our vendored copy relative to index.html.
+await Lerc.load({ locateFile: (p) => new URL('vendor/' + p, document.baseURI).href });
 window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue };   // debug console handle
 
 BARE.addEventListener('change', () => {

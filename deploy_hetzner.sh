@@ -22,4 +22,9 @@ grep -q "?? '/v1'" "$TMP" || { echo "!! TILE_BASE bake failed"; exit 1; }
 "${RSYNC[@]}" "$TMP" "$HOST:/srv/map3d/index.html"
 rm -f "$TMP"
 
+# Static viewer assets co-located with index.html (cz-border.json gates the
+# edge-tile coverage test; without it every ČR-border tile loads overcautiously).
+"${RSYNC[@]}" /Users/jan/projekty/inzerator/map3d/cz-border.json \
+  "$HOST:/srv/map3d/cz-border.json"
+
 echo "done. https://<domain>/  (Caddy serves /srv/map3d + /srv/tiles)"

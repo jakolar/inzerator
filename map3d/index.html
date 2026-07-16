@@ -978,7 +978,14 @@ const FRAG = /* glsl */`
     }
     if (uHasCad > 0.5) {
       vec4 cad = texture2D(uCad, uCadUv.xy + vUv * uCadUv.z);
-      col = mix(col, cad.rgb, cad.a);
+      // ČÚZK KN draws near-black lines/labels — invisible over dark ortho
+      // (forest, shadows). Repaint dark pixels bright yellow (the katamapa
+      // over-orthophoto convention); coloured elements (red plomby, water
+      // labels) keep their own hue. smoothstep keeps AA edges clean.
+      float cmax = max(max(cad.r, cad.g), cad.b);
+      vec3 cadCol = mix(vec3(1.0, 0.84, 0.29), cad.rgb,
+                        smoothstep(0.25, 0.55, cmax));
+      col = mix(col, cadCol, cad.a);
     }
     if (uHasMask > 0.5) {
       vec2 mu = (vWXZ - uMaskRect.xy) * uMaskRect.zw;
@@ -1027,7 +1034,9 @@ const ORTHO_WMS_URL = (z, x, y) => {
 // drapes 1:1). Fills the same ortho drape slot, so the whole streaming /
 // inheritance / pacing pipeline is reused; the cadastre overlay still
 // composits on top of it.
-const OSM_TILE_URL = (z, x, y) => `/proxy/osm-tile/${z}/${x}/${y}.png`;
+// size=512: the proxy stitches the four z+1 children — plain 256² OSM
+// upscales blurry on the 3D drape (street names unreadable).
+const OSM_TILE_URL = (z, x, y) => `/proxy/osm-tile/${z}/${x}/${y}.png?size=512`;
 const OSM = document.getElementById('osmToggle');
 OSM.checked = P.get('osm') === '1';
 let osmMode = OSM.checked;

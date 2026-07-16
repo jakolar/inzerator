@@ -3243,7 +3243,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         global _OSM_SEM(2) in-flight cap, identifying User-Agent.
         """
         import re
-        m = re.match(r"^/proxy/osm-tile/(\d+)/(\d+)/(\d+)\.png$", self.path)
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        m = re.match(r"^/proxy/osm-tile/(\d+)/(\d+)/(\d+)\.png$", parsed.path)
         if not m:
             self.send_error(404, "expected /proxy/osm-tile/{z}/{x}/{y}.png")
             return
@@ -3251,38 +3253,73 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         if not (0 <= z <= 19) or not (0 <= x < (1 << z)) or not (0 <= y < (1 << z)):
             self.send_error(400, "tile coords out of range")
             return
+        want512 = parse_qs(parsed.query).get("size", ["256"])[0] == "512"
 
-        cache_dir = Path("cache/osm_xyz") / str(z) / str(x)
-        cache_path = cache_dir / f"{y}.png"
-        data = None
-        if cache_path.is_file():
-            data = cache_path.read_bytes()
-            cache_state = "hit"
-        else:
-            url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        def fetch_one(fz, fx, fy):
+            """Cache-or-fetch one upstream 256² OSM tile → (bytes|None, state)."""
+            cdir = Path("cache/osm_xyz") / str(fz) / str(fx)
+            cpath = cdir / f"{fy}.png"
+            if cpath.is_file():
+                return cpath.read_bytes(), "hit"
+            url = f"https://tile.openstreetmap.org/{fz}/{fx}/{fy}.png"
             ua = "inzerator-heightfield/1.0 (https://github.com/alacremex/inzerator)"
             req = urllib.request.Request(url, headers={"User-Agent": ua})
-            last_err = None
+            raw = None
             for attempt in range(3):
                 with _OSM_XYZ_SEM:
                     try:
                         with urllib.request.urlopen(req, timeout=20) as resp:
-                            data = resp.read()
+                            raw = resp.read()
                         break
                     except (urllib.error.URLError, ConnectionError,
-                            TimeoutError, OSError) as e:
-                        last_err = e
+                            TimeoutError, OSError):
+                        pass
                 if attempt < 2:
                     import time as _t
                     _t.sleep(1 + attempt)
+            if raw is None:
+                return None, "miss"
+            cdir.mkdir(parents=True, exist_ok=True)
+            tmp = cpath.with_suffix(".png.tmp")
+            tmp.write_bytes(raw)
+            tmp.replace(cpath)
+            return raw, "miss"
+
+        if want512 and z < 19:
+            # @2x drape: stitch the four z+1 children into one 512² tile.
+            # OSM serves 256² only, which upscales blurry on the 3D terrain
+            # (street names unreadable). Children go through the same
+            # per-tile disk cache; the stitched PNG is cached separately.
+            cache_path = Path("cache/osm_xyz512") / str(z) / str(x) / f"{y}.png"
+            if cache_path.is_file():
+                data = cache_path.read_bytes()
+                cache_state = "hit"
+            else:
+                import io
+                from PIL import Image
+                canvas = Image.new("RGB", (512, 512))
+                for dy in (0, 1):
+                    for dx in (0, 1):
+                        raw, _ = fetch_one(z + 1, 2 * x + dx, 2 * y + dy)
+                        if raw is None:
+                            self.send_error(502, f"OSM child tile for {z}/{x}/{y}")
+                            return
+                        canvas.paste(
+                            Image.open(io.BytesIO(raw)).convert("RGB"),
+                            (dx * 256, dy * 256))
+                buf = io.BytesIO()
+                canvas.save(buf, "PNG", optimize=True)
+                data = buf.getvalue()
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_path.with_suffix(".png.tmp")
+                tmp.write_bytes(data)
+                tmp.replace(cache_path)
+                cache_state = "miss"
+        else:
+            data, cache_state = fetch_one(z, x, y)
             if data is None:
-                self.send_error(502, f"OSM tile {z}/{x}/{y}: {last_err}")
+                self.send_error(502, f"OSM tile {z}/{x}/{y} upstream failed")
                 return
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = cache_path.with_suffix(".png.tmp")
-            tmp.write_bytes(data)
-            tmp.replace(cache_path)
-            cache_state = "miss"
 
         self.send_response(200)
         self.send_header("Content-Type", "image/png")

@@ -1868,24 +1868,35 @@ function cameraMoving() {
   _camPrev.copy(camera.position);
   return moved;
 }
+// Cap the number of retained tile objects. The tiles Map used to be append-only
+// — dispose() freed a tile's textures/hGrid but never removed the object, and
+// nothing else deleted from the Map — so a long pan across ČR grew it to tens of
+// thousands of tiles whose heightTex/hGrid were never reclaimed. JS heap climbed
+// to multiple GB until fetch/decode OOM'd and the pipeline silently stalled
+// ("stopped loading new tiles"). Eviction now also triggers on tiles.size and
+// actually deletes the entry.
+const TILES_MAX = 2000;
 function evict() {
-  if (gpuEstimate <= GPU_MAX) return;
-  // Dispose only tiles NOT visible this frame AND idle >~2.5 s, oldest first,
-  // until the byte estimate fits. The `visible` + idle guards matter: the
-  // live LOD walk touches ancestor tiles (hidden but lastUsed=frame) every
-  // frame, so a deep tilted view's 300+ "hidden" tiles are the genuine
-  // working set, not garbage — evicting them just makes selectNode reload
-  // them (churn). Only tiles off the walk for >2.5 s are safe to drop.
+  let bytes = gpuEstimate - GPU_MAX;   // GPU-byte overshoot
+  let count = tiles.size - TILES_MAX;  // object-count overshoot
+  if (bytes <= 0 && count <= 0) return;
+  // Only tiles NOT visible this frame AND idle >~2.5 s, oldest first. The
+  // `visible` + idle guards matter: the live LOD walk touches ancestor tiles
+  // (hidden but lastUsed=frame) every frame, so a deep tilted view's 300+
+  // "hidden" tiles are the genuine working set, not garbage — evicting them just
+  // makes selectNode reload them (churn). Only tiles off the walk for >2.5 s are
+  // safe to drop. Already-disposed idle objects (no mesh) are included so the
+  // count cap can drain them too.
   const stale = [...tiles.values()]
-    .filter(t => t.z > ZMIN && t.state === 'ready' && t.mesh && !t.mesh.visible
+    .filter(t => t.z > ZMIN && (!t.mesh || !t.mesh.visible)
                  && frame - (t.lastUsed ?? 0) > 150)
     .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
-  let over = gpuEstimate - GPU_MAX;
   for (const t of stale) {
-    if (over <= 0) break;
-    const b = tileGpuBytes(t);
+    if (bytes <= 0 && count <= 0) break;
+    const b = t.mesh ? tileGpuBytes(t) : 0;
     t.dispose();
-    over -= b; gpuEstimate -= b;
+    tiles.delete(t.key);   // actually remove from the Map — this never happened
+    bytes -= b; gpuEstimate -= b; count--;
   }
 }
 
@@ -2040,9 +2051,12 @@ function tick() {
   prefetch();
   pump();
   stillFrames = cameraMoving() ? 0 : stillFrames + 1;
-  // Reclaim only after the camera has been still ~0.4 s — never mid-gesture,
-  // so rotating never disposes a tile that then swings back into view.
-  if (stillFrames > 24 && frame % 30 === 0) evict();
+  // GPU-byte trim waits until the camera has been still ~0.4 s — never
+  // mid-gesture, so rotating never disposes a tile that then swings back into
+  // view. The tile-count cap is a memory safety-valve that must run even during
+  // continuous interaction (that is exactly when the Map used to balloon); it
+  // only drops tiles idle >2.5 s off the LOD walk, so it can't churn the view.
+  if (frame % 30 === 0 && (stillFrames > 24 || tiles.size > TILES_MAX)) evict();
   renderer.render(scene, camera);
 
   // visCount, not stats.ready: heights decode before the first ortho JPEG

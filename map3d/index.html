@@ -1018,7 +1018,14 @@ const FRAG = /* glsl */`
       float cmax = max(max(cad.r, cad.g), cad.b);
       vec3 cadCol = mix(vec3(1.0, 0.84, 0.29), cad.rgb,
                         smoothstep(0.25, 0.55, cmax));
-      col = mix(col, cadCol, cad.a);
+      // Top-down raster smears down vertical DSM walls (a whole facade sits
+      // inside one thin line's XZ band → yellow-striped buildings at oblique
+      // views). Same cure as the highlight mask: fade the overlay out on
+      // steep surfaces; lines stay crisp on ground and roofs.
+      // 0.55..0.80 (vs the mask's 0.35..0.65): also kills the drip on rounded
+      // DSM roof shoulders; ground slopes up to ~35° keep full line alpha.
+      float cadFlat = smoothstep(0.55, 0.80, nrm.y);
+      col = mix(col, cadCol, cad.a * cadFlat);
     }
     if (uHasMask > 0.5) {
       vec2 mu = (vWXZ - uMaskRect.xy) * uMaskRect.zw;

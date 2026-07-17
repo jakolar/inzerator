@@ -1140,10 +1140,11 @@ function loadCad(url, onOk, stale, tile) {
   cadInflight++;
   const done = () => {
     cadInflight--;
-    // Mirror loadOrtho's drain: prio-order the backlog and drop stale /
-    // walk-abandoned entries with the flag reset so they can re-request.
+    // Drain nearest-to-FOCUS first (controls.target = screen centre), not by
+    // camera-distance prio: in a tilted view prio() favours the screen bottom,
+    // but the user reads parcels where they're looking — the orbit centre.
     cadBacklog.sort((a, b) =>
-      (a[3] ? prio(a[3]) : 0) - (b[3] ? prio(b[3]) : 0));
+      (a[3] ? focusDist(a[3]) : 0) - (b[3] ? focusDist(b[3]) : 0));
     while (cadBacklog.length) {
       const q = cadBacklog.shift();
       if (q[2] && q[2]()) { if (q[3]) q[3].cadRequested = false; continue; }
@@ -1701,6 +1702,10 @@ function screenPx(tile) {
   return tile.sideM * innerHeight /
          (2 * dist * Math.tan(camera.fov * Math.PI / 360));
 }
+// Cadastre ordering key: distance from the orbit target = the user's focus.
+function focusDist(tile) {
+  return tile.box.distanceToPoint(controls.target);
+}
 function prio(tile) {
   // Level-major (breadth-first): all of level z loads before any z+1, so
   // the view refines evenly one LOD step at a time — pure dist/sideM let
@@ -2095,8 +2100,12 @@ CAD.addEventListener('change', () => {
   // just kick fetches for on-screen tiles now so the overlay appears without
   // waiting for the next camera move.
   if (CAD.checked) {
-    for (const t of tiles.values())
-      if (t.mesh?.visible && !t.cadTex) t.requestCad();
+    // Dispatch nearest-to-focus first so the 4 in-flight slots start on the
+    // parcels the user is looking at, not on Map-iteration-order tiles.
+    [...tiles.values()]
+      .filter(t => t.mesh?.visible && !t.cadTex)
+      .sort((a, b) => focusDist(a) - focusDist(b))
+      .forEach(t => t.requestCad());
   } else {
     // Free the overlay NOW: a browse session leaves 30-80 cadTex alive
     // (~1.4 MB GPU each) that evict() rightly won't touch while their

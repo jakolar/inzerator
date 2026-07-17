@@ -1,10 +1,41 @@
 # Deploy produkce na Hetzner VPS (F4)
 
-## Stav (2026-07-03)
+## Stav (2026-07-17)
 
-**Deploy ODLOŽEN** — rozhodnutí uživatele: nejdřív doběhne F3 chain
-(pre-bake vysokých zoomů) a doladí se kvalita mapy; VPS se objedná až pak.
-Kroky níže zůstávají jako fronta práce, nic z nich teď nespouštět.
+**Deploy ZAHÁJEN** — pyramida je kompletní (full-ČR z=8..18, 888 GB),
+čeká se na objednávku VPS uživatelem (krok 1 níže). Rozhodnuto: nasazuje se
+i **backend** (`server.py` za Caddy reverse proxy) — search, katastr, OSM
+vrstva a klik na parcely fungují i v produkci; server.py na VPS běží bez
+bulk dat (jen ČÚZK REST + upstream proxy + disk cache).
+
+## Krok 1: Objednávka VPS (uživatel, ~10 min)
+
+1. Účet: <https://console.hetzner.com> — registrace (e-mail + karta;
+   první objednávka může chtít ověření identity).
+2. Nový projekt (např. „mapa") → **Add Server**:
+   - Location: `Falkenstein` nebo `Nuremberg` (~20–30 ms do ČR)
+   - Image: `Ubuntu 24.04`
+   - Type: Shared vCPU x86 → **CX32** (4 vCPU, 8 GB) — ~€7,6/měs
+   - Networking: IPv4 + IPv6 (default)
+   - SSH keys → Add SSH key → vložit veřejný klíč Macu (celý řádek):
+     ```
+     ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFQBczqxwbMthspFCXbdXKr9MPannPVNzUyVDNTV0KAY alacremex@gmail.com
+     ```
+   - Volumes → Create Volume: **1 TB** (1024 GB), připojit k serveru — ~€48/měs
+   - Celkem ≈ **€56/měs** → Create & Buy now
+3. Z konzole opsat **IP adresu serveru** a předat Claudovi.
+
+Doména není potřeba hned — start na IP, doména se doplní kdykoli později
+(Caddy si pak sám vyřídí Let's Encrypt certifikát).
+
+## Krok 2: Setup + upload (Claude, po obdržení IP)
+
+1. Setup přes SSH: Caddy, deploy user, adresáře, mount 1TB Volume, firewall.
+2. Backend: `server.py` jako systemd služba za Caddy reverse proxy
+   (`/api/*`, `/proxy/*`).
+3. Upload dat: 888 GB / ~9 M souborů po vrstvách a zoomech
+   (`deploy_hetzner.sh`, resumable) — ~1–2 dny dle uploadu.
+4. Ověření: dlaždice, viewer, API endpointy, cache hlavičky.
 
 - [x] Rozhodnutí: produkce plně online na Hetzner VPS, archiv doma
   (amendment D5 ve spec `docs/superpowers/specs/2026-07-02-cr-3d-map-design.md`)
@@ -15,11 +46,11 @@ Kroky níže zůstávají jako fronta práce, nic z nich teď nespouštět.
   ortho z=18 base 13 974 454 enumerováno / 4 537 022 zapsáno JPEG (zbytek
   skip + prázdný oceán/hranice), ortho z=17 re-agg 2 081 521; výšky z=18 base
   + z=17 re-agg. **888 GB celkem** (změřeno 2026-07-16).
-- [ ] Objednat VPS (CX32 + 500GB Volume, Ubuntu 24.04, Falkenstein/Norimberk)
-- [ ] DNS A záznam domény → IP serveru
-- [ ] Setup serveru (blok níže)
-- [ ] První push: `./deploy_hetzner.sh deploy@<host>`
-- [ ] Finální sync po doběhnutí F3 řetězu
+- [ ] Objednat VPS (CX32 + **1TB** Volume, Ubuntu 24.04, Falkenstein/Norimberk)
+  — viz Krok 1 výše
+- [ ] Setup serveru vč. systemd `server.py` + Caddy reverse proxy (blok níže)
+- [ ] První push: `./deploy_hetzner.sh deploy@<host>` (888 GB, resumable)
+- [ ] Doména + DNS A záznam → IP (kdykoli později; do té doby IP)
 
 Topologie: **produkce plně online** (kompletně předpečená pyramida + viewer
 na VPS), **archiv doma** (2 TB bulk na Elements — z něj se peče; na server
@@ -87,9 +118,10 @@ curl -sI https://mapa.example.com/ | head -3
 - **On-demand build** — vyžaduje 2 TB bulk; ten je doma. Nepředpečená
   dlaždice = klient zobrazí rodiče (replacement refinement, žádná díra).
   Po F3 se to týká jen neobydlených z=17..18.
-- **WMS ortho fallback a `/api/*`** — viewer je na CDN/VPS čistá statika;
-  fallback řetěz končí hypsometrií. Až bude potřeba vyhledávání adres,
-  přidá se malý backend (server.py umí běžet i bez bulk dat) — VPS na to
-  má výkon; zatím YAGNI.
+- ~~WMS ortho fallback a `/api/*`~~ — **ZMĚNA 2026-07-17**: backend SE
+  nasazuje. `server.py` běží na VPS jako systemd služba za Caddy reverse
+  proxy (`/api/*`, `/proxy/*`) — search, klik na parcely/budovy, katastr
+  a OSM vrstva fungují i v produkci. Bez bulk dat: jen ČÚZK REST /
+  upstream WMS+XYZ proxy s diskovou cache na Volume.
 - **R2 varianta** zůstává v `deploy_r2.sh` + `DEPLOY_R2.md` jako plan B
   (kdyby návštěvnost přerostla VPS, statika se přesune jedním rclone sync).

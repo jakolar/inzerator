@@ -978,28 +978,7 @@ const FRAG = /* glsl */`
   varying vec2 vUv;
   varying vec2 vWXZ;
   #include <fog_pars_fragment>
-#ifdef FEATURE_FADE
-  // LOD flip cross-fade (port of 3DTilesRendererJS TilesFadePlugin): 4x4 Bayer
-  // screen-door discard. Parent fades out on 'dither < uFadeOut', children fade
-  // in on 'dither >= uFadeIn' — the same matrix makes the patterns exact
-  // complements, so coverage stays ~100% with depth-write on and zero blending.
-  // Compiled in only while a fade runs (define, not a uniform branch) so the
-  // steady-state shader keeps early-Z.
-  uniform float uFadeIn;
-  uniform float uFadeOut;
-  float bayerDither2x2(vec2 v) { return mod(3.0 * v.y + 2.0 * v.x, 4.0); }
-  float bayerDither4x4(vec2 v) {
-    vec2 P1 = mod(v, 2.0);
-    vec2 P2 = floor(0.5 * mod(v, 4.0));
-    return 4.0 * bayerDither2x2(P1) + bayerDither2x2(P2);
-  }
-#endif
   void main() {
-#ifdef FEATURE_FADE
-    float dith = (0.5 + bayerDither4x4(floor(mod(gl_FragCoord.xy, 4.0)))) / 16.0;
-    if (dith >= uFadeIn) discard;
-    if (dith < uFadeOut) discard;
-#endif
     float t = uTexel;
     float hL = texture2D(uHeight, vUv - vec2(t, 0.)).r;
     float hR = texture2D(uHeight, vUv + vec2(t, 0.)).r;
@@ -1299,11 +1278,9 @@ const tiles = new Map();   // key "z/x/y" → Tile
 const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
 // ── Fade state ──────────────────────────────────────────────────────────
 // orthoFades: tiles cross-fading to their own just-arrived drape texture
-// (uOrthoFade 0→1). lodFades: tiles in a Bayer screen-door LOD transition
-// (tile → {mode:'in'|'out', start}); driven per-frame from tick().
+// (uOrthoFade 0→1); driven per-frame from tick().
 const FADE_MS = 250;
 const orthoFades = new Set();
-const lodFades = new Map();
 function finishOrthoFade(t) {
   orthoFades.delete(t);
   t._fadePrevTex?.dispose(); t._fadePrevTex = null;
@@ -1606,8 +1583,6 @@ class Tile {
           uCzMask: { value: czMaskTex },
           uCzRect: { value: CZ_RECT },   // shared instance
           uHasCz: { value: czOn },
-          uFadeIn: { value: 1 },        // used only while FEATURE_FADE is defined
-          uFadeOut: { value: 0 },
           ...THREE.UniformsLib.fog,          // fogColor/fogDensity, refreshed by renderer
         },
         vertexShader: VERT, fragmentShader: FRAG,
@@ -1725,7 +1700,7 @@ class Tile {
     }
     this.heightTex = this.orthoTex = this.hGrid = this.cadTex = null;
     this._fadePrevTex?.dispose(); this._fadePrevTex = null;
-    orthoFades.delete(this); lodFades.delete(this);
+    orthoFades.delete(this);
     this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     this.cadRequested = false;
     if (this.state !== 'empty') this.state = 'idle';
@@ -1918,64 +1893,19 @@ function selectNode(tile, show) {
 
 let visZMin = 99, visZMax = 0, visCount = 0;
 let shown = new Set();
-function startLodFade(t, mode, now) {
-  const prev = lodFades.get(t);
-  if (prev?.mode === mode) return;
-  const u = t.mesh.material.uniforms;
-  u.uFadeIn.value = mode === 'in' ? 0 : 1;
-  u.uFadeOut.value = 0;
-  if (!prev) {
-    t.mesh.material.defines.FEATURE_FADE = '';
-    t.mesh.material.needsUpdate = true;   // 2 cached program variants total
-  }
-  lodFades.set(t, { mode, start: now, frame });
-}
-function endLodFade(t, mode) {
-  lodFades.delete(t);
-  if (!t.mesh) return;
-  const u = t.mesh.material.uniforms;
-  u.uFadeIn.value = 1; u.uFadeOut.value = 0;
-  delete t.mesh.material.defines.FEATURE_FADE;
-  t.mesh.material.needsUpdate = true;
-  if (mode === 'out') t.mesh.visible = false;
-}
+// NOTE: a Bayer screen-door LOD cross-fade lived here briefly (port of
+// 3DTilesRendererJS TilesFadePlugin, 6f01c5f..10649bd). With ancestor-texture
+// inheritance the colours at a quad flip are pixel-identical already, so the
+// fade only masked the displacement-detail pop — and ~50 concurrent animated
+// dither patterns during a zoom read as heavy full-screen flicker on retina
+// ("celá mapa brutálně přeblikává"). Removed; the texture-arrival cross-fade
+// (uOrthoFade, an opaque mix) is the one that matters and stays.
 function applyVisibility(show) {
   const next = new Set(show);
-  // LOD flip cross-fade (Bayer screen-door — see FEATURE_FADE in FRAG): pair
-  // outgoing↔incoming tiles by ancestry. A split keeps the parent visible
-  // ~250 ms with rising uFadeOut while its children rise from uFadeIn=0 on the
-  // exact complementary pixel set; a coarsen is the same pair reversed.
-  // Unpaired removals (frustum exit) hide instantly, unrelated new entries pop
-  // in under the ancestor-texture inheritance (pixel-identical, no fade
-  // needed). Fast camera motion skips fades — invisible anyway, saves fill.
-  const removed = [];
-  for (const t of shown) if (!next.has(t) && t.mesh && t.mesh.visible) removed.push(t);
-  if (!camFast && removed.length) {
-    const added = [];
-    for (const t of next) if (t.mesh && !shown.has(t)) added.push(t);
-    const now = performance.now();
-    for (const r of removed) {
-      for (const a of added) {
-        const anc = a.z < r.z ? a : r, dec = a.z < r.z ? r : a;
-        if (dec.z > anc.z &&
-            (dec.x >> (dec.z - anc.z)) === anc.x &&
-            (dec.y >> (dec.z - anc.z)) === anc.y) {
-          startLodFade(r, 'out', now);
-          startLodFade(a, 'in', now);
-        }
-      }
-    }
-  }
-  for (const t of removed) if (lodFades.get(t)?.mode !== 'out') t.mesh.visible = false;
+  for (const t of shown) if (!next.has(t) && t.mesh) t.mesh.visible = false;
   visZMin = 99; visZMax = 0; visCount = 0;
   for (const t of next) {
     if (!t.mesh) continue;
-    // Re-entering tile with a leftover fade from an interrupted transition
-    // (frustum flick-away-and-back): its complement partner is gone, so a
-    // partial dither would punch see-through holes. Snap to full draw unless
-    // the pairing above (re)started a fade for it this very frame.
-    const lf = lodFades.get(t);
-    if (lf && lf.frame !== frame && !shown.has(t)) endLodFade(t, 'in');
     t.mesh.visible = true;
     // Tessellation tier by on-screen size (pointer swap, shared buffers).
     t.mesh.geometry = screenPx(t) < GEO_HALF_PX ? sharedGeoHalf : sharedGeo;
@@ -2126,13 +2056,11 @@ function tileGpuBytes(t) {
 // tiles during a gesture and reclaim only once the camera stops (~0.4 s still),
 // which is exactly when a stationary deep view actually needs the memory back.
 let stillFrames = 0;
-let camFast = false;   // >2%-of-distance/frame: skip LOD fades (invisible anyway)
 const _camPrev = new THREE.Vector3();
 function cameraMoving() {
   const dist = camera.position.distanceTo(controls.target) || 1;
-  const d = _camPrev.distanceTo(camera.position);
-  camFast = d > dist * 0.02;
-  const moved = !!camAnim || !!panVel || d > dist * 1e-3;
+  const moved = !!camAnim || !!panVel
+    || _camPrev.distanceTo(camera.position) > dist * 1e-3;
   _camPrev.copy(camera.position);
   return moved;
 }
@@ -2200,7 +2128,7 @@ let frame = 0, firstRendered = false;
 // so point locateFile at our vendored copy relative to index.html.
 await Lerc.load({ locateFile: (p) => new URL('vendor/' + p, document.baseURI).href });
 window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue,
-  orthoFades, lodFades, terrainPoint, pointInBorder, ORIGIN,
+  orthoFades, terrainPoint, pointInBorder, ORIGIN,
   mercYToLat, THREE, renderer };   // debug console handle
 
 BARE.addEventListener('change', () => {
@@ -2357,9 +2285,7 @@ function tick() {
   drainUploads(3);
   prefetch();
   pump();
-  // Advance fades: texture cross-fades (uOrthoFade) and Bayer LOD fades.
-  // LOD fades snap to done under fast camera motion (complementary dither is
-  // invisible mid-gesture and the discard costs fill rate).
+  // Advance texture cross-fades (uOrthoFade — the opaque own-texture mix).
   if (orthoFades.size) {
     const fnow = performance.now();
     for (const t of orthoFades) {
@@ -2368,16 +2294,6 @@ function tick() {
       const f = Math.min(1, (fnow - t._fadeStart) / FADE_MS);
       u.uOrthoFade.value = f;
       if (f >= 1) finishOrthoFade(t);
-    }
-  }
-  if (lodFades.size) {
-    const fnow = performance.now();
-    for (const [t, s] of lodFades) {
-      if (!t.mesh) { lodFades.delete(t); continue; }
-      const f = Math.min(1, (fnow - s.start) / FADE_MS);
-      const u = t.mesh.material.uniforms;
-      if (s.mode === 'in') u.uFadeIn.value = f; else u.uFadeOut.value = f;
-      if (f >= 1 || camFast) endLodFade(t, s.mode);
     }
   }
   stillFrames = cameraMoving() ? 0 : stillFrames + 1;

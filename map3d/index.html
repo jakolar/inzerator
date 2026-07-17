@@ -1818,7 +1818,7 @@ function startLodFade(t, mode, now) {
     t.mesh.material.defines.FEATURE_FADE = '';
     t.mesh.material.needsUpdate = true;   // 2 cached program variants total
   }
-  lodFades.set(t, { mode, start: now });
+  lodFades.set(t, { mode, start: now, frame });
 }
 function endLodFade(t, mode) {
   lodFades.delete(t);
@@ -1860,7 +1860,12 @@ function applyVisibility(show) {
   visZMin = 99; visZMax = 0; visCount = 0;
   for (const t of next) {
     if (!t.mesh) continue;
-    if (lodFades.get(t)?.mode === 'out') endLodFade(t, 'in');  // reappeared mid-fade
+    // Re-entering tile with a leftover fade from an interrupted transition
+    // (frustum flick-away-and-back): its complement partner is gone, so a
+    // partial dither would punch see-through holes. Snap to full draw unless
+    // the pairing above (re)started a fade for it this very frame.
+    const lf = lodFades.get(t);
+    if (lf && lf.frame !== frame && !shown.has(t)) endLodFade(t, 'in');
     t.mesh.visible = true;
     // Tessellation tier by on-screen size (pointer swap, shared buffers).
     t.mesh.geometry = screenPx(t) < GEO_HALF_PX ? sharedGeoHalf : sharedGeo;

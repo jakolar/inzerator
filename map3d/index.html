@@ -2262,7 +2262,13 @@ function tick() {
   // view. The tile-count cap is a memory safety-valve that must run even during
   // continuous interaction (that is exactly when the Map used to balloon); it
   // only drops tiles idle >2.5 s off the LOD walk, so it can't churn the view.
-  if (frame % 30 === 0 && (stillFrames > 24 || tiles.size > TILES_MAX)) evict();
+  // Evict triggers: settled (original gate), tile-count cap, and GPU-byte cap.
+  // The byte condition must fire during motion too — continuous browsing keeps
+  // stillFrames at 0 while textures pile up (2000 tiles ≈ 1 GB, "GPU 1000 MB"
+  // report 2026-07-17); the idle>2.5s + !visible guards inside evict() make
+  // mid-motion disposal safe (no rotate-flicker regression since 67e6154).
+  if (frame % 30 === 0 && (stillFrames > 24 || tiles.size > TILES_MAX
+                           || gpuEstimate > GPU_MAX)) evict();
   renderer.render(scene, camera);
 
   // visCount, not stats.ready: heights decode before the first ortho JPEG

@@ -1031,10 +1031,13 @@ const FRAG = /* glsl */`
     if (uHasCad > 0.5) {
       vec2 cuv = uCadUv.xy + vUv * uCadUv.z;
       vec4 cad = texture2D(uCad, cuv);
-      // Thicken ~1.5 px: the WMS strokes are 1-1.5 texels and get swallowed
-      // by building mass / wall suppression. 4-tap cross dilation — adopt the
-      // strongest neighbour when it beats the centre alpha.
-      float cdt = 1.5 / 512.0;
+      // Thicken the WMS strokes (1-1.5 texels, swallowed by building mass /
+      // wall suppression) via a 4-tap cross dilation. Radius follows the
+      // SCREEN footprint (fwidth), not a fixed texel count — a fixed radius
+      // ballooned into metre-wide blobs at street zoom once z18 started
+      // inheriting the z17 canonical raster.
+      vec2 cfw = fwidth(cuv);
+      float cdt = clamp(max(cfw.x, cfw.y), 0.5 / 512.0, 3.0 / 512.0);
       vec4 cN = texture2D(uCad, cuv + vec2(0., cdt));
       vec4 cS = texture2D(uCad, cuv - vec2(0., cdt));
       vec4 cE = texture2D(uCad, cuv + vec2(cdt, 0.));
@@ -1129,7 +1132,8 @@ let osmMode = OSM.checked;
 // Only z>=16 — parcel lines/numbers are illegible below that. The server
 // proxy disk-caches each rendered PNG (cache/cadastre) and rate-limits
 // upstream ČÚZK via _CUZK_SEM; the 4-slot gate below bounds our own burst.
-const CAD_MIN_Z = 16;
+const CAD_MIN_Z = 17;      // overlay visible from this zoom (parcels are subpixel below)
+const CAD_CANON_Z = 17;    // the ONLY level that fetches WMS; finer zooms inherit
 const CAD_URL = (z, x, y) => {
   const b = tileToBBoxMerc(z, x, y);
   return `/proxy/cadastre?SRS=EPSG:3857&layer=KN&size=512` +
@@ -1688,7 +1692,7 @@ class Tile {
       }, stale, this);
   }
   requestCad() {
-    if (this.cadRequested || !this.mesh || this.z < CAD_MIN_Z) return;
+    if (this.cadRequested || !this.mesh || this.z !== CAD_CANON_Z) return;
     this.cadRequested = true;
     const stale = () => !this.mesh || !CAD.checked;
     loadCad(CAD_URL(this.z, this.x, this.y), (bmp) => {
@@ -1990,7 +1994,18 @@ function applyVisibility(show) {
     {
       const u = t.mesh.material.uniforms;
       if (CAD.checked) {
-        if (t.z >= CAD_MIN_Z && !t.cadTex) t.requestCad();
+        // Fetch ONLY at the canonical level: every displayed z used to pull
+        // its own WMS PNG — the same ground downloaded up to 3× (z16/17/18)
+        // and during LOD churn two different-scale rasters (labels placed
+        // differently per request) rendered over each other ('vidím ji x přes
+        // sebe', 2026-07-17). Finer tiles inherit the canonical texture
+        // through the existing ancestor sub-window path below.
+        if (t.z >= CAD_MIN_Z) {
+          const canon = t.z === CAD_CANON_Z ? t
+            : tiles.get(`${CAD_CANON_Z}/${t.x >> (t.z - CAD_CANON_Z)}` +
+                        `/${t.y >> (t.z - CAD_CANON_Z)}`);
+          if (canon && !canon.cadTex) canon.requestCad();
+        }
         if (t.cadTex) {
           u.uCad.value = t.cadTex; u.uHasCad.value = 1; u.uCadUv.value.set(0, 0, 1);
         } else {
@@ -2203,10 +2218,17 @@ CAD.addEventListener('change', () => {
   // waiting for the next camera move.
   if (CAD.checked) {
     // Dispatch nearest-to-focus first so the 4 in-flight slots start on the
-    // parcels the user is looking at, not on Map-iteration-order tiles.
-    [...tiles.values()]
-      .filter(t => t.mesh?.visible && !t.cadTex)
-      .sort((a, b) => focusDist(a) - focusDist(b))
+    // parcels the user is looking at. Map visible tiles to their CANONICAL
+    // cad tile (only z=CAD_CANON_Z fetches — see applyVisibility) and dedupe.
+    const canon = new Set();
+    for (const t of tiles.values()) {
+      if (!t.mesh?.visible || t.z < CAD_MIN_Z) continue;
+      const c = t.z === CAD_CANON_Z ? t
+        : tiles.get(`${CAD_CANON_Z}/${t.x >> (t.z - CAD_CANON_Z)}` +
+                    `/${t.y >> (t.z - CAD_CANON_Z)}`);
+      if (c && !c.cadTex) canon.add(c);
+    }
+    [...canon].sort((a, b) => focusDist(a) - focusDist(b))
       .forEach(t => t.requestCad());
   } else {
     // Free the overlay NOW: a browse session leaves 30-80 cadTex alive

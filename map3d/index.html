@@ -698,60 +698,92 @@ function clearMask() {
   applyMask();
   clearGhost();
 }
-// Drape a highlight over any WGS polygon (building footprint or parcel
-// boundary) — same top-down mask + x-ray ghost.
+// Highlight any WGS polygon (parcel boundary / building footprint) as REAL
+// 3D geometry, not a top-down drape. A drape smears the stroke down the DSM
+// building walls (looks like it overshoots the parcel edge at oblique angles)
+// and the building mass hides it (roof unmarked → house reads as "not part of
+// the parcel"). A vertical curtain from ground to just above the roofs, plus a
+// flat ground fill, reads as a clean fence around the property from ANY angle.
+const HL_COL = 0xffd54a;
 function setMask(fp) {
   const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
+  clearMask();
+  if (pts.length < 3) return;
+  // Sample the DSM over the parcel: base = lowest boundary height, top =
+  // highest surface (i.e. tallest building) inside the ring, + headroom.
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (const p of pts) {
     x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
     z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z);
   }
-  const pad = Math.max(x1 - x0, z1 - z0) * 0.15 + 4;   // room for the stroke
-  x0 -= pad; x1 += pad; z0 -= pad; z1 += pad;
-  // Square the rect so the stroke width is isotropic in world units.
-  const side = Math.max(x1 - x0, z1 - z0);
-  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
-  x0 = cx - side / 2; x1 = cx + side / 2;
-  z0 = cz - side / 2; z1 = cz + side / 2;
-  const S = 512, c = document.createElement('canvas');
-  c.width = c.height = S;
-  const g = c.getContext('2d');
-  g.beginPath();
-  pts.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](
-    (p.x - x0) / (x1 - x0) * S, (p.z - z0) / (z1 - z0) * S));
-  g.closePath();
-  g.fillStyle = 'rgba(255, 213, 74, 0.28)'; g.fill();
-  g.lineWidth = 5; g.strokeStyle = 'rgba(255, 213, 74, 0.95)'; g.stroke();
-  clearMask();
-  maskTex = new THREE.CanvasTexture(c);
-  maskTex.flipY = false;   // canvas row 0 = north (min z) = mask v 0
-  MASK_RECT.set(x0, z0, 1 / (x1 - x0), 1 / (z1 - z0));
-  maskOn = 1;
-  applyMask();
-  // X-ray ghost: the DSM blob often leans past the KN footprint and hides
-  // the draped highlight from the far side. GreaterDepth draws the flat
-  // footprint ONLY where the mesh occludes it — visible surfaces keep the
-  // crisp draped mask, hidden parts glow through the building.
-  const gy = ((terrainH(cx, cz) ?? 0) + 1.5) * Y_SCALE;
+  const inPoly = (x, z) => {   // even-odd ray cast in scene XZ
+    let hit = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const a = pts[i], b = pts[j];
+      if ((a.z > z) !== (b.z > z) &&
+          x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x) hit = !hit;
+    }
+    return hit;
+  };
+  let groundH = Infinity, topH = -Infinity;
+  for (const p of pts) {
+    const h = terrainH(p.x, p.z);
+    if (h != null) { groundH = Math.min(groundH, h); topH = Math.max(topH, h); }
+  }
+  const N = 6;   // grid over bbox, clipped to the ring, to catch buildings
+  for (let i = 0; i <= N; i++) for (let j = 0; j <= N; j++) {
+    const x = x0 + (x1 - x0) * i / N, z = z0 + (z1 - z0) * j / N;
+    if (!inPoly(x, z)) continue;
+    const h = terrainH(x, z);
+    if (h != null) topH = Math.max(topH, h);
+  }
+  if (!isFinite(groundH)) groundH = 0;
+  if (!isFinite(topH)) topH = groundH;
+  const baseY = (groundH - 1) * Y_SCALE;
+  const topY = (topH + 4) * Y_SCALE;
+
+  bGhost = new THREE.Group();
+
+  // Ground fill — flat translucent land. Buildings correctly occlude it (the
+  // house stands ON the highlighted land). ponytail: flat at the lowest edge,
+  // so on steeply sloped parcels the uphill half sinks under terrain; fine for
+  // the built-up parcels this is for. Conform to terrain if that ever matters.
   const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, p.z)));
   const fillGeo = new THREE.ShapeGeometry(shape);
-  fillGeo.rotateX(Math.PI / 2);
+  fillGeo.rotateX(Math.PI / 2);           // XY shape → XZ ground plane
+  fillGeo.translate(0, baseY + 0.5, 0);
   const fill = new THREE.Mesh(fillGeo, new THREE.MeshBasicMaterial({
-    color: 0xffd54a, transparent: true, opacity: 0.22,
-    depthWrite: false, depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide,
+    color: HL_COL, transparent: true, opacity: 0.22,
+    depthWrite: false, side: THREE.DoubleSide,
   }));
-  const line = new THREE.LineLoop(
-    new THREE.BufferGeometry().setFromPoints(
-      pts.map(p => new THREE.Vector3(p.x, 0, p.z))),
-    new THREE.LineBasicMaterial({
-      color: 0xffd54a, transparent: true, opacity: 0.85,
-      depthWrite: false, depthFunc: THREE.GreaterDepth,
+
+  // Vertical boundary curtain — indexed quads, base→top per ring segment.
+  const cv = [], ci = [], n = pts.length;
+  for (const p of pts) cv.push(p.x, baseY, p.z);   // 0..n-1  bottom ring
+  for (const p of pts) cv.push(p.x, topY, p.z);    // n..2n-1 top ring
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    ci.push(i, j, j + n, i, j + n, i + n);
+  }
+  const curtGeo = new THREE.BufferGeometry();
+  curtGeo.setAttribute('position', new THREE.Float32BufferAttribute(cv, 3));
+  curtGeo.setIndex(ci);
+  const curtain = (opacity, depthFunc) => new THREE.Mesh(curtGeo,
+    new THREE.MeshBasicMaterial({
+      color: HL_COL, transparent: true, opacity, depthWrite: false,
+      side: THREE.DoubleSide, depthFunc,
     }));
-  fill.renderOrder = line.renderOrder = 10;
-  bGhost = new THREE.Group();
-  bGhost.add(fill, line);
-  bGhost.position.y = gy;
+  const front = curtain(0.28, THREE.LessEqualDepth);   // visible faces
+  const xray = curtain(0.10, THREE.GreaterDepth);      // glow through mass
+
+  // Crisp top edge of the fence.
+  const topLine = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(
+      pts.map(p => new THREE.Vector3(p.x, topY, p.z))),
+    new THREE.LineBasicMaterial({
+      color: HL_COL, transparent: true, opacity: 0.9, depthWrite: false }));
+
+  for (const o of [fill, xray, front, topLine]) { o.renderOrder = 10; bGhost.add(o); }
   scene.add(bGhost);
 }
 function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }

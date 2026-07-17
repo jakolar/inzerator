@@ -250,9 +250,16 @@ scene.fog = new THREE.FogExp2(SKY_HAZE, 0);
 {
   const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(8e6, 8e6),
-    new THREE.MeshBasicMaterial({ color: 0x93a08d, fog: true }));
+    // depthWrite OFF + renderOrder -1: drawn first and never in the depth
+    // buffer, so terrain always paints cleanly over it. With depthWrite on,
+    // country-scale views z-fought it against lowland terrain — the depth
+    // precision at 100+ km exceeds the ~200 m height gap, striping half of
+    // ČR (2026-07-17 report).
+    new THREE.MeshBasicMaterial({ color: 0x93a08d, fog: true,
+                                  depthWrite: false }));
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = 100 * Y_SCALE;
+  ground.renderOrder = -1;
   scene.add(ground);
 }
 

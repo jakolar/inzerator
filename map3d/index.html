@@ -948,10 +948,39 @@ const FRAG = /* glsl */`
   uniform sampler2D uCad;
   uniform float uHasCad;
   uniform vec3 uCadUv;
+  // Own-texture arrival cross-fade: when a tile's own JPEG lands it used to
+  // snap from the blurry inherited ancestor window to full sharpness. uOrthoPrev
+  // keeps the previous drape binding; uOrthoFade ramps 0→1 (~250 ms) and the
+  // fragment mixes the two — opaque, no transparency sorting, no z-fight.
+  uniform sampler2D uOrthoPrev;
+  uniform float uHasOrthoPrev;
+  uniform vec3 uOrthoPrevUv;
+  uniform float uOrthoFade;
   varying vec2 vUv;
   varying vec2 vWXZ;
   #include <fog_pars_fragment>
+#ifdef FEATURE_FADE
+  // LOD flip cross-fade (port of 3DTilesRendererJS TilesFadePlugin): 4x4 Bayer
+  // screen-door discard. Parent fades out on 'dither < uFadeOut', children fade
+  // in on 'dither >= uFadeIn' — the same matrix makes the patterns exact
+  // complements, so coverage stays ~100% with depth-write on and zero blending.
+  // Compiled in only while a fade runs (define, not a uniform branch) so the
+  // steady-state shader keeps early-Z.
+  uniform float uFadeIn;
+  uniform float uFadeOut;
+  float bayerDither2x2(vec2 v) { return mod(3.0 * v.y + 2.0 * v.x, 4.0); }
+  float bayerDither4x4(vec2 v) {
+    vec2 P1 = mod(v, 2.0);
+    vec2 P2 = floor(0.5 * mod(v, 4.0));
+    return 4.0 * bayerDither2x2(P1) + bayerDither2x2(P2);
+  }
+#endif
   void main() {
+#ifdef FEATURE_FADE
+    float dith = (0.5 + bayerDither4x4(floor(mod(gl_FragCoord.xy, 4.0)))) / 16.0;
+    if (dith >= uFadeIn) discard;
+    if (dith < uFadeOut) discard;
+#endif
     float t = uTexel;
     float hL = texture2D(uHeight, vUv - vec2(t, 0.)).r;
     float hR = texture2D(uHeight, vUv + vec2(t, 0.)).r;
@@ -964,6 +993,10 @@ const FRAG = /* glsl */`
       ? texture2D(uOrtho, uOrthoUv.xy + vUv * uOrthoUv.z).rgb
       : mix(vec3(.24, .30, .24), vec3(.55, .52, .46),
             clamp((uHBase + texture2D(uHeight, vUv).r) / 900.0, 0.0, 1.0));
+    if (ortho && uHasOrthoPrev > 0.5 && uOrthoFade < 1.0)
+      base = mix(texture2D(uOrthoPrev,
+                           uOrthoPrevUv.xy + vUv * uOrthoPrevUv.z).rgb,
+                 base, uOrthoFade);
     // Ortho already carries natural shading — full hillshade on top double-
     // darkened it ("zvýšit brightness orto?", 2026-07-11): soften the
     // hillshade, then grade: gamma lift for shadows/mids (no highlight
@@ -1208,6 +1241,22 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
 
 const tiles = new Map();   // key "z/x/y" → Tile
 const stats = { fetches: 0, ready: 0, empty: 0, failed: 0 };
+// ── Fade state ──────────────────────────────────────────────────────────
+// orthoFades: tiles cross-fading to their own just-arrived drape texture
+// (uOrthoFade 0→1). lodFades: tiles in a Bayer screen-door LOD transition
+// (tile → {mode:'in'|'out', start}); driven per-frame from tick().
+const FADE_MS = 250;
+const orthoFades = new Set();
+const lodFades = new Map();
+function finishOrthoFade(t) {
+  orthoFades.delete(t);
+  t._fadePrevTex?.dispose(); t._fadePrevTex = null;
+  const u = t.mesh?.material.uniforms;
+  if (u) { u.uOrthoFade.value = 1; u.uOrthoPrev.value = null; u.uHasOrthoPrev.value = 0; }
+}
+// Snap all texture fades — called before anything disposes textures that may
+// be bound as uOrthoPrev (base-layer toggle disposes hidden ancestors' drapes).
+function completeOrthoFades() { for (const t of [...orthoFades]) finishOrthoFade(t); }
 
 // ── CZ border (simplified ~100 m, mercator) ───────────────────────────
 // Distinguishes two kinds of 404: beyond the data coverage (abroad —
@@ -1447,6 +1496,12 @@ class Tile {
           uCad: { value: null },
           uHasCad: { value: 0 },
           uCadUv: { value: new THREE.Vector3(0, 0, 1) },
+          uOrthoPrev: { value: null },
+          uHasOrthoPrev: { value: 0 },
+          uOrthoPrevUv: { value: new THREE.Vector3(0, 0, 1) },
+          uOrthoFade: { value: 1 },
+          uFadeIn: { value: 1 },        // used only while FEATURE_FADE is defined
+          uFadeOut: { value: 0 },
           ...THREE.UniformsLib.fog,          // fogColor/fogDensity, refreshed by renderer
         },
         vertexShader: VERT, fragmentShader: FRAG,
@@ -1490,11 +1545,24 @@ class Tile {
       tex.anisotropy = 4;
       queueUpload(tex, () => {
         if (!this.mesh) { tex.dispose(); return; }   // disposed while queued
-        // Dispose any previous drape (base-layer swap orto↔OSM) so the old
-        // texture stays visible until the new one is ready — no blank flash.
-        if (this.orthoTex && this.orthoTex !== tex) this.orthoTex.dispose();
-        this.orthoTex = tex;
         const u = this.mesh.material.uniforms;
+        const oldOwn = (this.orthoTex && this.orthoTex !== tex)
+          ? this.orthoTex : null;
+        // Cross-fade from whatever was draped (inherited ancestor sub-window
+        // or the previous base layer): capture the outgoing binding and let
+        // tick() ramp uOrthoFade 0→1. An own→own swap (orto↔OSM) must keep
+        // the old texture alive for the fade — disposed at finishOrthoFade.
+        if (u.uHasOrtho.value > 0.5 && u.uOrtho.value) {
+          this._fadePrevTex?.dispose();
+          u.uOrthoPrev.value = u.uOrtho.value;
+          u.uOrthoPrevUv.value.copy(u.uOrthoUv.value);
+          u.uHasOrthoPrev.value = 1;
+          u.uOrthoFade.value = 0;
+          this._fadePrevTex = oldOwn;
+          this._fadeStart = performance.now();
+          orthoFades.add(this);
+        } else if (oldOwn) oldOwn.dispose();
+        this.orthoTex = tex;
         u.uOrtho.value = tex;
         u.uHasOrtho.value = 1;
         u.uOrthoUv.value.set(0, 0, 1);   // own texture: full window
@@ -1550,6 +1618,8 @@ class Tile {
       if (tex) { tex.__dead = true; tex.dispose(); }   // __dead: skip in drainUploads
     }
     this.heightTex = this.orthoTex = this.hGrid = this.cadTex = null;
+    this._fadePrevTex?.dispose(); this._fadePrevTex = null;
+    orthoFades.delete(this); lodFades.delete(this);
     this.orthoDone = this.orthoRequested = false;   // reload re-fetches ortho
     this.cadRequested = false;
     if (this.state !== 'empty') this.state = 'idle';
@@ -1738,12 +1808,59 @@ function selectNode(tile, show) {
 
 let visZMin = 99, visZMax = 0, visCount = 0;
 let shown = new Set();
+function startLodFade(t, mode, now) {
+  const prev = lodFades.get(t);
+  if (prev?.mode === mode) return;
+  const u = t.mesh.material.uniforms;
+  u.uFadeIn.value = mode === 'in' ? 0 : 1;
+  u.uFadeOut.value = 0;
+  if (!prev) {
+    t.mesh.material.defines.FEATURE_FADE = '';
+    t.mesh.material.needsUpdate = true;   // 2 cached program variants total
+  }
+  lodFades.set(t, { mode, start: now });
+}
+function endLodFade(t, mode) {
+  lodFades.delete(t);
+  if (!t.mesh) return;
+  const u = t.mesh.material.uniforms;
+  u.uFadeIn.value = 1; u.uFadeOut.value = 0;
+  delete t.mesh.material.defines.FEATURE_FADE;
+  t.mesh.material.needsUpdate = true;
+  if (mode === 'out') t.mesh.visible = false;
+}
 function applyVisibility(show) {
   const next = new Set(show);
-  for (const t of shown) if (!next.has(t) && t.mesh) t.mesh.visible = false;
+  // LOD flip cross-fade (Bayer screen-door — see FEATURE_FADE in FRAG): pair
+  // outgoing↔incoming tiles by ancestry. A split keeps the parent visible
+  // ~250 ms with rising uFadeOut while its children rise from uFadeIn=0 on the
+  // exact complementary pixel set; a coarsen is the same pair reversed.
+  // Unpaired removals (frustum exit) hide instantly, unrelated new entries pop
+  // in under the ancestor-texture inheritance (pixel-identical, no fade
+  // needed). Fast camera motion skips fades — invisible anyway, saves fill.
+  const removed = [];
+  for (const t of shown) if (!next.has(t) && t.mesh && t.mesh.visible) removed.push(t);
+  if (!camFast && removed.length) {
+    const added = [];
+    for (const t of next) if (t.mesh && !shown.has(t)) added.push(t);
+    const now = performance.now();
+    for (const r of removed) {
+      for (const a of added) {
+        const anc = a.z < r.z ? a : r, dec = a.z < r.z ? r : a;
+        if (dec.z > anc.z &&
+            (dec.x >> (dec.z - anc.z)) === anc.x &&
+            (dec.y >> (dec.z - anc.z)) === anc.y) {
+          startLodFade(r, 'out', now);
+          startLodFade(a, 'in', now);
+        }
+      }
+    }
+  }
+  for (const t of removed) if (lodFades.get(t)?.mode !== 'out') t.mesh.visible = false;
   visZMin = 99; visZMax = 0; visCount = 0;
   for (const t of next) {
     if (!t.mesh) continue;
+    if (lodFades.get(t)?.mode === 'out') endLodFade(t, 'in');  // reappeared mid-fade
     t.mesh.visible = true;
     // Tessellation tier by on-screen size (pointer swap, shared buffers).
     t.mesh.geometry = screenPx(t) < GEO_HALF_PX ? sharedGeoHalf : sharedGeo;
@@ -1825,6 +1942,9 @@ function prefetch() {
   const zoomIn = prevDist > 0 && dist < prevDist * 0.997;
   prevDist = dist;
   if (pending.length || inflight > 1) return;   // only when idle
+  // Admission control: don't warm speculative tiles into a cache that evict()
+  // is already draining — prefetch churn against the cap wastes fetches.
+  if (tiles.size > TILES_MAX) return;
   if (zoomIn && visZMax && visZMax < ZMAX)
     warm3x3(visZMax + 1,
             controls.target.x + ORIGIN.x, ORIGIN.y - controls.target.z);
@@ -1880,11 +2000,13 @@ function tileGpuBytes(t) {
 // tiles during a gesture and reclaim only once the camera stops (~0.4 s still),
 // which is exactly when a stationary deep view actually needs the memory back.
 let stillFrames = 0;
+let camFast = false;   // >2%-of-distance/frame: skip LOD fades (invisible anyway)
 const _camPrev = new THREE.Vector3();
 function cameraMoving() {
   const dist = camera.position.distanceTo(controls.target) || 1;
-  const moved = !!camAnim || !!panVel
-    || _camPrev.distanceTo(camera.position) > dist * 1e-3;
+  const d = _camPrev.distanceTo(camera.position);
+  camFast = d > dist * 0.02;
+  const moved = !!camAnim || !!panVel || d > dist * 1e-3;
   _camPrev.copy(camera.position);
   return moved;
 }
@@ -1921,7 +2043,9 @@ function evict() {
                  && (t.state === 'ready' || t.state === 'idle' || t.state === 'empty')
                  && (!t.mesh || !t.mesh.visible)
                  && frame - (t.lastUsed ?? 0) > 150)
-    .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
+    // Oldest first; equal age → children before parents (an evicted parent
+    // under live children can't cover for them, the reverse always can).
+    .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0) || b.z - a.z);
   for (const t of stale) {
     if (bytes <= 0 && count <= 0) break;
     const b = t.mesh ? tileGpuBytes(t) : 0;
@@ -1949,7 +2073,8 @@ let frame = 0, firstRendered = false;
 // Self-hosted wasm: the lerc +esm bundle bakes in jsdelivr's absolute path,
 // so point locateFile at our vendored copy relative to index.html.
 await Lerc.load({ locateFile: (p) => new URL('vendor/' + p, document.baseURI).href });
-window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue };   // debug console handle
+window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue,
+  orthoFades, lodFades };   // debug console handle
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;
@@ -1986,6 +2111,9 @@ OSM.addEventListener('change', () => {
   // shows them — keeps the toggle burst to the on-screen set, not all the
   // ancestor/LOD-walk tiles in the map.
   osmMode = OSM.checked;
+  // Snap running texture fades first: the loop below disposes hidden tiles'
+  // drapes, which may still be bound as some visible tile's uOrthoPrev.
+  completeOrthoFades();
   for (const t of tiles.values()) {
     if (!t.mesh) continue;
     t.orthoRequested = t.orthoDone = false;
@@ -2091,6 +2219,29 @@ function tick() {
   drainUploads(3);
   prefetch();
   pump();
+  // Advance fades: texture cross-fades (uOrthoFade) and Bayer LOD fades.
+  // LOD fades snap to done under fast camera motion (complementary dither is
+  // invisible mid-gesture and the discard costs fill rate).
+  if (orthoFades.size) {
+    const fnow = performance.now();
+    for (const t of orthoFades) {
+      const u = t.mesh?.material.uniforms;
+      if (!u) { finishOrthoFade(t); continue; }
+      const f = Math.min(1, (fnow - t._fadeStart) / FADE_MS);
+      u.uOrthoFade.value = f;
+      if (f >= 1) finishOrthoFade(t);
+    }
+  }
+  if (lodFades.size) {
+    const fnow = performance.now();
+    for (const [t, s] of lodFades) {
+      if (!t.mesh) { lodFades.delete(t); continue; }
+      const f = Math.min(1, (fnow - s.start) / FADE_MS);
+      const u = t.mesh.material.uniforms;
+      if (s.mode === 'in') u.uFadeIn.value = f; else u.uFadeOut.value = f;
+      if (f >= 1 || camFast) endLodFade(t, s.mode);
+    }
+  }
   stillFrames = cameraMoving() ? 0 : stillFrames + 1;
   // GPU-byte trim waits until the camera has been still ~0.4 s — never
   // mid-gesture, so rotating never disposes a tile that then swings back into

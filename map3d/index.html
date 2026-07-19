@@ -1114,7 +1114,7 @@ const FRAG = /* glsl */`
       // ballooned into metre-wide blobs at street zoom once z18 started
       // inheriting the z17 canonical raster.
       vec2 cfw = fwidth(cuv);
-      float cdt = clamp(max(cfw.x, cfw.y), 0.5 / 512.0, 1.8 / 512.0);
+      float cdt = clamp(max(cfw.x, cfw.y), 0.5 / 512.0, 1.1 / 512.0);
       vec4 cN = texture2D(uCad, cuv + vec2(0., cdt));
       vec4 cS = texture2D(uCad, cuv - vec2(0., cdt));
       vec4 cE = texture2D(uCad, cuv + vec2(cdt, 0.));

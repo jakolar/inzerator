@@ -2272,16 +2272,32 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     self.send_error(404, "No parcel near this point")
                     return
-                # Pick the parcel whose ring centroid is closest to (sx, sy).
-                def centroid_dist2(feat):
+                # Pick the parcel actually CLOSEST to the click — true
+                # point-to-polygon distance (0 if inside), not the mean of the
+                # ring vertices. The old vertex-mean mis-ranked elongated/L/flag
+                # parcels (mean sits up the long arm, a compact neighbour wins);
+                # worse, in wgs_mode the rings are lon/lat (outSR=4326) but were
+                # compared against (sx,sy) in S-JTSK metres — pure nonsense. Do
+                # the distance in the ring's own CRS with the click in that CRS
+                # (wgs: scale lon by cos(lat) so it ranks in ~metres).
+                import math
+                from shapely.geometry import Point, Polygon
+                if wgs_mode:
+                    kx = math.cos(math.radians(lat))
+                    click_pt = Point(lon * kx, lat)
+                    def _xy(p): return (p[0] * kx, p[1])
+                else:
+                    click_pt = Point(sx, sy)
+                    def _xy(p): return (p[0], p[1])
+                def poly_dist(feat):
                     rings = feat.get("geometry", {}).get("rings", [])
-                    if not rings: return float('inf')
-                    ring = rings[0]
-                    if len(ring) < 3: return float('inf')
-                    cx_p = sum(p[0] for p in ring) / len(ring)
-                    cy_p = sum(p[1] for p in ring) / len(ring)
-                    return (cx_p - sx) ** 2 + (cy_p - sy) ** 2
-                feats.sort(key=centroid_dist2)
+                    if not rings or len(rings[0]) < 3: return float('inf')
+                    try:
+                        poly = Polygon([_xy(p) for p in rings[0]])
+                        return 0.0 if poly.contains(click_pt) else poly.distance(click_pt)
+                    except Exception:
+                        return float('inf')
+                feats.sort(key=poly_dist)
                 feats = feats[:1]    # keep only the closest
             f = feats[0]
             attrs = f.get("attributes", {})

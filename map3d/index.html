@@ -852,8 +852,26 @@ const rowsHtml = (rows) => '<table>' +
   rows.filter(Boolean).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
     .join('') + '</table>';
 async function showInfo(px, py) {
-  const p = pickSurface(px, py);
+  let p = pickSurface(px, py);
   if (!p) return;
+  // The oblique DSM ray-march lands on a building's NEAR wall, and the DSM
+  // "melts" that wall downhill toward the camera — so the hit x/z sits a few
+  // metres in front of the true footprint. Row houses sit on the parcel line,
+  // so that camera-ward bias crosses it → the NEIGHBOUR parcel gets picked
+  // (reported repeatedly). On a steep hit (facade/skirt), nudge the query point
+  // AWAY from the camera, back into the footprint, so both the parcel and the
+  // building queries land on the right one. Flat ground (low slope) is left as-is.
+  const slopeAt = (x, z) => {
+    const a = terrainH(x + 2, z), b = terrainH(x - 2, z),
+          c = terrainH(x, z + 2), d = terrainH(x, z - 2);
+    return (a == null || b == null || c == null || d == null)
+      ? 0 : Math.hypot(a - b, c - d) / 4;
+  };
+  if (slopeAt(p.x, p.z) > 2.5) {
+    const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+    const hd = new THREE.Vector3(dir.x, 0, dir.z).normalize();
+    p = p.clone().addScaledVector(hd, 5);   // ~5 m deeper, past the melted skirt
+  }
   const lon = (p.x + ORIGIN.x) / WMERC * 180;
   const lat = mercYToLat(ORIGIN.y - p.z);
   const q = `lon=${lon.toFixed(7)}&lat=${lat.toFixed(7)}`;
@@ -2226,8 +2244,8 @@ let frame = 0, firstRendered = false;
 // so point locateFile at our vendored copy relative to index.html.
 await Lerc.load({ locateFile: (p) => new URL('vendor/' + p, document.baseURI).href });
 window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue,
-  orthoFades, terrainPoint, pointInBorder, ORIGIN,
-  mercYToLat, THREE, renderer };   // debug console handle
+  orthoFades, terrainPoint, pickSurface, terrainH, pointInBorder, ORIGIN,
+  WMERC, mercYToLat, THREE, renderer };   // debug console handle
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;

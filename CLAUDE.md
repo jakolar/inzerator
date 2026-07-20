@@ -108,9 +108,11 @@ Negative S-JTSK coords need the `=` form (`--cx=-547700`), otherwise argparse sw
 - **`tiles_v2_` directory prefix** is unchanged after the v2 retirement — rename to `tiles_` is deferred until a separate sweep touches all hard-coded references (`gen_heightfield.py`, `dispatch_heightfield.py`, `refresh_*.py`, `locations.py`, `server.py`).
 - **Czech UI, English code/commits** — matches the global rule in `~/.claude/CLAUDE.md`.
 
-## Bulk downloads (DMPOK + ortofoto)
+## Bulk downloads (DMPOK surface + DMR5G bare-earth + ortofoto)
 
-ČÚZK DMPOK-TIFF mass pull lives in `bulk_dmpok.py` + `bulk_dmpok_inventory.py` + `bulk_dmpok_status.py` + `bulk_dmpok_profile.py`, writing to `/Volumes/Elements/cuzk-bulk/` by default (override `BULK_OUT_DIR`). 4 workers, ~10 sheets/min observed, ~3 nights for the full 16 299-sheet ČR pull. See `BULK_DMPOK.md` for runbook and `BULK_DMPOK_PROFILE.md` for the performance rationale.
+ČÚZK DMPOK-TIFF mass pull lives in `bulk_dmpok.py` + `bulk_dmpok_inventory.py` + `bulk_dmpok_status.py` + `bulk_dmpok_profile.py`, writing to `/Volumes/Elements/cuzk-bulk/` by default (override `BULK_OUT_DIR`). 4 workers, ~10 sheets/min observed, ~3 nights for the full 16 299-sheet ČR pull. See `BULK_DMPOK.md` for runbook and `BULK_DMPOK_PROFILE.md` for the performance rationale. DMPOK is the **surface** model (0.5 m, includes buildings + vegetation).
+
+`bulk_dmr5g.py` is the ground-only twin: the DMR 5G **bare-earth** product (LAZ point clouds, one `<MAPNOM>.laz` per SM5 sheet) from `openzu.cuzk.gov.cz/opendata/DMR5G/epsg-5514/`. Same signal-safe/resumable/atomic-state engine as `bulk_dmpok.py`; writes a flat archive to `/Volumes/Elements/cuzk-dmr5g/` (override `BULK_DMR5G_OUT_DIR`). Full ČR = 16 299 sheets ≈ **45 GB** (measured 2026-07-20, all `done`, 0 missing/fail, ~2h44m). Seed its `sheets.json` once from the identical DMPOK MAPNOM grid — see the module docstring. It's a **point cloud**, not a raster: to use as terrain, rasterise to a grid (the per-location pipeline still fetches the DMR5G ImageServer raster directly; see `fetch_dmr5g` in `gen_heightfield.py`).
 
 `bulk_ortofoto.py` + `bulk_ortofoto_inventory.py` + `bulk_ortofoto_status.py` are a clone of the same engine for the full ortofoto dataset (~1.1 TB JPEG, newest acquisition per sheet). Runbook in `BULK_ORTOFOTO.md`. Sanity check there: `missing` should stay ~0 — a climbing count means a broken ZIP url pattern, not a coverage gap.
 

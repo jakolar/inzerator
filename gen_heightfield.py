@@ -310,7 +310,7 @@ def _encode_lerc(data, out_path, max_z_error=0.10):
 
     `max_z_error` (m): hard upper bound on per-cell elevation error in the
     decoded output. 0 = lossless (often LARGER than PNG for our data).
-    0.10 = 10 cm tolerance, comfortably below ČÚZK DMP5G's 10-30 cm RMS
+    0.10 = 10 cm tolerance, comfortably below ČÚZK DMPOK's 10-30 cm RMS
     source error — i.e. "lossless vs source" but ~50% of PNG size.
 
     Browser decode via WASM `lerc` npm package: returns Float32Array

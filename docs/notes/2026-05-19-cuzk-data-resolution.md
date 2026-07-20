@@ -26,7 +26,7 @@ Viz commit `f439533` a `server.py:_proxy_ortofoto_vhr`.
 
 | Produkt | Rozlišení | Co obsahuje | Endpoint | Cena |
 |---|---|---|---|---|
-| **SM5 / DMP5G** | **0.5 m horizontal**, ~10 cm vertical | terén + budovy + vegetace ("surface") | ATOM (`cache/dmpok_tiff_*`), WCS/WMS | free |
+| **SM5 / DMPOK** | **0.5 m horizontal**, ~10 cm vertical | terén + budovy + vegetace ("surface", DSM) | ATOM (`cache/dmpok_tiff_*`), WCS/WMS | free |
 | DMP1G | 1 m horizontal | terén + budovy | WCS, ATOM | free |
 | DMR5G | 5 m horizontal | jen terén (ground-only) | WCS `ags.cuzk.gov.cz/.../dmr5g/ImageServer` | free |
 | DMR4G | 5 m | terén derived | WMS/WCS | free |

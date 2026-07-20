@@ -261,7 +261,7 @@ def main() -> int:
                   "→ marked pending")
             _persist_state()
 
-        pending = [c for c, s in _state.items() if s["status"] == "pending"]
+        pending = [c for c, s in _state.items() if s.get("status") == "pending"]
         if not pending:
             print(f"Nothing pending. ({STATE_FILE} has no 'pending' entries.)")
             return 0

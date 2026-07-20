@@ -330,9 +330,11 @@ function terrainPoint(px, py) {
 // tap on a tall building hits its NEAR FACE, not the ground plane behind it
 // (the plane intersect terrainPoint() uses sails over a tilted building).
 // The mesh is displaced GPU-side — CPU geometry is flat — so intersectObjects
-// can't see the blobs; we march terrainH() (coarse hGrid, includes buildings)
-// instead. The hit point's x/z IS the plumb drop to the footprint; the
-// building-detail query's 5 m tolerance absorbs the DSM blob's slight lean.
+// can't see the blobs; we march terrainHiRes() (bilinear sample of the SAME
+// full-res height texture the GPU displaces from, so the CPU pick surface
+// matches what's rendered — the old 32² hGrid was ~3 m off and mis-picked
+// neighbour parcels). The hit x/z is the plumb drop to the footprint;
+// building-detail's 5 m tolerance absorbs the DSM blob's slight lean.
 function pickSurface(px, py) {
   gestureRay.setFromCamera(new THREE.Vector2(px / innerWidth * 2 - 1,
                                              1 - py / innerHeight * 2), camera);
@@ -712,6 +714,8 @@ function clearMask() {
   maskTex = MASK_EMPTY; maskOn = 0;
   applyMask();
   clearGhost();
+  hlFp = null;   // dismiss: forget the parcel so a later style-switch can't
+                 // resurrect a highlight for an already-closed info sheet.
 }
 // Highlight any WGS polygon (parcel boundary / building footprint) as REAL
 // 3D geometry, not a top-down drape. A drape smears the stroke down the DSM
@@ -794,11 +798,11 @@ const HL_STYLES = {
     add(_hlLoop(p, b + 0.6, 0xffffff, 0.95));
   },
 };
-function setMask(fp) { hlFp = fp; renderHighlight(); }
-function renderHighlight() {
+function setMask(fp) { renderHighlight(fp); }
+function renderHighlight(fp = hlFp) {   // default captures hlFp BEFORE clearMask nulls it
   clearMask();
-  const fp = hlFp;
   if (!fp) return;
+  hlFp = fp;                            // re-arm so live style-switches keep working
   const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
   if (pts.length < 3) return;
   // Sample the DSM over the parcel: base = lowest boundary height, top =

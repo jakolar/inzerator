@@ -216,8 +216,14 @@ OVERPASS_MIRRORS = [
 def _ruian_get(url, timeout=30, retries=5, backoff=0.5):
     """GET against ČÚZK ArcGIS / RÚIAN with exponential backoff. The service
     flaps under load — measured ~40% direct-hit rate during outages. With 5
-    retries (0.5+1+2+4+8 = 15.5 s total wait) the per-call failure rate drops
-    from ~21% (3 retries) to ~8%, and most outages clear inside that window."""
+    retries the per-call failure rate drops from ~21% (3 retries) to ~8%, and
+    most outages clear inside that window.
+
+    Connection *refused* is a distinct, benign flap: ČÚZK rejects the first TCP
+    connect but accepts an immediate retry. That's the common interactive case
+    (parcel/building click), so retry it after 0.1 s instead of burning the
+    0.5→1→2 s exponential ramp — three refusals were costing ~3.5 s per click.
+    Genuine timeouts/errors still get the full exponential wait."""
     import time as _time
     last_err = None
     for attempt in range(retries + 1):
@@ -230,7 +236,10 @@ def _ruian_get(url, timeout=30, retries=5, backoff=0.5):
                 TimeoutError, OSError) as e:
             last_err = e
             if attempt < retries:
-                _time.sleep(backoff * (2 ** attempt))
+                reason = getattr(e, "reason", e)
+                refused = isinstance(e, ConnectionRefusedError) or \
+                    isinstance(reason, ConnectionRefusedError)
+                _time.sleep(0.1 if refused else backoff * (2 ** attempt))
     raise last_err if last_err else RuntimeError("RÚIAN unreachable")
 
 
@@ -2233,6 +2242,34 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             out_sr = "5514"
 
         try:
+            import math
+            from shapely.geometry import Point, Polygon
+            # Rank helpers reused by both the point query and the envelope
+            # fallback. Rings come back in out_sr (wgs_mode → 4326, else 5514);
+            # scale lon by cos(lat) so wgs distances/areas rank in ~metres.
+            if wgs_mode:
+                kx = math.cos(math.radians(lat))
+                click_pt = Point(lon * kx, lat)
+                def _xy(p): return (p[0] * kx, p[1])
+            else:
+                click_pt = Point(sx, sy)
+                def _xy(p): return (p[0], p[1])
+            def _poly(feat):
+                rings = feat.get("geometry", {}).get("rings", [])
+                if not rings or len(rings[0]) < 3:
+                    return None
+                try:
+                    # ponytail: exterior ring only — holes don't change the
+                    # smallest-containing pick (the nested parcel wins on area).
+                    return Polygon([_xy(p) for p in rings[0]])
+                except Exception:
+                    return None
+            def _area(feat):
+                try:
+                    return float(feat.get("attributes", {}).get("vymeraparcely") or 0) or float("inf")
+                except (TypeError, ValueError):
+                    return float("inf")
+
             url = "https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/5/query"
             params = {
                 "geometry": json.dumps({
@@ -2243,11 +2280,24 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 "spatialRel": "esriSpatialRelIntersects",
                 "outFields": "id,kmenovecislo,poddelenicisla,druhpozemkukod,vymeraparcely",
                 "outSR": out_sr, "f": "json", "returnGeometry": "true",
-                "resultRecordCount": "1",
+                "resultRecordCount": "12",
             }
             raw = json.loads(_ruian_get(f"{url}?" + urllib.parse.urlencode(params), timeout=15))
             feats = raw.get("features", [])
-            if not feats:
+            if feats:
+                # A point can intersect >1 parcel when a smaller parcel is
+                # nested inside a larger one (stavební parcela inside a
+                # pozemková, enclaves). ArcGIS returns them in arbitrary
+                # OBJECTID order, so grabbing the first made the inner parcel
+                # unselectable. Keep the SMALLEST parcel that actually contains
+                # the click — the most specific one.
+                def _rank(feat):
+                    poly = _poly(feat)
+                    inside = bool(poly and poly.contains(click_pt))
+                    return (0 if inside else 1, _area(feat))
+                feats.sort(key=_rank)
+                feats = feats[:1]
+            else:
                 # Click landed on road / public space (not a registered parcel).
                 # Fall back to envelope query in 10m × 10m box around the point
                 # and return the parcel whose centroid is closest to the click.
@@ -2272,31 +2322,19 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                         return
                     self.send_error(404, "No parcel near this point")
                     return
-                # Pick the parcel actually CLOSEST to the click — true
-                # point-to-polygon distance (0 if inside), not the mean of the
-                # ring vertices. The old vertex-mean mis-ranked elongated/L/flag
-                # parcels (mean sits up the long arm, a compact neighbour wins);
-                # worse, in wgs_mode the rings are lon/lat (outSR=4326) but were
-                # compared against (sx,sy) in S-JTSK metres — pure nonsense. Do
-                # the distance in the ring's own CRS with the click in that CRS
-                # (wgs: scale lon by cos(lat) so it ranks in ~metres).
-                import math
-                from shapely.geometry import Point, Polygon
-                if wgs_mode:
-                    kx = math.cos(math.radians(lat))
-                    click_pt = Point(lon * kx, lat)
-                    def _xy(p): return (p[0] * kx, p[1])
-                else:
-                    click_pt = Point(sx, sy)
-                    def _xy(p): return (p[0], p[1])
+                # Click landed on road/public space — no parcel contains it.
+                # Pick the CLOSEST parcel by true point-to-polygon distance
+                # (0 if inside), reusing the rank helpers above. Beats the old
+                # vertex-mean, which mis-ranked elongated/L/flag parcels (mean
+                # sits up the long arm, a compact neighbour wins).
                 def poly_dist(feat):
-                    rings = feat.get("geometry", {}).get("rings", [])
-                    if not rings or len(rings[0]) < 3: return float('inf')
+                    poly = _poly(feat)
+                    if poly is None:
+                        return float("inf")
                     try:
-                        poly = Polygon([_xy(p) for p in rings[0]])
                         return 0.0 if poly.contains(click_pt) else poly.distance(click_pt)
                     except Exception:
-                        return float('inf')
+                        return float("inf")
                 feats.sort(key=poly_dist)
                 feats = feats[:1]    # keep only the closest
             f = feats[0]

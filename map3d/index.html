@@ -1113,7 +1113,7 @@ function updateDrawStats() {
         body: JSON.stringify({ polygon: drawPts.map(p => [p.lon, p.lat]) }),
       });
       const j = await r.json();
-      if (req !== estimateReq || !r.ok) return;
+      if (req !== estimateReq || !r.ok || !drawMode) return;
       const missing = j.sheets_total - j.sheets_cached;
       const timeTxt = missing === 0
         ? '~2–4 min (vše v cache)'

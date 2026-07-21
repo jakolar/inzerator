@@ -909,3 +909,23 @@ class TestPersistPolygon:
         meta = json.loads(Path("tiles_v2_poly-test/location.json").read_text())
         assert meta["polygon"] == ext["polygon"]
         assert meta["polygon_local"] == ext["polygon_local"]
+
+    def test_resume_retry_preserves_polygon(self):
+        """Retry path (server.py resume_from_disk) calls enqueue_job with no
+        inner_half/parcel_ids/polygon_ext, which reaches _persist_location_meta
+        as all-None. A rebuild-from-scratch would silently drop the drawn
+        polygon — merge-preserve must keep existing keys whose args are
+        absent this call."""
+        ext = locations.polygon_extent(TestParseJobExtentPolygon.POLY)
+        locations._persist_location_meta(
+            "poly-test", "Poly", ext["cx"], ext["cy"],
+            inner_half=ext["inner_half"],
+            polygon=ext["polygon"], polygon_local=ext["polygon_local"])
+
+        # Bare call, matching what resume_from_disk feeds enqueue_job.
+        locations._persist_location_meta("poly-test", "Poly", ext["cx"], ext["cy"])
+
+        meta = json.loads(Path("tiles_v2_poly-test/location.json").read_text())
+        assert meta["polygon"] == ext["polygon"]
+        assert meta["polygon_local"] == ext["polygon_local"]
+        assert meta["inner_half"] == ext["inner_half"]

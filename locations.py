@@ -98,19 +98,39 @@ def _persist_location_meta(slug: str, label: str, cx: float, cy: float,
     """Write tiles_v2_<slug>/location.json with {slug, label, cx, cy} so
     the label survives the only on-disk persistence path we have now that
     the v2 top-level manifest is no longer written. Called at job enqueue
-    so the dashboard sees the right label even before sm5 finishes."""
+    so the dashboard sees the right label even before sm5 finishes.
+
+    Merge-preserve: if location.json already exists, keep its
+    inner_half/subject_parcels/polygon/polygon_local/created_at where this
+    call's args are None/absent, instead of rebuilding from scratch. Needed
+    because the dashboard Retry path (server.py resume_from_disk) recovers
+    only cx/cy/label and calls enqueue_job bare — without merge-preserve a
+    retry silently wipes a drawn polygon selection."""
     base = Path(f"{TILES_DIR_PREFIX}{slug}")
     base.mkdir(parents=True, exist_ok=True)
+    out = base / "location.json"
+    existing = {}
+    if out.is_file():
+        try:
+            existing = json.loads(out.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = {}
     meta = {"slug": slug, "label": label, "cx": cx, "cy": cy,
-            "created_at": time.time()}
+            "created_at": existing.get("created_at", time.time())}
     if inner_half is not None:
         meta["inner_half"] = inner_half
+    elif "inner_half" in existing:
+        meta["inner_half"] = existing["inner_half"]
     if parcel_ids:
         meta["subject_parcels"] = list(parcel_ids)
+    elif "subject_parcels" in existing:
+        meta["subject_parcels"] = existing["subject_parcels"]
     if polygon:
         meta["polygon"] = polygon
         meta["polygon_local"] = polygon_local
-    out = base / "location.json"
+    elif "polygon" in existing:
+        meta["polygon"] = existing["polygon"]
+        meta["polygon_local"] = existing.get("polygon_local")
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
     tmp.replace(out)

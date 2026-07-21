@@ -848,6 +848,35 @@ function walkPerimeter(sampleSceneY, sideM) {
 const SEAM_SKIRT_DEPTH = 30;     // m below the terrain edge — covers metre-scale LOD disagreement with margin
 const SEAM_SKIRT_DARKEN = 0.75;  // reads as shadow inside the seam, not as a lit wall
 const seamSkirts = [];           // { mesh, ringIndex } — bare-mode toggle hides these
+
+// ── Island mode (polygon cutout) ──
+// When location.json carries polygon_local, terrain is hard-clipped to that
+// polygon: an alpha mask rasterised over ±maskHalf (= rings[0].half, the
+// closeup extent) is fragment-discarded by every terrain-look material.
+// ONE shared uniform trio — referenced (not cloned) by ring materials and
+// makeEdgeOrthoMaterial (seam skirts, section band), so activation is a
+// single .value write regardless of material creation order.
+const islandUniforms = {
+  uMask:     { value: null },
+  uHasMask:  { value: 0.0 },
+  uMaskHalf: { value: 1.0 },
+};
+const ISLAND_MASK_PARS = `
+      uniform sampler2D uMask;
+      uniform float uHasMask;
+      uniform float uMaskHalf;
+`;
+const ISLAND_MASK_GUARD = `
+        if (uHasMask > 0.5) {
+          vec2 muv = vWorldPos.xz / (2.0 * uMaskHalf) + 0.5;
+          if (muv.x < 0.0 || muv.x > 1.0 || muv.y < 0.0 || muv.y > 1.0) discard;
+          if (texture2D(uMask, muv).a < 0.5) discard;
+        }
+`;
+// Pedestal solid + section band + ground shadow plane — hidden in island
+// mode (the island floats; a full-square pedestal under it would defeat
+// the cutout). Registered here because they're built inside a later block.
+const pedestalMeshes = [];
 // Minimal ortho-sampling material for edge curtains (LOD seam skirts, the
 // pedestal section band). SHARES the ring material's ortho + flip uniform
 // OBJECTS — tier upgrades, OSM basemap swaps and the visibility
@@ -863,12 +892,18 @@ function makeEdgeOrthoMaterial(ringMat, darken) {
       uOrthoFlipY: ringMat.uniforms.uOrthoFlipY,
       uOrthoFlipX: ringMat.uniforms.uOrthoFlipX,
       uDarken:     { value: darken },
+      // SHARED island-mask trio — see islandUniforms above.
+      uMask:       islandUniforms.uMask,
+      uHasMask:    islandUniforms.uHasMask,
+      uMaskHalf:   islandUniforms.uMaskHalf,
     },
     vertexShader: `
       #include <fog_pars_vertex>
       varying vec2 vUv;
+      varying vec3 vWorldPos;
       void main() {
         vUv = uv;
+        vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
         gl_Position = projectionMatrix * mvPosition;
         #include <fog_vertex>
@@ -881,7 +916,10 @@ function makeEdgeOrthoMaterial(ringMat, darken) {
       uniform float uOrthoFlipX;
       uniform float uDarken;
       varying vec2 vUv;
+      varying vec3 vWorldPos;
+${ISLAND_MASK_PARS}
       void main() {
+${ISLAND_MASK_GUARD}
         vec2 orthoUv = vUv;
         if (uOrthoFlipY > 0.5) orthoUv.y = 1.0 - orthoUv.y;
         if (uOrthoFlipX > 0.5) orthoUv.x = 1.0 - orthoUv.x;
@@ -1036,6 +1074,10 @@ for (let i = 0; i < rings.length; i++) {
       uYBase:     { value: yMid },     // shared baseline so rings line up
       uClipBox:   { value: clipBox || new THREE.Vector4(0,0,0,0) },
       uClipEnabled: { value: clipBox ? 1.0 : 0.0 },
+      // SHARED island-mask trio — see islandUniforms above.
+      uMask:      islandUniforms.uMask,
+      uHasMask:   islandUniforms.uHasMask,
+      uMaskHalf:  islandUniforms.uMaskHalf,
       // Hillshade: runtime sun lighting derived from heightmap derivatives.
       // uHmTexel = 1/heightmap_size, uHmStep = step in meters per texel.
       // Together they let the shader convert sampled height deltas into
@@ -1099,6 +1141,7 @@ for (let i = 0; i < rings.length; i++) {
       uniform float uShadeYMax;
       uniform vec4 uClipBox;
       uniform float uClipEnabled;
+${ISLAND_MASK_PARS}
       uniform float uHmTexel;
       uniform float uHmStep;
       uniform float uRingHalf;
@@ -1201,6 +1244,7 @@ for (let i = 0; i < rings.length; i++) {
         if (uClipEnabled > 0.5 &&
             vWorldPos.x > uClipBox.x && vWorldPos.x < uClipBox.z &&
             vWorldPos.z > uClipBox.y && vWorldPos.z < uClipBox.w) discard;
+${ISLAND_MASK_GUARD}
         vec3 col;
         if (uShadeMode > 0.5) {
           // Flat-shaded by elevation. Map absolute Y to [0,1] over the
@@ -1444,7 +1488,9 @@ hideLoader();
   shadowMesh.position.set(0, bottomY + 0.05, 0);
   shadowMesh.renderOrder = -1;
   shadowMesh.frustumCulled = false;
+  shadowMesh.visible = islandUniforms.uHasMask.value < 0.5;
   scene.add(shadowMesh);
+  pedestalMeshes.push(shadowMesh);
 
   console.info(`[block-base] W=${W.toFixed(0)}m, depth=${BASE_DEPTH.toFixed(0)}m, ` +
                `topY=${topY.toFixed(1)} (scene), bottomY=${bottomY.toFixed(1)} (scene), ` +
@@ -1594,7 +1640,9 @@ hideLoader();
       const solid = new THREE.Mesh(solidGeo, solidMat);
       solid.renderOrder = 0;
       solid.frustumCulled = false;
+      solid.visible = islandUniforms.uHasMask.value < 0.5;
       scene.add(solid);
+      pedestalMeshes.push(solid);
       console.info(`[block-base] pedestal solid (${P} columns, depth ${BASE_DEPTH.toFixed(0)} m, rim ${RIM_H} m @ envelope)`);
 
       // ── Ortho section band ──
@@ -1633,7 +1681,9 @@ hideLoader();
         bandGeo, makeEdgeOrthoMaterial(ringMeshes[0].material, BAND_DARKEN));
       band.renderOrder = 1;        // alongside the outer ring
       band.frustumCulled = false;
+      band.visible = islandUniforms.uHasMask.value < 0.5;
       scene.add(band);
+      pedestalMeshes.push(band);
       console.info(`[block-base] section band added (${P} columns)`);
     } catch (e) {
       console.warn('[block-base] pedestal build failed:', e);
@@ -2810,25 +2860,110 @@ parcelsToggle.addEventListener('change', async () => {
 // would miss. We add each loaded parcel's own id so redrawOutlines' parcelsById
 // lookup hits. Optional file / missing field / unknown ids → silent no-op.
 (async () => {
+  let loc = null;
   try {
-    const loc = await fetch(`/tiles_v2_${slug}/location.json?t=${Date.now()}`)
+    loc = await fetch(`/tiles_v2_${slug}/location.json?t=${Date.now()}`)
       .then(r => r.ok ? r.json() : null);
+  } catch { /* optional file */ }
+  try {
     const subj = loc?.subject_parcels;
-    if (!Array.isArray(subj) || !subj.length) return;
-    const want = new Set(subj.map(Number));
-    parcelsToggle.checked = true;
-    parcelsToggle.disabled = true;
-    await Promise.all([ensureParcels(), ensureHeightDataLoaded()]);
-    parcelsToggle.disabled = false;
-    for (const p of (parcels || [])) {
-      if (p.id && want.has(Number(p.id))) selectedParcels.add(p.id);
+    if (Array.isArray(subj) && subj.length) {
+      const want = new Set(subj.map(Number));
+      parcelsToggle.checked = true;
+      parcelsToggle.disabled = true;
+      await Promise.all([ensureParcels(), ensureHeightDataLoaded()]);
+      parcelsToggle.disabled = false;
+      for (const p of (parcels || [])) {
+        if (p.id && want.has(Number(p.id))) selectedParcels.add(p.id);
+      }
+      outlineGroup.visible = true;
+      redrawOutlines();
     }
-    outlineGroup.visible = true;
-    redrawOutlines();
   } catch (e) {
     console.warn('[subject] location.json highlight skipped:', e);
   }
+  try {
+    if (Array.isArray(loc?.polygon_local) && loc.polygon_local.length >= 3) {
+      await activateIslandMode(loc.polygon_local);
+    }
+  } catch (e) {
+    console.warn('[island] polygon cutout skipped:', e);
+  }
 })();
+
+// ── Island mode activation (see islandUniforms near the seam-skirt block) ──
+// Rasterises polygon_local ([[dx, dz] m], viewer scene axes: dz = +south)
+// into a 1024² alpha mask spanning ±maskHalf, flips the shared uniforms on,
+// hides the pedestal and closes the cut with curtain walls.
+// Shadow-bake note: bakeShadowMaps is deliberately NOT masked — occluders
+// outside the polygon still exist in reality, so their shadows falling into
+// the island stay physically plausible; masking the bake would instead
+// produce fake sunlit rims along the cut. Shadows are opt-in anyway.
+async function activateIslandMode(ring) {
+  const maskHalf = rings[0].half;   // closeup ring extent — mask + terrain share it
+  // ponytail: 1024 px over ±1500 m ≈ 2.9 m/px cut-edge precision; bump to
+  // 2048 if the discard edge ever looks ragged on large maskHalf lokace.
+  const N = 1024;
+  const c = document.createElement('canvas');
+  c.width = c.height = N;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff';
+  g.beginPath();
+  for (let i = 0; i < ring.length; i++) {
+    const [dx, dz] = ring[i];
+    const u = (dx / (2 * maskHalf) + 0.5) * N;
+    const v = (dz / (2 * maskHalf) + 0.5) * N;   // +dz = scene +Z = canvas +v (flipY=false)
+    if (i) g.lineTo(u, v); else g.moveTo(u, v);
+  }
+  g.closePath();
+  g.fill();
+  const maskTex = new THREE.CanvasTexture(c);
+  // Row 0 = north, same convention as the ortho/heightmap textures
+  // (memory feedback_ktx2_orientation: default flip=0, verify visually).
+  maskTex.flipY = false;
+  islandUniforms.uMask.value = maskTex;
+  islandUniforms.uMaskHalf.value = maskHalf;
+  islandUniforms.uHasMask.value = 1.0;
+  for (const m of pedestalMeshes) m.visible = false;
+  // Curtain top follows the DSM — needs the lazy CPU heightmap rehydrated
+  // (dropped at startup; sampleAt returns null until loaded).
+  await ensureHeightDataLoaded();
+  buildIslandCurtain(ring);
+  console.info(`[island] active: ${ring.length}-gon, maskHalf ${maskHalf} m`);
+}
+
+// Vertical walls along the polygon cut, terrain edge down to a flat base
+// slab below the lowest terrain. Edges are subdivided so the top follows
+// the terrain profile instead of chord-cutting through hills.
+function buildIslandCurtain(ring) {
+  const CURTAIN_STEP = 3;                  // m between top samples along an edge
+  const yBase = globalYmin - yMid - 15;    // scene space (terrain Y = AMSL - yMid)
+  const topAt = (x, z) => {
+    const h = sampleAt(x, z);
+    return h == null ? yBase : h - yMid;
+  };
+  const pos = [];
+  for (let i = 0; i < ring.length; i++) {
+    const [ax, az] = ring[i];
+    const [bx, bz] = ring[(i + 1) % ring.length];
+    const segs = Math.max(1, Math.ceil(Math.hypot(bx - ax, bz - az) / CURTAIN_STEP));
+    for (let s = 0; s < segs; s++) {
+      const t0 = s / segs, t1 = (s + 1) / segs;
+      const x0 = ax + (bx - ax) * t0, z0 = az + (bz - az) * t0;
+      const x1 = ax + (bx - ax) * t1, z1 = az + (bz - az) * t1;
+      const y0 = topAt(x0, z0), y1 = topAt(x1, z1);
+      pos.push(x0, y0, z0,  x1, y1, z1,  x0, yBase, z0,
+               x1, y1, z1,  x1, yBase, z1,  x0, yBase, z0);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  const mat = new THREE.MeshBasicMaterial({ color: 0xcfc5b4, side: THREE.DoubleSide });
+  const curtain = new THREE.Mesh(geo, mat);
+  curtain.frustumCulled = false;
+  scene.add(curtain);
+  console.info(`[island] curtain: ${pos.length / 18} wall quads, base ${yBase.toFixed(1)} m (scene)`);
+}
 
 parcelsClear.addEventListener('click', () => {
   selectedParcels.clear();

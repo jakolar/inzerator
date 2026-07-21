@@ -20,7 +20,7 @@
     background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
     pointer-events: none; white-space: pre;
   }
-  #ctl, #ctl2, #ctl3, #ctl4 {
+  #ctl, #ctl2, #ctl3, #ctl4, #ctl5 {
     position: fixed; right: 10px; z-index: 5;
     font: 13px system-ui, sans-serif; color: #dfe7f0;
     background: rgba(12, 18, 26, .72); border-radius: 8px; padding: 8px 12px;
@@ -31,14 +31,20 @@
   #ctl2 { top: 52px; }
   #ctl3 { top: 94px; }
   #ctl4 { top: 136px; }
+  #ctl5 { top: 178px; }
   #ctl input, #ctl2 input, #ctl3 input { accent-color: #7fae6b; }
   #ctl4 select {
     font: inherit; color: #dfe7f0; background: rgba(255, 255, 255, .08);
     border: 1px solid rgba(223, 231, 240, .28); border-radius: 5px;
     padding: 2px 4px; cursor: pointer;
   }
+  #ctl5 button {
+    font: inherit; color: #dfe7f0; background: transparent; border: 0;
+    cursor: pointer; padding: 0;
+  }
+  #ctl5.active { background: rgba(127, 174, 107, .55); }
   #nav {
-    position: fixed; top: 188px; right: 10px; z-index: 5;
+    position: fixed; top: 230px; right: 10px; z-index: 5;
     display: flex; flex-direction: column; gap: 8px;
   }
   #nav button {
@@ -78,18 +84,35 @@
     font: 11px system-ui, sans-serif; color: rgba(223, 231, 240, .75);
     background: rgba(12, 18, 26, .55); border-radius: 6px; padding: 3px 8px;
   }
-  #bsheet {
+  #bsheet, #drawSheet {
     position: fixed; left: 10px; right: 10px; bottom: 10px; z-index: 6;
     max-width: 420px; max-height: 45%; overflow-y: auto;
     font: 13px/1.5 system-ui, sans-serif; color: #dfe7f0;
     background: rgba(12, 18, 26, .88); border-radius: 12px;
     padding: 12px 14px; touch-action: pan-y;
   }
-  #bsheet.hidden { display: none; }
+  #bsheet.hidden, #drawSheet.hidden { display: none; }
   #bsheet table { border-collapse: collapse; margin-top: 6px; }
   #bsheet td { padding: 1px 10px 1px 0; vertical-align: top; }
   #bsheet td:first-child { color: rgba(223, 231, 240, .65); white-space: nowrap; }
-  #bsheet a { color: #9ec7ff; }
+  #bsheet a, #drawSheet a { color: #9ec7ff; }
+  #drawStats { white-space: pre-line; }
+  #drawSheet input {
+    display: block; width: 100%; box-sizing: border-box; margin-top: 8px;
+    font: 13px system-ui, sans-serif; color: #dfe7f0;
+    background: rgba(255, 255, 255, .08); border: 1px solid rgba(223, 231, 240, .28);
+    border-radius: 5px; padding: 6px 8px;
+  }
+  #drawSheet #drawGo {
+    margin-top: 8px; font: 13px system-ui, sans-serif; color: #10151c;
+    background: #7fae6b; border: 0; border-radius: 6px; padding: 7px 14px;
+    cursor: pointer;
+  }
+  #drawSheet #drawGo:disabled { background: rgba(127, 174, 107, .35); cursor: default; }
+  #drawSheet #drawCancel {
+    position: absolute; top: 6px; right: 8px; border: 0; background: none;
+    color: #dfe7f0; font-size: 18px; cursor: pointer; padding: 4px;
+  }
   #bclose {
     position: absolute; top: 6px; right: 8px; border: 0; background: none;
     color: #dfe7f0; font-size: 18px; cursor: pointer; padding: 4px;
@@ -119,6 +142,7 @@
     <option value="obrys">obrys</option>
   </select>
 </label>
+<label id="ctl5"><button id="drawBtn">✏️ výřez</button></label>
 <div id="search">
   <input id="searchInput" type="text" autocomplete="off"
          placeholder="Hledat obec, adresu, parcelu…">
@@ -134,6 +158,12 @@
   <button id="homeBtn" title="Výchozí pohled">🏠</button>
 </div>
 <div id="bsheet" class="hidden"><button id="bclose">×</button><div id="bbody"></div></div>
+<div id="drawSheet" class="hidden">
+  <button id="drawCancel">×</button>
+  <div id="drawStats">klikáním umísťuj vrcholy, uzavři kliknutím na první bod</div>
+  <input id="drawLabel" placeholder="název výřezu">
+  <button id="drawGo" disabled>Vygenerovat</button>
+</div>
 <div id="attrib">Mapová data © ČÚZK (DMPOK, Ortofoto)</div>
 <div id="loading"><div id="loadmsg">ČR 3D mapa — načítám dlaždice…</div></div>
 
@@ -554,7 +584,7 @@ function startZoomAnim(f, anchor = null) {
         // has passed (a second tap cancels this and zooms instead).
         const tx = e.clientX, ty = e.clientY;
         clearTimeout(tapTimer);
-        tapTimer = setTimeout(() => showInfo(tx, ty), 320);
+        tapTimer = setTimeout(() => drawMode ? addDrawVertex(tx, ty) : showInfo(tx, ty), 320);
       }
       // Flick → inertia; a drag-hold-release must NOT fire it (the trace
       // then only holds stale deltas from before the hold).
@@ -988,9 +1018,180 @@ async function showInfo(px, py) {
     if (e.pointerType !== 'mouse' || !mDown) return;
     const moved = Math.hypot(e.clientX - mDown[0], e.clientY - mDown[1]);
     mDown = null;
-    if (moved < 5) showInfo(e.clientX, e.clientY);
+    if (moved < 5) drawMode ? addDrawVertex(e.clientX, e.clientY)
+                            : showInfo(e.clientX, e.clientY);
   });
 }
+
+// ── Polygon draw mode (výřez): click vertices, close the ring on the first
+// point, POST /api/estimate for a demand estimate, then /api/jobs to launch
+// the pipeline for an arbitrary polygon (no RÚIAN centre needed). ─────────
+let drawMode = false, drawPts = [];   // [{lon, lat, sx, sz}]
+let drawGhost = null;
+const ctl5 = document.getElementById('ctl5');
+const drawBtn = document.getElementById('drawBtn');
+const drawSheet = document.getElementById('drawSheet');
+const drawStats = document.getElementById('drawStats');
+const drawLabel = document.getElementById('drawLabel');
+const drawGo = document.getElementById('drawGo');
+
+function redrawDraw() {
+  if (drawGhost) {
+    scene.remove(drawGhost);
+    drawGhost.children.forEach(o => { o.geometry.dispose(); o.material.dispose(); });
+    drawGhost = null;
+  }
+  if (!drawPts.length) return;
+  drawGhost = new THREE.Group();
+  const pts = drawPts.map(p => new THREE.Vector2(p.sx, p.sz));
+  const y = Math.max(...drawPts.map(p => (terrainHiRes(p.sx, p.sz) ?? 0))) * Y_SCALE + 4;
+  if (pts.length >= 3) drawGhost.add(_hlFill(pts, y, 0x38e0ff, 0.15));
+  if (pts.length >= 2) drawGhost.add(_hlLoop(pts, y, 0x38e0ff, 0.9));
+  for (const p of drawPts) {                  // vertex markers
+    const m = new THREE.Mesh(new THREE.SphereGeometry(3, 8, 8),
+      new THREE.MeshBasicMaterial({ color: 0x38e0ff }));
+    m.position.set(p.sx, y, p.sz); drawGhost.add(m);
+  }
+  drawGhost.children.forEach(o => o.renderOrder = 11);
+  scene.add(drawGhost);
+}
+
+function addDrawVertex(px, py) {
+  // Close the ring when clicking near the FIRST vertex (screen space).
+  if (drawPts.length >= 3) {
+    const v = new THREE.Vector3(drawPts[0].sx,
+      (terrainHiRes(drawPts[0].sx, drawPts[0].sz) ?? 0) * Y_SCALE, drawPts[0].sz)
+      .project(camera);
+    const sx0 = (v.x * 0.5 + 0.5) * innerWidth, sy0 = (-v.y * 0.5 + 0.5) * innerHeight;
+    if (Math.hypot(px - sx0, py - sy0) < 14) { finishDraw(); return; }
+  }
+  const pt = terrainPoint(px, py);
+  if (!pt) return;
+  const mx = pt.x + ORIGIN.x, my = ORIGIN.y - pt.z;
+  drawPts.push({ lon: mx / WMERC * 180, lat: mercYToLat(my), sx: pt.x, sz: pt.z });
+  redrawDraw(); updateDrawStats();
+}
+
+// Shoelace area (ha) + bbox (m) on an equirectangular approximation around
+// the polygon's own latitude — good enough at village scale (few km).
+function polyAreaBBox(pts) {
+  const lat0 = pts.reduce((s, p) => s + p.lat, 0) / pts.length;
+  const k = Math.cos(lat0 * Math.PI / 180) * 111320;
+  const proj = pts.map(p => ({ x: p.lon * k, y: p.lat * 111320 }));
+  let area2 = 0;
+  for (let i = 0; i < proj.length; i++) {
+    const a = proj[i], b = proj[(i + 1) % proj.length];
+    area2 += a.x * b.y - b.x * a.y;
+  }
+  const xs = proj.map(p => p.x), ys = proj.map(p => p.y);
+  return {
+    area_ha: Math.abs(area2) / 2 / 10000,
+    bbox_w_m: Math.max(...xs) - Math.min(...xs),
+    bbox_h_m: Math.max(...ys) - Math.min(...ys),
+  };
+}
+function sizeEstimate(inner_half) {
+  const mb = inner_half <= 700 ? 8 : inner_half <= 1400 ? 10 : 12;
+  return `stránka ≈ ${mb} MB · GPU ≈ 30 MB (ultra) / 128 MB (super)`;
+}
+let estimateTimer = 0, estimateReq = 0;
+function updateDrawStats() {
+  if (drawPts.length < 2) {
+    drawStats.textContent = 'klikáním umísťuj vrcholy, uzavři kliknutím na první bod';
+    return;
+  }
+  const { area_ha, bbox_w_m, bbox_h_m } = polyAreaBBox(drawPts);
+  const lines = [`plocha ${area_ha.toFixed(2)} ha · bbox ${bbox_w_m.toFixed(0)} × ${bbox_h_m.toFixed(0)} m`];
+  drawStats.textContent = lines.join('\n');
+  if (drawPts.length < 3) return;
+  clearTimeout(estimateTimer);
+  estimateTimer = setTimeout(async () => {
+    const req = ++estimateReq;
+    try {
+      const r = await fetch('/api/estimate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ polygon: drawPts.map(p => [p.lon, p.lat]) }),
+      });
+      const j = await r.json();
+      if (req !== estimateReq || !r.ok) return;
+      const missing = j.sheets_total - j.sheets_cached;
+      const timeTxt = missing === 0
+        ? '~2–4 min (vše v cache)'
+        : `~${5 + missing}–30 min (stahuje ${missing} listů)`;
+      const out = [
+        `plocha ${area_ha.toFixed(2)} ha · bbox ${bbox_w_m.toFixed(0)} × ${bbox_h_m.toFixed(0)} m · ring ${j.inner_half.toFixed(0)} m`,
+      ];
+      if (j.clamped) out.push('⚠ polygon přesahuje max. ring 4 km — okraj bude oříznut');
+      out.push(`generování ${timeTxt}`);
+      out.push(sizeEstimate(j.inner_half));
+      drawStats.textContent = out.join('\n');
+    } catch { /* offline/estimate failure: keep the last good stats text */ }
+  }, 600);
+}
+
+function finishDraw() {
+  drawGo.disabled = drawPts.length < 3;
+  if (!drawLabel.value.trim()) drawLabel.placeholder = 'název výřezu';
+}
+function exitDraw() {
+  drawMode = false;
+  drawPts = [];
+  if (drawGhost) { scene.remove(drawGhost);
+    drawGhost.children.forEach(o => { o.geometry.dispose(); o.material.dispose(); });
+    drawGhost = null; }
+  drawSheet.classList.add('hidden');
+  ctl5.classList.remove('active');
+  drawGo.disabled = true;
+  drawLabel.value = '';
+}
+drawBtn.addEventListener('click', () => {
+  if (drawMode) { exitDraw(); return; }
+  drawMode = true;
+  drawPts = [];
+  ctl5.classList.add('active');
+  drawSheet.classList.remove('hidden');
+  updateDrawStats();
+  hideBInfo();
+});
+document.getElementById('drawCancel').addEventListener('click', exitDraw);
+drawGo.addEventListener('click', async () => {
+  const label = drawLabel.value.trim() || 'výřez';
+  const slug = slugifyJS(label) + '-vyrez';
+  drawGo.disabled = true;
+  try {
+    const r = await fetch('/api/jobs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug, label, polygon: drawPts.map(p => [p.lon, p.lat]) }),
+    });
+    const j = await r.json();
+    if (r.ok) {
+      drawStats.innerHTML = `job běží — <a href="/" target="_blank">dashboard</a>, po dokončení ` +
+        `<a href="/heightfield/?slug=${j.slug || slug}" target="_blank">${j.slug || slug}</a>`;
+      drawMode = false; ctl5.classList.remove('active');
+    } else {
+      drawStats.textContent = `chyba: ${j.error}` + (j.suggestion ? ` (zkus „${j.suggestion}“)` : '');
+      drawGo.disabled = false;
+    }
+  } catch (err) {
+    drawStats.textContent = `chyba: ${err.message}`;
+    drawGo.disabled = false;
+  }
+});
+// NFD-fold slugify — byte-for-byte copy of slugifyJS in the dashboard index.html.
+function slugifyJS(text) {
+  return text
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+document.addEventListener('keydown', e => {
+  if (!drawMode) return;
+  if (e.key === 'Escape') exitDraw();
+  else if (e.key === 'Backspace' && drawPts.length) {
+    drawPts.pop(); redrawDraw(); updateDrawStats();
+  }
+});
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -2408,7 +2609,9 @@ window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue,
   orthoFades, terrainPoint, pickSurface, terrainH, terrainHiRes, pointInBorder,
   ORIGIN, WMERC, Y_SCALE, mercYToLat, THREE, renderer,
   leadInfo: () => ({ leadActive, azVel: _azVel, pending: pending.length }),
-  setLead: (v) => { leadOverride = v; } };   // debug A/B: null=auto, false=off
+  setLead: (v) => { leadOverride = v; },   // debug A/B: null=auto, false=off
+  get drawPts() { return drawPts; },
+  drawInfo: () => ({ drawMode, drawPts, drawGoEnabled: !drawGo.disabled }) };
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;

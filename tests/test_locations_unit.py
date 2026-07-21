@@ -809,12 +809,12 @@ def test_persist_location_meta_omits_selection_when_absent(tmp_path, monkeypatch
 
 
 def test_parse_job_extent_empty():
-    assert locations.parse_job_extent({}) == (None, None)
+    assert locations.parse_job_extent({}) == (None, None, None)
 
 
 def test_parse_job_extent_values():
-    assert locations.parse_job_extent({"inner_half": 750}) == (750.0, None)
-    assert locations.parse_job_extent({"parcel_ids": [1, 2, 3]}) == (None, [1, 2, 3])
+    assert locations.parse_job_extent({"inner_half": 750}) == (750.0, None, None)
+    assert locations.parse_job_extent({"parcel_ids": [1, 2, 3]}) == (None, [1, 2, 3], None)
 
 
 def test_parse_job_extent_rejects_bad():
@@ -863,3 +863,39 @@ class TestPolygonExtent:
         ):
             with pytest.raises(ValueError):
                 locations.polygon_extent(bad)
+
+
+class TestParseJobExtentPolygon:
+    POLY = [[17.2215, 49.7175], [17.2300, 49.7175], [17.2258, 49.7230]]
+
+    def test_polygon_parsed_and_derived(self):
+        ih, pids, ext = locations.parse_job_extent({"polygon": self.POLY})
+        assert ext is not None and ext["inner_half"] == 500.0
+        assert ih == 500.0                    # polygon fills inner_half
+        assert pids is None
+
+    def test_explicit_inner_half_wins(self):
+        ih, _, ext = locations.parse_job_extent(
+            {"polygon": self.POLY, "inner_half": 900})
+        assert ih == 900.0 and ext is not None
+
+    def test_no_polygon_is_backcompat(self):
+        ih, pids, ext = locations.parse_job_extent({"inner_half": 700})
+        assert (ih, pids, ext) == (700.0, None, None)
+
+    def test_invalid_polygon_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            locations.parse_job_extent({"polygon": [[1, 2]]})
+
+
+class TestPersistPolygon:
+    def test_location_json_gains_polygon(self):
+        ext = locations.polygon_extent(TestParseJobExtentPolygon.POLY)
+        locations._persist_location_meta(
+            "poly-test", "Poly", ext["cx"], ext["cy"],
+            inner_half=ext["inner_half"],
+            polygon=ext["polygon"], polygon_local=ext["polygon_local"])
+        meta = json.loads(Path("tiles_v2_poly-test/location.json").read_text())
+        assert meta["polygon"] == ext["polygon"]
+        assert meta["polygon_local"] == ext["polygon_local"]

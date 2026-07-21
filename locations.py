@@ -92,7 +92,9 @@ def location_status(slug: str) -> str:
 
 def _persist_location_meta(slug: str, label: str, cx: float, cy: float,
                            inner_half: float | None = None,
-                           parcel_ids: list | None = None) -> None:
+                           parcel_ids: list | None = None,
+                           polygon: list | None = None,
+                           polygon_local: list | None = None) -> None:
     """Write tiles_v2_<slug>/location.json with {slug, label, cx, cy} so
     the label survives the only on-disk persistence path we have now that
     the v2 top-level manifest is no longer written. Called at job enqueue
@@ -105,6 +107,9 @@ def _persist_location_meta(slug: str, label: str, cx: float, cy: float,
         meta["inner_half"] = inner_half
     if parcel_ids:
         meta["subject_parcels"] = list(parcel_ids)
+    if polygon:
+        meta["polygon"] = polygon
+        meta["polygon_local"] = polygon_local
     out = base / "location.json"
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
@@ -802,9 +807,11 @@ def _new_job(slug: str, label: str, cx: float, cy: float,
 
 
 def parse_job_extent(body: dict):
-    """Extract optional (inner_half, parcel_ids) from a /api/jobs JSON body.
-    Returns (inner_half|None, parcel_ids|None). Raises ValueError on bad types
-    so the HTTP handler can map to 400."""
+    """Extract optional (inner_half, parcel_ids, polygon_ext) from a
+    /api/jobs JSON body. polygon_ext is the polygon_extent() dict (already
+    validated) or None. An explicit inner_half beats the polygon-derived
+    one; without it the polygon's clamped bbox half-extent is used.
+    Raises ValueError on bad types so the HTTP handler can map to 400."""
     inner_half = body.get("inner_half")
     if inner_half is not None:
         if (isinstance(inner_half, bool) or not isinstance(inner_half, (int, float))
@@ -817,13 +824,19 @@ def parse_job_extent(body: dict):
                 or not all(isinstance(x, int) and not isinstance(x, bool)
                            for x in parcel_ids)):
             raise ValueError("parcel_ids must be a list of ≤500 ints")
-    return inner_half, parcel_ids
+    polygon_ext = None
+    if body.get("polygon") is not None:
+        polygon_ext = polygon_extent(body["polygon"])   # raises ValueError
+        if inner_half is None:
+            inner_half = polygon_ext["inner_half"]
+    return inner_half, parcel_ids, polygon_ext
 
 
 def enqueue_job(slug: str, label: str, cx: float, cy: float,
                 force_recompress: bool = False,
                 inner_half: float | None = None,
-                parcel_ids: list | None = None) -> str | None:
+                parcel_ids: list | None = None,
+                polygon_ext: dict | None = None) -> str | None:
     """Add new job. Returns job_id, or None if a non-terminal job with the
     same slug is already queued or running (caller maps to 409).
 
@@ -850,7 +863,9 @@ def enqueue_job(slug: str, label: str, cx: float, cy: float,
     # state contention. Failure is non-fatal: dashboard would just show
     # the slug instead of the human-readable label until next gen.
     try:
-        _persist_location_meta(slug, label, cx, cy, inner_half, parcel_ids)
+        _persist_location_meta(slug, label, cx, cy, inner_half, parcel_ids,
+                               polygon=(polygon_ext or {}).get("polygon"),
+                               polygon_local=(polygon_ext or {}).get("polygon_local"))
     except OSError as e:
         print(f"[enqueue_job] persist meta failed for {slug!r}: {e}")
     return job["job_id"]

@@ -2176,8 +2176,15 @@ function terrainHiRes(sx, sz) {
 // gpuEstimate is refreshed by the HUD scan every 15 frames (same
 // arithmetic, single source of truth). Chrome scales by reported RAM;
 // Safari never reports deviceMemory — assume a phone.
+// The desktop ceiling was 1024 MB, but a normal tilted orbit at detail zoom
+// holds a ~1.3 GB working set, so `gpuEstimate > GPU_MAX` tripped the byte-cap
+// evict() mid-rotation — the trimmed tiles swung straight back into view and
+// re-streamed as a coarse-ancestor pop ("rotate flicker"). Give RAM-rich
+// machines the headroom to hold the orbit set (a desktop GPU has GBs of VRAM).
+// The Safari/phone path (192 MB, undefined deviceMemory) is deliberately left
+// untouched — that budget is the low-memory OOM guard, not a flicker knob.
 const GPU_MAX = (navigator.deviceMemory
-  ? Math.min(1024, Math.max(256, navigator.deviceMemory * 64))
+  ? Math.min(2048, Math.max(256, navigator.deviceMemory * 128))
   : 192) * 1048576;
 let gpuEstimate = 0;
 const HBYTES = FLOAT_LINEAR ? 4 : 2;
@@ -2214,7 +2221,11 @@ function cameraMoving() {
 // actually deletes the entry.
 // Low-memory devices (phones; Safari hides deviceMemory) get a smaller cap —
 // each ready tile retains ~130-260 kB CPU-side (DataTexture pixels + hGrid).
-const TILES_MAX = (navigator.deviceMemory ?? 4) >= 8 ? 2000 : 1200;
+// Desktop raised 2000→3000 to match the GPU_MAX headroom above: a tilted orbit
+// touches ~2k tiles, and a 2000 count-cap would evict mid-rotation (churn) even
+// when the byte budget had room. ~3000×250 kB ≈ 750 MB JS heap — fine on an
+// 8 GB+ machine, and the byte-cap still bounds GPU memory underneath.
+const TILES_MAX = (navigator.deviceMemory ?? 4) >= 8 ? 3000 : 1200;
 function evict() {
   let bytes = gpuEstimate - GPU_MAX;   // GPU-byte overshoot
   let count = tiles.size - TILES_MAX;  // object-count overshoot

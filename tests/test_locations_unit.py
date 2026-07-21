@@ -823,3 +823,43 @@ def test_parse_job_extent_rejects_bad():
                 {"parcel_ids": "x"}, {"parcel_ids": [1, "a"]}):
         with pytest.raises(ValueError):
             locations.parse_job_extent(bad)
+
+
+class TestPolygonExtent:
+    # Hnojice-ish triangle, ~600 m across
+    POLY = [[17.2215, 49.7175], [17.2300, 49.7175], [17.2258, 49.7230]]
+
+    def test_derives_centre_and_ring(self):
+        ext = locations.polygon_extent(self.POLY)
+        # S-JTSK for this area: cx ≈ -547-548k, cy ≈ -1107-1108k
+        assert -549000 < ext["cx"] < -546000
+        assert -1109000 < ext["cy"] < -1106000
+        assert ext["inner_half"] == 500.0          # small polygon → clamped up
+        assert ext["clamped"] is False             # raw < 500 is a floor, not a cut
+        assert 400 < ext["bbox_w_m"] < 800
+        assert len(ext["polygon_local"]) == 3
+        # local ring is centred on (cx, cy): bbox of dx spans ~±bbox_w/2
+        dxs = [p[0] for p in ext["polygon_local"]]
+        assert abs(max(dxs) + min(dxs)) < 1.0
+
+    def test_clamp_flag_when_too_big(self):
+        big = [[17.20, 49.70], [17.26, 49.70], [17.26, 49.745], [17.20, 49.745]]
+        ext = locations.polygon_extent(big)        # ~4.3 x 5 km bbox
+        assert ext["inner_half"] == 2000.0
+        assert ext["clamped"] is True
+
+    def test_drops_closing_vertex(self):
+        closed = self.POLY + [self.POLY[0]]
+        ext = locations.polygon_extent(closed)
+        assert len(ext["polygon"]) == 3
+
+    def test_rejects_bad_input(self):
+        import pytest
+        for bad in (
+            None, [], self.POLY[:2],                       # too few
+            [[17.2, 49.7]] * 201,                          # too many
+            [[17.2, 49.7], [17.3, "x"], [17.25, 49.75]],   # non-number
+            [[3.0, 49.7], [3.1, 49.7], [3.05, 49.75]],     # outside CR
+        ):
+            with pytest.raises(ValueError):
+                locations.polygon_extent(bad)

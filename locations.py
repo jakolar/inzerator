@@ -196,6 +196,63 @@ def _sjtsk_to_wgs(cx: float, cy: float) -> tuple[float, float]:
     return lat, lon
 
 
+_WGS_TO_SJTSK = None
+
+def _wgs_to_sjtsk(lon: float, lat: float) -> tuple[float, float]:
+    """WGS84 → EPSG:5514. Lazy transformer, mirror of _sjtsk_to_wgs."""
+    global _WGS_TO_SJTSK
+    if _WGS_TO_SJTSK is None:
+        from pyproj import Transformer
+        _WGS_TO_SJTSK = Transformer.from_crs("EPSG:4326", "EPSG:5514", always_xy=True)
+    return _WGS_TO_SJTSK.transform(lon, lat)
+
+
+def polygon_extent(polygon) -> dict:
+    """Validate a drawn WGS polygon and derive the job extent from its bbox.
+
+    Single source of truth for both POST /api/jobs (polygon mode) and
+    POST /api/estimate. Returns cx/cy (S-JTSK bbox centre), inner_half
+    (clamped to derive_rings' 500–2000 m), the normalized unclosed WGS ring
+    and a viewer-ready local ring ([dx, -(sy-cy)] metres, the ring_local
+    axis convention). Raises ValueError with a client-safe message.
+    """
+    if not isinstance(polygon, list):
+        raise ValueError("polygon must be a list of 3-200 [lon, lat] pairs")
+    if not (3 <= len(polygon) <= 200):
+        raise ValueError("polygon must be a list of 3-200 [lon, lat] pairs")
+    pts = []
+    for p in polygon:
+        if (not isinstance(p, (list, tuple)) or len(p) != 2
+                or isinstance(p[0], bool) or isinstance(p[1], bool)
+                or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in p)):
+            raise ValueError("polygon vertices must be [lon, lat] numbers")
+        lon, lat = float(p[0]), float(p[1])
+        if not (12.0 <= lon <= 19.0 and 48.2 <= lat <= 51.3):
+            raise ValueError("polygon vertex outside CR bounds")
+        pts.append([lon, lat])
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]                       # store unclosed
+    if len(pts) < 3 or len(pts) > 200:
+        raise ValueError("polygon must have 3-200 distinct vertices")
+
+    sj = [_wgs_to_sjtsk(lon, lat) for lon, lat in pts]
+    xs = [s[0] for s in sj]; ys = [s[1] for s in sj]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    bbox_w = max(xs) - min(xs); bbox_h = max(ys) - min(ys)
+    raw = max(bbox_w, bbox_h) / 2.0
+    inner_half = max(500.0, min(2000.0, raw))   # mirrors derive_rings clamp
+    return {
+        "cx": round(cx, 2), "cy": round(cy, 2),
+        "inner_half_raw": round(raw, 1), "inner_half": inner_half,
+        "clamped": raw > 2000.0,
+        "bbox_w_m": round(bbox_w, 1), "bbox_h_m": round(bbox_h, 1),
+        "polygon": pts,
+        "polygon_local": [[round(sx - cx, 2), round(-(sy - cy), 2)]
+                          for sx, sy in sj],
+    }
+
+
 class RuianUnavailable(Exception):
     """ČÚZK RUIAN AdresniMisto service nedostupný (network / 5xx)."""
 

@@ -76,6 +76,16 @@
   }
   #search-results .row.sel, #search-results .row:hover { background: rgba(127, 174, 107, .22); }
   #search-results .row small { color: rgba(223, 231, 240, .6); }
+  #search-results .pill {
+    display: inline-block; min-width: 52px; text-align: center; margin-right: 8px;
+    font: 600 10px/1.6 system-ui, sans-serif; letter-spacing: .04em;
+    border-radius: 4px; padding: 0 5px; vertical-align: 1px;
+  }
+  #search-results .pill.obec    { background: #2d5a8722; color: #7fb3e8; border: 1px solid #7fb3e844; }
+  #search-results .pill.ku      { background: #6a4a8722; color: #c19fe8; border: 1px solid #c19fe844; }
+  #search-results .pill.parcel  { background: #7fae6b22; color: #a4d18d; border: 1px solid #a4d18d44; }
+  #search-results .pill.address { background: #b8863b22; color: #e8c07f; border: 1px solid #e8c07f44; }
+  #search-results .row .hist { opacity: .55; margin-right: 6px; }
   #search-results .msg {
     padding: 9px 12px; color: rgba(223, 231, 240, .7); font: 12px system-ui, sans-serif;
   }
@@ -661,24 +671,104 @@ function flyTo(lon, lat, z = 15) {
 const searchBox = document.getElementById('search');
 const searchInput = document.getElementById('searchInput');
 const searchResults = document.getElementById('search-results');
-let searchHits = [], searchSel = -1, searchTimer = 0;
+let searchHits = [], searchSel = -1, searchTimer = 0, searchSeq = 0;
+
+// ── Local KÚ/obec catalog (ported from katamapa) ──────────────────────
+// ~13k KÚ + ~6k obcí bundled as JSON, lazy-fetched on first query; matching
+// is diacritics-folded substring with prefix-beats-mid ranking, so obec/KÚ
+// hits render INSTANTLY while the ČÚZK address/parcel query streams in.
+let _catalog = null;   // [{kind, kod, nazev, norm}], null until loaded
+// Unicode escapes, not raw combining chars — raw ones don't survive
+// re-encoding (katamapa searchCatalog.ts:22 learned this the hard way).
+const foldCz = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+async function loadCatalog() {
+  if (_catalog) return _catalog;
+  const [ku, ob] = await Promise.all([
+    fetch('data/kuList.json').then(r => r.json()),
+    fetch('data/obecList.json').then(r => r.json()),
+  ]);
+  _catalog = [
+    ...ob.map(([kod, nazev]) => ({ kind: 'obec', kod, nazev, norm: foldCz(nazev) })),
+    ...ku.map(([kod, nazev]) => ({ kind: 'ku', kod, nazev, norm: foldCz(nazev) })),
+  ];
+  return _catalog;
+}
+function searchCatalog(q, limit = 6) {
+  if (!_catalog) return [];
+  const nq = foldCz(q), scored = [];
+  for (const e of _catalog) {
+    const pos = e.norm.indexOf(nq);
+    if (pos < 0) continue;
+    // prefix (pos 0) beats mid-string; then shorter names; obec beats KÚ on ties
+    scored.push([e, (pos === 0 ? 0 : 1e6) + pos * 1000 + e.nazev.length +
+                    (e.kind === 'ku' ? 0.5 : 0)]);
+  }
+  scored.sort((a, b) => a[1] - b[1]);
+  return scored.slice(0, limit).map(([e]) => ({
+    kind: e.kind, kod: e.kod, label: e.nazev,
+    sub: e.kind === 'obec' ? 'obec' : 'katastrální území' }));
+}
+
+// ── Recent picks (localStorage, 5 entries) ────────────────────────────
+const HIST_KEY = 'map3d_search_history';
+const histLoad = () => { try { return JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch { return []; } };
+function histPush(h) {
+  const list = histLoad().filter(x => !(x.kind === h.kind && x.label === h.label));
+  list.unshift(h);
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(list.slice(0, 5))); } catch {}
+}
+
+const PILL = { obec: 'OBEC', ku: 'KÚ', parcel: 'PARCELA', address: 'ADRESA' };
 function renderSearch() {
   searchResults.innerHTML = searchHits.map((h, i) =>
-    `<div class="row${i === searchSel ? ' sel' : ''}" data-i="${i}">${h.label}${
-      h.obec && !h.label.includes(h.obec) ? ` <small>${h.obec}</small>` : ''}</div>`
+    `<div class="row${i === searchSel ? ' sel' : ''}" data-i="${i}">` +
+    (h.fromHist ? '<span class="hist">↺</span>' : '') +
+    `<span class="pill ${h.kind}">${PILL[h.kind] ?? '?'}</span>${h.label}` +
+    `${h.sub ? ` <small>${h.sub}</small>` :
+       h.obec && !h.label.includes(h.obec) ? ` <small>${h.obec}</small>` : ''}</div>`
   ).join('');
 }
-function pickHit(i) {
+function showHistory() {
+  searchHits = histLoad().map(h => ({ ...h, fromHist: true }));
+  searchSel = -1;
+  searchHits.length ? renderSearch() : (searchResults.innerHTML = '');
+}
+// Fly the camera to fit a WGS bbox: zoom derived from the mercator span so a
+// village fills the view and a big city zooms out accordingly.
+function flyToBbox(bbox) {
+  const [w, s, e, n] = bbox;
+  const span = Math.max(Math.abs(lonToMercX(e) - lonToMercX(w)),
+                        Math.abs(latToMercY(n) - latToMercY(s)));
+  const z = Math.max(9, Math.min(17, 8 - Math.log2(Math.max(span, 1) * 1.6 / 450000)));
+  flyTo((w + e) / 2, (s + n) / 2, Math.round(z * 10) / 10);
+}
+async function pickHit(i) {
   const h = searchHits[i];
   if (!h) return;
-  flyTo(h.wgs_lon, h.wgs_lat);
   searchBox.classList.remove('open');
   searchResults.innerHTML = '';
   searchInput.blur();
+  histPush({ kind: h.kind, label: h.label, sub: h.sub, obec: h.obec, kod: h.kod,
+             wgs_lon: h.wgs_lon, wgs_lat: h.wgs_lat, bbox: h.bbox });
+  if (h.wgs_lon != null) {                       // address/parcel → point
+    flyTo(h.wgs_lon, h.wgs_lat, h.kind === 'parcel' ? 17.5 : 17);
+    return;
+  }
+  if (h.bbox) { flyToBbox(h.bbox); return; }     // history replay of obec/KÚ
+  // obec/KÚ from the catalog: lazy extent lookup (layer 12 / 7), then fit.
+  try {
+    const layer = h.kind === 'obec' ? 12 : 7;
+    const r = await fetch(`/api/ruian/extent?layer=${layer}&kod=${h.kod}`);
+    if (!r.ok) throw 0;
+    const { bbox } = await r.json();
+    h.bbox = bbox;
+    histPush({ kind: h.kind, label: h.label, sub: h.sub, kod: h.kod, bbox });
+    flyToBbox(bbox);
+  } catch { /* ČÚZK down — leave the view as is */ }
 }
 document.getElementById('searchBtn').addEventListener('click', () => {
   const open = searchBox.classList.toggle('open');
-  if (open) searchInput.focus();
+  if (open) { searchInput.focus(); loadCatalog(); if (searchInput.value.trim().length < 2) showHistory(); }
   else searchResults.innerHTML = '';
 });
 searchResults.addEventListener('click', e => {
@@ -688,17 +778,29 @@ searchResults.addEventListener('click', e => {
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
   const q = searchInput.value.trim();
-  if (q.length < 2) { searchHits = []; searchResults.innerHTML = ''; return; }
+  const seq = ++searchSeq;
+  if (q.length < 2) { showHistory(); return; }
+  // Instant pass: local catalog renders immediately (no network).
+  loadCatalog().then(() => {
+    if (seq !== searchSeq) return;
+    searchHits = searchCatalog(q); searchSel = -1;
+    renderSearch();
+  });
+  // Debounced pass: ČÚZK addresses + parcels, merged around the catalog
+  // hits — a trailing number ("Hnojice 15") means the address is the intent.
   searchTimer = setTimeout(async () => {
-    searchResults.innerHTML = '<div class="msg">Hledám…</div>';
     try {
       const r = await fetch(`/api/ruian/search?q=${encodeURIComponent(q)}&kind=all`);
-      if (!r.ok) { searchResults.innerHTML = '<div class="msg">ČÚZK nedostupné.</div>'; return; }
-      searchHits = (await r.json()).slice(0, 12); searchSel = -1;
-      if (!searchHits.length) searchResults.innerHTML = '<div class="msg">Nic nenalezeno.</div>';
-      else renderSearch();
-    } catch { searchResults.innerHTML = '<div class="msg">Chyba hledání.</div>'; }
-  }, 250);
+      if (seq !== searchSeq) return;
+      if (!r.ok) return;   // keep catalog hits, remote just doesn't augment
+      const remote = (await r.json()).slice(0, 8);
+      const cat = searchCatalog(q);
+      searchHits = (/\d/.test(q) ? [...remote, ...cat] : [...cat, ...remote]).slice(0, 12);
+      searchSel = -1;
+      searchHits.length ? renderSearch()
+        : searchResults.innerHTML = '<div class="msg">Nic nenalezeno.</div>';
+    } catch { /* keep whatever is rendered */ }
+  }, 300);
 });
 searchInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); pickHit(searchSel < 0 ? 0 : searchSel); }

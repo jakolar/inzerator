@@ -1947,6 +1947,28 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 return
             self._send_json(200, results)
             return
+        if _path == "/api/ruian/extent":
+            # WGS bbox of a KÚ (layer 7) or obec (layer 12) — lazy resolution
+            # for the map3d search's fly-to-bbox on catalog picks (ported from
+            # katamapa's returnExtentOnly pattern).
+            layer = _query.get("layer", [""])[0]
+            kod = _query.get("kod", [""])[0]
+            if layer not in ("7", "12") or not kod.isdigit():
+                self._send_json(400, {"error": "params: layer=7|12, kod=<int>"})
+                return
+            url = (f"https://ags.cuzk.cz/arcgis/rest/services/RUIAN/MapServer/"
+                   f"{layer}/query?" + urllib.parse.urlencode({
+                       "where": f"kod={kod}", "returnExtentOnly": "true",
+                       "outSR": "4326", "f": "json"}))
+            try:
+                raw = json.loads(_ruian_get(url, timeout=15))
+                ext = raw["extent"]
+                bbox = [ext["xmin"], ext["ymin"], ext["xmax"], ext["ymax"]]
+            except Exception as e:
+                self._send_json(503, {"error": f"extent lookup failed: {e}"})
+                return
+            self._send_json(200, {"bbox": bbox})
+            return
         if _path == "/api/sjtsk2wgs":
             # Used by the index.html manual-S-JTSK fallback so the verify
             # map can still place a marker without bundling proj4 client-side.

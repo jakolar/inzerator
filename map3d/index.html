@@ -835,20 +835,25 @@ function applyMask() {
     u.uHasMask.value = maskOn;
   });
 }
-let bGhost = null;
-function clearGhost() {
-  if (!bGhost) return;
-  scene.remove(bGhost);
-  bGhost.children.forEach(o => { o.geometry.dispose(); o.material.dispose(); });
-  bGhost = null;
+// Multi-select: key ('p:<id>' parcel / 'b:<id>' building) → { fp, area,
+// group }. Tap toggles membership; × on the sheet clears everything.
+const selection = new Map();
+function disposeHlGroup(g) {
+  if (!g) return;
+  scene.remove(g);
+  g.children.forEach(o => { o.geometry.dispose(); o.material.dispose(); });
+}
+function removeSel(key) {
+  const s = selection.get(key);
+  if (!s) return;
+  disposeHlGroup(s.group);
+  selection.delete(key);
 }
 function clearMask() {
   if (maskTex !== MASK_EMPTY) maskTex.dispose();
   maskTex = MASK_EMPTY; maskOn = 0;
   applyMask();
-  clearGhost();
-  hlFp = null;   // dismiss: forget the parcel so a later style-switch can't
-                 // resurrect a highlight for an already-closed info sheet.
+  for (const key of [...selection.keys()]) removeSel(key);
 }
 // Highlight any WGS polygon (parcel boundary / building footprint) as REAL
 // 3D geometry, not a top-down drape. A drape smears the stroke down the DSM
@@ -859,7 +864,6 @@ function clearMask() {
 // switch live via the "parcela" selector (?hl= sets the default).
 const HL_COL = 0xffd54a;
 let hlStyle = P.get('hl') || 'teren';
-let hlFp = null;   // last footprint, so a style switch restyles it live
 
 // Geometry factory helpers (scene XZ ring `pts`, scene-Y levels y0/y1).
 function _hlFill(pts, y, color, opacity, depthFunc) {
@@ -994,13 +998,14 @@ const HL_STYLES = {
     add(_hlRibbon(p, 2.2, 0xffd54a, 0.16, b, THREE.GreaterDepth));   // occluded ghost
   },
 };
-function setMask(fp) { renderHighlight(fp); }
-function renderHighlight(fp = hlFp) {   // default captures hlFp BEFORE clearMask nulls it
-  clearMask();
-  if (!fp) return;
-  hlFp = fp;                            // re-arm so live style-switches keep working
+function toggleSel(key, fp, area) {
+  if (selection.has(key)) { removeSel(key); return false; }
+  selection.set(key, { fp, area, group: buildHlGroup(fp) });
+  return true;
+}
+function buildHlGroup(fp) {   // WGS ring → styled Object3D group in the scene
   const pts = fp.map(([lo, la]) => toScene(lonToMercX(lo), latToMercY(la)));
-  if (pts.length < 3) return;
+  if (pts.length < 3) return null;
   // Sample the DSM over the parcel: base = lowest boundary height, top =
   // highest surface (i.e. tallest building) inside the ring, + headroom.
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
@@ -1034,16 +1039,23 @@ function renderHighlight(fp = hlFp) {   // default captures hlFp BEFORE clearMas
   const baseY = (groundH - 1) * Y_SCALE;
   const topY = (topH + 4) * Y_SCALE;
 
-  bGhost = new THREE.Group();
-  const add = (o) => { o.renderOrder = 10; bGhost.add(o); };
+  const group = new THREE.Group();
+  const add = (o) => { o.renderOrder = 10; group.add(o); };
   (HL_STYLES[hlStyle] || HL_STYLES.ohrada)(add, pts, baseY, topY);
-  scene.add(bGhost);
+  scene.add(group);
+  return group;
 }
 {
   const sel = document.getElementById('hlStyle');
   if (!HL_STYLES[hlStyle]) hlStyle = 'ohrada';
   sel.value = hlStyle;
-  sel.addEventListener('change', () => { hlStyle = sel.value; renderHighlight(); });
+  sel.addEventListener('change', () => {
+    hlStyle = sel.value;
+    for (const s of selection.values()) {   // restyle all live
+      disposeHlGroup(s.group);
+      s.group = buildHlGroup(s.fp);
+    }
+  });
 }
 function hideBInfo() { bsheet.classList.add('hidden'); clearMask(); }
 document.getElementById('bclose').addEventListener('click', hideBInfo);
@@ -1070,14 +1082,16 @@ async function showInfo(px, py) {
   if (req !== bReq) return;               // superseded by a newer tap
   if (!parcel && !bld) {
     bbody.textContent = 'Informace nejsou dostupné (backend neběží).';
-    clearMask();
     return;
   }
-  // Highlight the parcel boundary; fall back to the building footprint only
-  // when the point isn't on a registered parcel (roads, public space).
-  if (parcel?.found && parcel.ring_wgs) setMask(parcel.ring_wgs);
-  else if (bld?.found && bld.footprint_wgs) setMask(bld.footprint_wgs);
-  else clearMask();
+  // Toggle the parcel in the selection; fall back to the building footprint
+  // only when the point isn't on a registered parcel (roads, public space).
+  // A miss (neither found) leaves the selection alone — a stray tap must not
+  // wipe a multi-parcel pick.
+  if (parcel?.found && parcel.ring_wgs)
+    toggleSel('p:' + parcel.id, parcel.ring_wgs, parcel.area_m2);
+  else if (bld?.found && bld.footprint_wgs)
+    toggleSel('b:' + bld.ruian_id, bld.footprint_wgs, null);
 
   let html;
   if (parcel?.found) {
@@ -1105,7 +1119,22 @@ async function showInfo(px, py) {
                         `${bld.ruian_id}" target="_blank" rel="noopener">${bld.ruian_id}</a>`],
             ]) + `</div>`;
   }
+  if (selection.size > 1) {
+    const areas = [...selection.values()].map(s => s.area).filter(a => a != null);
+    const sum = areas.reduce((a, b) => a + b, 0);
+    const plu = (n) => n === 1 ? 'parcela' : n < 5 ? 'parcely' : 'parcel';
+    html += `<div style="margin-top:10px; padding-top:8px; ` +
+            `border-top:1px solid rgba(255,255,255,.12);">` +
+            `<b>Výběr: ${areas.length} ${plu(areas.length)}` +
+            (selection.size > areas.length ?
+              ` + ${selection.size - areas.length} budov` : '') + `</b>` +
+            (sum ? ` · celkem ${Math.round(sum).toLocaleString('cs-CZ')} m²` : '') +
+            ` &nbsp;<a href="#" id="selclear">zrušit výběr</a></div>`;
+  }
   bbody.innerHTML = html;
+  document.getElementById('selclear')?.addEventListener('click', (e) => {
+    e.preventDefault(); hideBInfo();
+  });
 }
 // Desktop: a non-drag left click queries directly (no double-click zoom
 // to disambiguate against).
@@ -1784,7 +1813,7 @@ fetch('cz-border.json').then(r => r.json()).then(p => { BORDER = p; buildCzMask(
 let czMaskTex = null, czOn = 0;
 const CZ_RECT = new THREE.Vector4();   // merc x0, merc y0, 1/w, 1/h (shared)
 function buildCzMask() {
-  // Same conventions as setMask (the parcel-highlight mask, proven in prod):
+  // Same conventions as the parcel-highlight mask (proven in prod):
   // draw in SCENE coordinates, canvas row 0 = min z (north), flipY = false,
   // shader samples with plain (vWXZ - rect.xy) * rect.zw.
   const S = 2048, c = document.createElement('canvas');

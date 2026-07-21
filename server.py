@@ -3861,6 +3861,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self._handle_post_jobs_retry(path[len("/api/jobs/"):-len("/retry")])
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 self._handle_post_jobs_cancel(path[len("/api/jobs/"):-len("/cancel")])
+            elif path == "/api/estimate":
+                self._handle_post_estimate()
             elif path == "/api/image-edit":
                 self._api_image_edit()
             else:
@@ -3871,6 +3873,33 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             import traceback
             traceback.print_exc()
             self._send_json(500, {"error": "internal server error"})
+
+    def _handle_post_estimate(self):
+        """Demand estimate for a drawn polygon: derived ring + SM5 sheet
+        cache state. No downloads — resolves MAPNOM codes via ČÚZK and
+        checks cache/dmpok_tiff_<code>/<code>.tif presence."""
+        body = self._read_json_body()
+        try:
+            ext = locations.polygon_extent(body.get("polygon"))
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        # Same envelope the sm5 step will use (see _do_sm5_download).
+        sm5_half = max(2500.0, 3.0 * ext["inner_half"])
+        try:
+            codes = locations._resolve_sm5_codes(ext["cx"], ext["cy"], half=sm5_half)
+        except locations.RuianUnavailable as e:
+            self._send_json(503, {"error": str(e)})
+            return
+        cached = sum(
+            1 for c in codes
+            if (Path("cache") / f"dmpok_tiff_{c}" / f"{c}.tif").exists())
+        self._send_json(200, {
+            "cx": ext["cx"], "cy": ext["cy"],
+            "inner_half": ext["inner_half"], "clamped": ext["clamped"],
+            "bbox_w_m": ext["bbox_w_m"], "bbox_h_m": ext["bbox_h_m"],
+            "sheets_total": len(codes), "sheets_cached": cached,
+        })
 
     def _handle_post_jobs(self):
         body = self._read_json_body()
@@ -3927,6 +3956,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         else:
             cx = body.get("cx")
             cy = body.get("cy")
+            if (cx is None or cy is None) and body.get("polygon") is not None:
+                # Polygon mode: the client (map3d) has no projection library;
+                # derive the centre server-side. parse_job_extent re-derives
+                # below — polygon_extent is cheap and idempotent.
+                try:
+                    _ext = locations.polygon_extent(body["polygon"])
+                except ValueError as e:
+                    self._send_json(400, {"error": str(e)})
+                    return
+                cx, cy = _ext["cx"], _ext["cy"]
 
         if not slug or cx is None or cy is None:
             self._send_json(400, {"error": "required fields: slug, cx, cy (or resume_from_disk=true)"})

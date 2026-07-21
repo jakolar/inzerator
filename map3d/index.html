@@ -1319,10 +1319,12 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
   const next = () => {
     orthoInflight--;
     // Backlog is priority-ordered like the height queue (level-major +
-    // screen impact) — FIFO sharpened random far tiles before the ones
-    // on screen. Sorted per freed slot: backlog is small (≤ hundreds).
+    // screen impact + the tile's park bias, so lead/prefetch ortho stays
+    // behind on-screen work) — FIFO sharpened random far tiles before the
+    // ones on screen. Sorted per freed slot: backlog is small (≤ hundreds).
     orthoBacklog.sort((a, b) =>
-      (a[4] ? prio(a[4]) : 0) - (b[4] ? prio(b[4]) : 0));
+      (a[4] ? prio(a[4]) + (a[4].prioBias ?? 0) : 0) -
+      (b[4] ? prio(b[4]) + (b[4].prioBias ?? 0) : 0));
     // Drain past stale entries until one actually starts — handing the
     // freed slot to a single stale entry (which no-ops) stalled the rest
     // of the backlog until some future request kicked it again.
@@ -1331,7 +1333,9 @@ function loadOrtho(url, onOk, onErr, stale, tile) {
       if (q[3] && q[3]()) continue;
       // Abandoned by the quadtree walk (camera moved on) → drop and allow
       // a re-request if the tile ever re-enters the view (applyVisibility).
-      if (q[4] && frame - (q[4].lastUsed ?? 0) > 60) {
+      // Same motion-aware grace as pump()'s sweep: an orbiting camera brings
+      // these tiles back within a revolution.
+      if (q[4] && frame - (q[4].lastUsed ?? 0) > (stillFrames === 0 ? 240 : 60)) {
         q[4].orthoRequested = false;
         continue;
       }
@@ -1843,17 +1847,22 @@ function pump() {
   // bake-contended server. Let in-flight finish; dispatch nothing new.
   if (document.hidden) return;
   // Stale sweep over IN-FLIGHT fetches (height + ortho + cad): abort what
-  // the walk abandoned, same 60-frame threshold as the queue prune below.
+  // the walk abandoned, same threshold as the queue prune below.
   // `?? frame` keeps prefetch warms (never walked, no lastUsed) alive —
   // they're cheap cache warmers, not stale work. abort() is idempotent;
   // each owner's catch unregisters its entry.
+  // While the camera MOVES the threshold is 240 frames (~4 s), not 60: an
+  // orbit's trailing edge returns within a revolution, and aborting its
+  // in-flight work just forced a refetch + re-fade over the same ground
+  // (measured warm orbit: a texture fade running 202/220 frames).
+  const staleF = stillFrames === 0 ? 240 : 60;
   for (const f of liveFetches)
-    if (frame - (f.t.lastUsed ?? frame) > 60) f.ctl.abort();
+    if (frame - (f.t.lastUsed ?? frame) > staleF) f.ctl.abort();
   if (!pending.length || inflight >= MAX_INFLIGHT) return;
   // Drop queued tiles the quadtree stopped asking for (camera moved on) —
   // without this a horizon sweep piles up hundreds of stale requests.
   for (let i = pending.length - 1; i >= 0; i--) {
-    if (frame - (pending[i].lastUsed ?? frame) > 60) {
+    if (frame - (pending[i].lastUsed ?? frame) > staleF) {
       pending[i].state = 'idle';
       pending.splice(i, 1);
     }
@@ -1881,6 +1890,23 @@ const roots = [];
 
 const frustum = new THREE.Frustum();
 const projView = new THREE.Matrix4();
+// Rotation load-ahead: while the camera yaws around the orbit target, walk
+// (but never display) the quadtree inside a second frustum rotated AHEAD of
+// the view, so the leading edge streams before it scrolls on screen. Without
+// it nothing preloads a rotation: prefetch() keys off controls.target
+// velocity, and during an orbit the target is stationary — measured cold
+// orbit had a z<=10 tile on screen next to z16+ for 113/220 frames, every
+// ground patch visibly stepping through the whole LOD ladder ("přeblikávání").
+const leadFrustum = new THREE.Frustum();
+const leadPV = new THREE.Matrix4();
+const _leadCam = new THREE.PerspectiveCamera();
+let leadActive = false, _prevAz = null, _azVel = 0;
+let leadOverride = null;   // debug A/B: null = auto, false/true = forced
+// Lead enqueue shelf: the SHALLOW tower (server-pre-baked, a handful of tiles
+// per level — exactly the intermediates whose absence flashes z8 wedges at
+// entry) competes at gate priority; deep levels park behind all real work
+// (level-major prio would otherwise starve in-view z14+ behind them).
+function parkBias(z) { return z <= Math.min(13, (visZMax || ZMIN) - 1) ? 50 : 1e6; }
 const SPLIT_PX = HIDPI ? 288 : 384;
 const MERGE_PX = Math.round(SPLIT_PX * 0.7);   // split/merge hysteresis
 
@@ -1937,22 +1963,45 @@ function hasOrthoPath(t) {
 // cover — two near-coincident surfaces z-fighting ("mapa problikává",
 // 2026-07-06). Returns true when the node's area is fully covered by
 // pushed tiles (or is genuinely outside coverage).
-function selectNode(tile, show) {
+function selectNode(tile, show, loadOnly = false) {
   if (!tile.inCR) return true;
+  let leadGate = false;
   if (!frustum.intersectsBox(tile.cullBox)) {
-    // Off-view nodes still gate their parent quad's completion: ready →
-    // covered, otherwise load and report not-covered — they just aren't
-    // rendered. Completion is therefore frustum-independent and MONOTONIC:
-    // camera rotation can never flip a refined quad back to its coarse
-    // parent, which used to read as edge-of-screen layer flicker while a
-    // newly entering child streamed in.
-    tile.lastUsed = frame;
-    if (tile.state === 'ready') return true;
-    if (tile.state === 'empty' && coverage(tile) === 'out') return true;
-    if (tile.state === 'idle') enqueue(tile, 50);   // after in-view work of the same level
-    return false;
+    if (leadActive && leadFrustum.intersectsBox(tile.cullBox)) {
+      // Rotation load-ahead: the node sits in the yaw-predicted frustum.
+      // Walk + fetch it exactly like a visible node — so the whole tower
+      // streams before it scrolls on screen, not just the gate level — but
+      // never display it (loadOnly guards the show pushes below).
+      // TRANSITION node (parent quad partly in-view): it still GATES that
+      // quad's completion, so its OWN load keeps real gate priority — only
+      // the walk below it is speculative. Parking gates at 1e6 stalled
+      // in-view quads on their off-view siblings (z8 wedges over half the
+      // screen); the reverse (real-priority depth) floods level-major prio
+      // and starves in-view z14+ ("10 s nenačítala polovina tiles").
+      leadGate = !loadOnly;
+      loadOnly = true;
+    } else {
+      // Off-view nodes still gate their parent quad's completion: ready →
+      // covered, otherwise load and report not-covered — they just aren't
+      // rendered. Completion is therefore frustum-independent and MONOTONIC:
+      // camera rotation can never flip a refined quad back to its coarse
+      // parent, which used to read as edge-of-screen layer flicker while a
+      // newly entering child streamed in.
+      tile.lastUsed = frame;
+      if (tile.state === 'ready') return true;
+      if (tile.state === 'empty' && coverage(tile) === 'out') return true;
+      // Under loadOnly this gates a LEAD quad: shallow → compete, deep → park.
+      if (tile.state === 'idle') enqueue(tile, loadOnly ? parkBias(tile.z) : 50);
+      return false;
+    }
   }
   tile.lastUsed = frame;
+  // Promote parked work the moment a more urgent walk touches it — the
+  // enqueue-time 1e6 bias would otherwise keep an on-screen tile last.
+  // Ring-warmed tiles entering the LEAD sector step up to the lead shelf.
+  if (!loadOnly && tile.prioBias >= 1e6) tile.prioBias = 0;
+  else if (loadOnly && tile.state === 'queued' && tile.prioBias > parkBias(tile.z))
+    tile.prioBias = parkBias(tile.z);
 
   // Hysteresis: once split, merge back only well below the split
   // threshold — a camera hovering at the boundary otherwise flips
@@ -1968,13 +2017,14 @@ function selectNode(tile, show) {
     // hasOrthoPath only blocks the no-ancestor-texture case (startup /
     // freshly entered z=8 root): height-only tiles must never show.
     if (tile.state === 'ready' && hasOrthoPath(tile)) {
-      show.push(tile);
+      if (!loadOnly) show.push(tile);
       return true;
     }
     // Abroad: genuinely nothing to render — covered. An empty tile
     // INSIDE the coverage keeps returning false (ancestor covers).
     if (tile.state === 'empty' && coverage(tile) === 'out') return true;
-    if (tile.state === 'idle') enqueue(tile);
+    if (tile.state === 'idle')
+      enqueue(tile, leadGate ? 50 : loadOnly ? parkBias(tile.z) : 0);
     // Not coverable (loading, or 404-empty inside ČR — e.g. beyond the
     // populated-mask data depth): ancestor keeps covering. Empty tiles
     // used to return "covered", which punched holes in the terrain.
@@ -1982,7 +2032,7 @@ function selectNode(tile, show) {
     if (tile._kids) {
       const kids = [];
       let covered = true;
-      for (const c of tile._kids) if (!selectNode(c, kids)) covered = false;
+      for (const c of tile._kids) if (!selectNode(c, kids, loadOnly)) covered = false;
       if (covered) { show.push(...kids); return true; }
     }
     return false;
@@ -1990,11 +2040,12 @@ function selectNode(tile, show) {
 
   const kids = [];
   let covered = true;
-  for (const c of tile.children()) if (!selectNode(c, kids)) covered = false;
+  for (const c of tile.children()) if (!selectNode(c, kids, loadOnly)) covered = false;
   if (covered) { show.push(...kids); return true; }
   // children incomplete → discard the partial set, cover with self
-  if (tile.state === 'ready' && hasOrthoPath(tile)) { show.push(tile); return true; }
-  if (tile.state === 'idle') enqueue(tile, -100);  // fallback loads first
+  if (tile.state === 'ready' && hasOrthoPath(tile)) { if (!loadOnly) show.push(tile); return true; }
+  if (tile.state === 'idle')
+    enqueue(tile, leadGate ? 50 : loadOnly ? parkBias(tile.z) : -100);  // fallback loads first
   return false;
 }
 
@@ -2014,8 +2065,18 @@ function applyVisibility(show) {
   for (const t of next) {
     if (!t.mesh) continue;
     t.mesh.visible = true;
+    if (t.prioBias) t.prioBias = 0;   // on screen = real work, drop any park bias
     // Tessellation tier by on-screen size (pointer swap, shared buffers).
-    t.mesh.geometry = screenPx(t) < GEO_HALF_PX ? sharedGeoHalf : sharedGeo;
+    // Hysteresis (single threshold re-popped displacement silhouettes as an
+    // orbit modulated screenPx — 183 tier flips per 220-frame orbit), and
+    // demotions (full→half, the visible detail-LOSS direction) are deferred
+    // while the camera moves; promotions stay instant so a growing tile
+    // never renders blocky. Shared buffers — deferral costs no memory.
+    {
+      const wantHalf = screenPx(t) < (t._geoHalf ? GEO_HALF_PX : GEO_HALF_PX * 0.85);
+      if (!wantHalf || t._geoHalf || stillFrames > 0) t._geoHalf = wantHalf;
+      t.mesh.geometry = t._geoHalf ? sharedGeoHalf : sharedGeo;
+    }
     t.everShown = true;   // fetch-efficiency metric (HUD console)
     visCount++;
     if (t.z < visZMin) visZMin = t.z;
@@ -2281,7 +2342,9 @@ let frame = 0, firstRendered = false;
 await Lerc.load({ locateFile: (p) => new URL('vendor/' + p, document.baseURI).href });
 window.__map3d = { tiles, stats, camera, controls, liveFetches, decodeQueue,
   orthoFades, terrainPoint, pickSurface, terrainH, terrainHiRes, pointInBorder,
-  ORIGIN, WMERC, Y_SCALE, mercYToLat, THREE, renderer };   // debug console handle
+  ORIGIN, WMERC, Y_SCALE, mercYToLat, THREE, renderer,
+  leadInfo: () => ({ leadActive, azVel: _azVel, pending: pending.length }),
+  setLead: (v) => { leadOverride = v; } };   // debug A/B: null=auto, false=off
 
 BARE.addEventListener('change', () => {
   const v = BARE.checked ? 1 : 0;
@@ -2417,6 +2480,66 @@ function tick() {
   }
   projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projView);
+  // Yaw rate around the orbit target (EMA-smoothed) drives the load-ahead
+  // frustum: a camera clone rotated ~90 frames ahead along the current spin,
+  // capped inside the horizontal FOV so the lead sector always overlaps the
+  // view (a portrait phone's narrow frustum would otherwise leave a gap).
+  {
+    const az = Math.atan2(camera.position.z - controls.target.z,
+                          camera.position.x - controls.target.x);
+    if (_prevAz !== null) {
+      let d = az - _prevAz;
+      if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;
+      _azVel = _azVel * 0.8 + d * 0.2;
+    }
+    _prevAz = az;
+    const ox = camera.position.x - controls.target.x,
+          oz = camera.position.z - controls.target.z;
+    // Near-nadir the azimuth is degenerate — tiny mouse moves swing it wildly
+    // and a spurious lead flooded the fetch queue while looking straight down
+    // ("šel jsem kolmo a zase se objevilo", 2026-07-21). Kill the signal.
+    if (Math.hypot(ox, oz) < 0.2 * camera.position.distanceTo(controls.target))
+      _azVel = 0;
+    leadActive = leadOverride ?? (Math.abs(_azVel) > 0.004);   // ~14°/s — a deliberate spin
+    if (leadActive) {
+      const hFov = 2 * Math.atan(Math.tan(camera.fov * Math.PI / 360) * camera.aspect);
+      const lead = Math.max(-0.9 * hFov, Math.min(0.9 * hFov, _azVel * 90));
+      const c = Math.cos(lead), s = Math.sin(lead);
+      _leadCam.position.set(controls.target.x + ox * c - oz * s,
+                            camera.position.y,
+                            controls.target.z + ox * s + oz * c);
+      _leadCam.fov = camera.fov; _leadCam.aspect = camera.aspect;
+      _leadCam.near = camera.near; _leadCam.far = camera.far;
+      _leadCam.updateProjectionMatrix();
+      _leadCam.lookAt(controls.target);
+      _leadCam.updateMatrixWorld();
+      leadPV.multiplyMatrices(_leadCam.projectionMatrix, _leadCam.matrixWorldInverse);
+      leadFrustum.setFromProjectionMatrix(leadPV);
+      // Full-ring shallow warm: the lead frustum looks one way — a direction
+      // REVERSAL backs into fully cold ground, and a very fast spin outruns
+      // the lead. While rotating, keep the whole 360° annulus of pre-baked
+      // shallow levels parked in the queue (1e6 = idle-time cache filling;
+      // promotion on lead/view entry). ~tens of tiles, minted once.
+      if (frame % 30 === 0) {
+        const R = Math.min(20000, Math.max(1500, 3 * Math.hypot(ox, oz)));
+        const zTop = Math.min(13, (visZMax || ZMIN) - 1);
+        const mx = controls.target.x + ORIGIN.x, my = ORIGIN.y - controls.target.z;
+        for (let z = Math.max(ZMIN, zTop - 1); z <= zTop; z++) {
+          const n = 2 ** z;
+          const cl = (v) => Math.min(n - 1, Math.max(0, v));
+          const x0 = cl(Math.floor((mx - R + WMERC) / (2 * WMERC) * n)),
+                x1 = cl(Math.floor((mx + R + WMERC) / (2 * WMERC) * n)),
+                y0 = cl(Math.floor((WMERC - (my + R)) / (2 * WMERC) * n)),
+                y1 = cl(Math.floor((WMERC - (my - R)) / (2 * WMERC) * n));
+          for (let x = x0; x <= x1; x++)
+            for (let y = y0; y <= y1; y++) {
+              const t = getTile(z, x, y);
+              if (t.state === 'idle' && t.inCR) enqueue(t, 1e6);
+            }
+        }
+      }
+    }
+  }
   // Height finalize budget: LERC decode + void fill + (iOS) half-float
   // conversion cost ~2-10 ms per tile; drain under ~4 ms/frame so a
   // 24-deep h2 burst spreads over a few frames instead of freezing one.

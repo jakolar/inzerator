@@ -24,7 +24,7 @@ Concurrency caps: `_CUZK_SEM = Semaphore(6)` (across all threads) and `_OSM_SEM 
 Endpoints (all under `ProxyHandler.do_GET` / `do_POST`):
 
 - `/proxy/ortofoto`, `/proxy/cadastre`, `/proxy/osm` — ČÚZK / OSM tile/WMS proxies, in-process LRU caches (`_CUZK_CACHE`, `_BoundedCache`).
-- `/api/locations`, `/api/ruian/search?q=`, `/api/sjtsk2wgs`, `/api/jobs[/<id>][/retry|/cancel]` — Lokace UI; backed by `locations.py`. POST `/api/jobs` optionally takes `inner_half` (m, selection-driven ring sizing) + `parcel_ids` (subject parcels the viewer pre-highlights).
+- `/api/locations`, `/api/ruian/search?q=`, `/api/sjtsk2wgs`, `/api/jobs[/<id>][/retry|/cancel]`, `/api/estimate` — Lokace UI; backed by `locations.py`. POST `/api/jobs` optionally takes `inner_half` (m, selection-driven ring sizing) + `parcel_ids` (subject parcels the viewer pre-highlights), or a `polygon` ring instead of `cx`/`cy` (see Pipeline section). POST `/api/estimate` is the pre-submit demand check for a drawn polygon.
 - `/cuzk-pyramid/dmpok/<z>/<x>/<y>.lerc` — heightmap pyramid tiles, built **on demand** from bulk DMPOK for z=14..20 (`_PYRAMID_BUILD_SEM = Semaphore(3)`, per-tile locks) and served from disk once built. Lower zooms come pre-baked by `dispatch_pyramid.py`.
 - `/api/buildings`, `/api/parcels`, `/api/parcel-at-point`, `/api/roads`, `/api/poi`, `/api/wiki`, `/api/building-detail` — viewer queries.
 - `/api/image-edit` (POST) + `/api/image-edit/prompt`, `/api/image-edit/status` — OpenAI gpt-image-1 proxy. Refuses with 503 unless `INZERATOR_API_TOKEN` is set (intentional: shared LAN, OpenAI billing attaches to the key). System prompt is read server-side from `image_edit_prompt.txt` — single source of truth, clients cannot override.
@@ -47,6 +47,8 @@ Per-step output lives under `tiles_v2_<slug>/` (the directory prefix is unchange
 `tiles_v2_<slug>/location.json` is written by `enqueue_job` and persists `{slug, label, cx, cy, created_at}` (+ optional `inner_half`, `subject_parcels`) so the dashboard label survives across server restarts. `subject_parcels` drives the viewer's pre-highlight — match parcel ids **numerically**, ČÚZK returns them as floats. Legacy v2 manifest fallback is still wired in `_read_label()` and the resume-from-disk endpoint for lokace that pre-date the retirement.
 
 Atomic manifest write pattern: `tmp = path.with_suffix('.json.tmp'); tmp.write_text(...); tmp.replace(path)`.
+
+`POST /api/jobs` also accepts polygon mode — `{slug, label, polygon}` with a WGS `[lon, lat]` ring (3–200 vertices, drawn via map3d's ✏️ výřez button) instead of `cx`/`cy`. `locations.polygon_extent()` is the single source of truth for deriving `cx`/`cy` (S-JTSK bbox centre) and a clamped `inner_half` from the ring, shared with `POST /api/estimate` (sheet-cache-aware demand check — resolves MAPNOM codes and reports `sheets_total`/`sheets_cached` with no downloads, used by the draw sheet before submit). `location.json` for a polygon job additionally carries `polygon` (WGS ring) and `polygon_local` (viewer-space metres relative to `cx`/`cy`). The heightfield viewer reads these to activate island mode — fragment-shader discard outside the polygon mask plus curtain walls along the cut edges, in place of the square pedestal. Spec + plan: `docs/superpowers/specs/2026-07-21-polygon-cutout-page-design.md`, `docs/superpowers/plans/2026-07-21-polygon-cutout-page.md`.
 
 ## Cache layout
 

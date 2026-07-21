@@ -140,7 +140,7 @@ def _read_label(slug: str) -> str:
 
 def list_locations() -> list[dict]:
     """Scan working dir for `tiles_v2_*` directories. Returns a list of
-    {slug, label, status, has_heightfield, modified_ts}, sorted newest-
+    {slug, label, status, has_heightfield, modified_ts, size_mb}, sorted newest-
     first by modified_ts. mtime fallback chain:
     heightfield/manifest.json → tile dir → 0.
     """
@@ -156,12 +156,17 @@ def list_locations() -> list[dict]:
             ts = hf_manifest.stat().st_mtime if hf_manifest.is_file() else path.stat().st_mtime
         except OSError:
             ts = 0
+        try:
+            size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        except OSError:
+            size = 0
         out.append({
             "slug": slug,
             "label": _read_label(slug),
             "status": location_status(slug),
             "has_heightfield": hf_manifest.exists(),
             "modified_ts": ts,
+            "size_mb": round(size / 1048576, 1),
         })
     out.sort(key=lambda d: d["modified_ts"], reverse=True)
     return out

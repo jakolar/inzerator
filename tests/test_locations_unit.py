@@ -146,6 +146,16 @@ def test_list_locations_scan(tmp_path, monkeypatch):
     assert by_slug["beta"]["has_heightfield"] is False
 
 
+def test_list_locations_reports_size(tmp_path, monkeypatch):
+    """list_locations includes size_mb: sum of file sizes under tiles_v2_<slug>/."""
+    monkeypatch.chdir(tmp_path)
+    base = Path("tiles_v2_size-test")
+    base.mkdir(parents=True)
+    (base / "blob.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+    entry = [l for l in locations.list_locations() if l["slug"] == "size-test"][0]
+    assert 1.9 < entry["size_mb"] < 2.1
+
+
 def test_persist_location_meta_writes_label(tmp_path, monkeypatch):
     """enqueue path: location.json with {slug, label, cx, cy, created_at}
     after _persist_location_meta. Atomic via .tmp + replace."""

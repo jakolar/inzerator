@@ -97,7 +97,7 @@
     }
     el.innerHTML = r.map(loc => `
       <div class="location-row" data-slug="${loc.slug}">
-        <span class="label">${escapeHtml(loc.label)}</span>
+        <span class="label">${escapeHtml(loc.label)}${loc.size_mb > 0 ? ` · ${loc.size_mb} MB` : ''}</span>
         <span class="status status-${loc.status}">${statusLabel(loc)}</span>
         ${loc.status === 'partial'
           ? `<button class="btn" data-action="retry-from-disk" data-slug="${loc.slug}">Retry</button>`

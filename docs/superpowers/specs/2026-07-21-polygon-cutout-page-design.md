@@ -63,7 +63,9 @@ heightfield viewer: location.json has polygon → island mode
   the server derives `{ cx, cy, inner_half, clamped, bbox_m }` (single source
   of truth, same code path as the job) and checks sheet cache presence via
   the existing MAPNOM resolution used by the sm5 step, returning
-  `{ sheets_total, sheets_cached, dmr5g_cached }`. Debounced per vertex.
+  `{ sheets_total, sheets_cached }`. (DMR5G is fetched per-location, not
+  per-sheet — unknowable before the slug exists; the UI shows the time as a
+  range instead.) Debounced per vertex.
   UI renders the clamp warning (island cut by ring edge when bbox > 4 km)
   and "~2–4 min (cache)" vs "~15–30 min (stahuje X listů)".
 - **Page size**: static table by ring size + ortho tiers (mid/high/ultra

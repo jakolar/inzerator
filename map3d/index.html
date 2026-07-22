@@ -1194,7 +1194,7 @@ function addDrawVertex(px, py) {
       (terrainHiRes(drawPts[0].sx, drawPts[0].sz) ?? 0) * Y_SCALE, drawPts[0].sz)
       .project(camera);
     const sx0 = (v.x * 0.5 + 0.5) * innerWidth, sy0 = (-v.y * 0.5 + 0.5) * innerHeight;
-    if (Math.hypot(px - sx0, py - sy0) < 14) { finishDraw(); return; }
+    if (Math.hypot(px - sx0, py - sy0) < 14) return;   // tap on 1st vertex = no-op (ring is implicit)
   }
   const pt = terrainPoint(px, py);
   if (!pt) return;
@@ -1227,8 +1227,11 @@ function sizeEstimate(inner_half) {
 }
 let estimateTimer = 0, estimateReq = 0;
 function updateDrawStats() {
+  // Enable as soon as a valid ring exists — don't gate on a close-tap (the
+  // 14 px hit zone on the first vertex is untappable with a finger).
+  drawGo.disabled = drawPts.length < 3;
   if (drawPts.length < 2) {
-    drawStats.textContent = 'klikáním umísťuj vrcholy, uzavři kliknutím na první bod';
+    drawStats.textContent = 'klikáním umísťuj vrcholy (min. 3)';
     return;
   }
   const { area_ha, bbox_w_m, bbox_h_m } = polyAreaBBox(drawPts);
@@ -1260,10 +1263,6 @@ function updateDrawStats() {
   }, 600);
 }
 
-function finishDraw() {
-  drawGo.disabled = drawPts.length < 3;
-  if (!drawLabel.value.trim()) drawLabel.placeholder = 'název výřezu';
-}
 function exitDraw() {
   drawMode = false;
   drawPts = [];

@@ -750,6 +750,219 @@ def resolve_slug_paths(slug, cli_cx=None, cli_cy=None):
         f"{hf_manifest}, or have the legacy v2 manifest at {legacy}.")
 
 
+def _ring_pool_init(cache_dir):
+    """Worker init: restore the CACHE_DIR singleton the ring body reads
+    (macOS spawn starts a fresh interpreter that re-imports this module
+    with CACHE_DIR back at its None default)."""
+    global CACHE_DIR
+    CACHE_DIR = cache_dir
+
+
+def _process_ring(ring, args, out_dir, tiers):
+    """Build one ring (heightmap + bare + ortho tiers + cadastre) and
+    return (ring_meta, ring_bytes). Runs in the main process or a pool
+    worker; the caller must pre-warm the shared SM5 ortho cache so
+    concurrent rings never race on a download."""
+    slug = ring["slug"]
+    half = ring["half"]
+    step = ring["step"]
+    size = ring["ortho_size"]
+    # CLI override wins over per-ring value; per-ring wins over derived.
+    if args.max_z_error is not None:
+        ring_mze = args.max_z_error
+    elif "max_z_error" in ring:
+        ring_mze = ring["max_z_error"]
+    else:
+        ring_mze = default_max_z_error_for_step(step)
+    print(f"\n=== Ring '{slug}': {2*half}×{2*half} m, step {step} m, "
+          f"ortho {size}², LERC ±{ring_mze} m ===")
+
+    ext = 'lerc' if args.format == 'lerc' else 'png'
+    hm_path = out_dir / f"{slug}_heightmap.{ext}"
+    bare_path = out_dir / f"{slug}_bare.{ext}"
+    cad_path = out_dir / f"{slug}_cadastre.png"
+
+    # Fetch order: bare first (despike reference), then SM5. SM5 spikes
+    # of 50-400 m would otherwise dominate the heightfield — ČÚZK source
+    # data has known LIDAR backscatter glitches that gen_detail.py's
+    # mesh pipeline filters out before meshing. Heightfield must do the
+    # same or buildings/cliffs disappear under sky-poking artefacts.
+    if bare_path.exists() and not args.refresh_bare:
+        print(f"  reusing cached bare from {bare_path.name}")
+        bare_data = decode_bare_from_disk(bare_path)
+    else:
+        print(f"  fetching DMR5G bare earth …")
+        bare_data = fetch_bare_grid(args.cx, args.cy, half, step)
+
+    sm5_data = _fetch_sm5_grid(args.cx, args.cy, half, step)
+    if sm5_data.shape != bare_data.shape:
+        # Theoretically same step → same shape, but SM5 merge() with
+        # bounds can pad by 1 cell. Resize bare to match SM5 grid.
+        bare_data = np.array(
+            Image.fromarray(bare_data).resize(
+                (sm5_data.shape[1], sm5_data.shape[0]), Image.BILINEAR),
+            dtype=np.float64,
+        )
+    sm5_data = despike_sm5(sm5_data, bare_data, dmr_ceiling=50.0)
+
+    # Shared y-range covers both SM5 (with buildings/trees) and bare.
+    # Single uniform pair lets the viewer swap samplers without re-deriving
+    # vertex range. Bare's min/max usually lies entirely inside SM5's range.
+    y_min = float(min(sm5_data.min(), bare_data.min()))
+    y_max = float(max(sm5_data.max(), bare_data.max()))
+
+    _encode_heightmap_file(sm5_data, y_min, y_max, hm_path, ring_mze)
+    print(f"  heightmap:    {hm_path.stat().st_size/1024:>7.1f} KB, "
+          f"{sm5_data.shape[0]}×{sm5_data.shape[1]} px, "
+          f"Y {y_min:.1f}–{y_max:.1f} m")
+    _encode_heightmap_file(bare_data, y_min, y_max, bare_path, ring_mze)
+    print(f"  bare:         {bare_path.stat().st_size/1024:>7.1f} KB")
+    n = sm5_data.shape[0]
+
+    # Emit one ortho per requested quality tier as JPEG + KTX2 (ETC1S).
+    # Naming: `<slug>_ortho_<tier>.jpg` (basisu source + fallback) and
+    # `<slug>_ortho_<tier>.ktx2` (what the viewer loads for tiers ≥ 2048).
+    # WebP was dropped — the viewer never loaded it (KTX2 wins) and its
+    # method=6 encode dominated gen time.
+    # Make sure every SM5 sheet covering this ring is cached BEFORE
+    # the first composite build. Without this, gaps in cache show
+    # up as empty stripes in the ortho — exactly the recurring
+    # "one stripe didn't load" complaint. Per-ring call because each
+    # ring has its own bbox extent.
+    ensure_sm5_cached(args.cx, args.cy, half,
+                      fetch_missing=not args.no_fetch_missing)
+    ortho_files = {}
+    # Build the composite once at the largest tier and downscale (LANCZOS)
+    # for the smaller ones — rebuilding from source sheets at each tier
+    # size costs ~14 s per 8192² ring. Descending size so the first
+    # iteration is the base. (Same pattern as refresh_ortho.)
+    tier_specs = sorted(
+        ((tier, ORTHO_TIERS[tier],
+          max(64, int(round(size * ORTHO_TIERS[tier]["scale"]))))
+         for tier in tiers),
+        key=lambda s: -s[2])
+    base_composite = None
+    for tier, t, tier_size in tier_specs:
+        if base_composite is None:
+            base_composite = build_ortho_composite(args.cx, args.cy, half, tier_size)
+            composite = base_composite
+        else:
+            composite = base_composite.resize((tier_size, tier_size), Image.LANCZOS)
+        jpg_path = out_dir / f"{slug}_ortho_{tier}.jpg"
+        save_ortho_jpeg(composite, jpg_path, t["quality"], t["subsampling"])
+        jpg_kb = round(jpg_path.stat().st_size / 1024, 1)
+        # KTX2 (ETC1S) — only worth it for tiers ≥ 2048 px; smaller
+        # tiers are already tiny on GPU (low @ 1024² = 4 MB raw RGB,
+        # already not a concern) and the ~5 s basisu pass would
+        # dominate gen time per ring.
+        ktx2_name = None
+        ktx2_kb = None
+        if tier_size >= 2048:
+            ktx2_path = out_dir / f"{slug}_ortho_{tier}.ktx2"
+            try:
+                encode_ortho_ktx2(jpg_path, ktx2_path)
+                ktx2_name = ktx2_path.name
+                ktx2_kb = round(ktx2_path.stat().st_size / 1024, 1)
+            except FileNotFoundError:
+                print(f"  (ktx2 {tier} skipped: basisu not installed)")
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()[:200] or repr(e)
+                print(f"  (ktx2 {tier} skipped: rc={e.returncode}, stderr={err})")
+        tier_entry = {
+            "file": jpg_path.name,
+            "size_px": tier_size,
+            "kb": jpg_kb,
+        }
+        if ktx2_name:
+            tier_entry["ktx2_file"] = ktx2_name
+            tier_entry["ktx2_kb"] = ktx2_kb
+        ortho_files[tier] = tier_entry
+        extra = f"  ktx2 {ktx2_kb:>6.1f} KB" if ktx2_name else ""
+        print(f"  ortho_{tier}: {tier_size}×{tier_size}  "
+              f"jpg {jpg_kb:>7.1f} KB (q={t['quality']}, "
+              f"sub={'4:2:0' if t['subsampling']==2 else '4:4:4'}, prog){extra}")
+    # No more legacy `<slug>_ortho.jpg` copy — the v1/v2 viewers that
+    # needed it were retired (June 2026) and the duplicate cost ~35 MB
+    # per ring. The manifest's `ortho_file` field now points straight at
+    # the default tier's JPEG. Drop a stale copy left by older gens
+    # (regenerable build artifact, hard delete is fine).
+    stale_legacy = out_dir / f"{slug}_ortho.jpg"
+    if stale_legacy.exists():
+        stale_legacy.unlink()
+        print(f"  removed stale legacy {stale_legacy.name}")
+
+    cad_ok = False
+    cad_ktx2_path = out_dir / f"{slug}_cadastre.ktx2"
+    cad_ktx2_ok = False
+    parcels_path = out_dir / f"{slug}_parcels.json"
+    buildings_path = out_dir / f"{slug}_buildings.json"
+    vec_counts = None
+    if not args.no_cadastre:
+        print(f"  fetching cadastre via {INZERATOR_PROXY} …")
+        cad_ok = fetch_cadastre(args.cx, args.cy, half,
+                                 args.cadastre_size, cad_path)
+        if cad_ok:
+            print(f"  cadastre.png:  {cad_path.stat().st_size/1024:.1f} KB, "
+                  f"{args.cadastre_size}×{args.cadastre_size}")
+            # KTX2 compressed mirror of the cadastre — viewer prefers it
+            # over the PNG (8× GPU saving via ETC1S transcoding).
+            try:
+                encode_cadastre_ktx2(cad_path, cad_ktx2_path)
+                cad_ktx2_ok = True
+                print(f"  cadastre.ktx2: {cad_ktx2_path.stat().st_size/1024:.1f} KB, 4096×4096 ETC1S")
+            except FileNotFoundError:
+                print(f"  (cadastre KTX2 skipped: basisu not installed)")
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()[:200] or repr(e)
+                print(f"  (cadastre KTX2 skipped: rc={e.returncode}, stderr={err})")
+        # Vector cadastre (parcels + buildings) — same data source as the
+        # raster path, but lets the viewer skip the 64 MB R8 upload.
+        # Generated alongside the PNG so existing slugs keep the raster
+        # fallback if the viewer is older.
+        vec_counts = fetch_vector_cadastre(args.cx, args.cy, half,
+                                            parcels_path, buildings_path)
+        if vec_counts:
+            pkb = round(parcels_path.stat().st_size / 1024, 1)
+            bkb = round(buildings_path.stat().st_size / 1024, 1)
+            print(f"  parcels.json: {pkb:>6.1f} KB ({vec_counts['parcels']} parcel(s))")
+            print(f"  buildings:    {bkb:>6.1f} KB ({vec_counts['buildings']} building(s))")
+
+    ring_meta = {
+        "slug": slug,
+        "half": half,
+        "step": step,
+        "side_m": 2 * half,
+        "heightmap_size": n,
+        "ortho_size": size,
+        "y_min": y_min,
+        "y_max": y_max,
+        "heightmap_file": hm_path.name,
+        "heightmap_format": args.format,
+        "bare_file": bare_path.name,
+        # legacy field — now an alias for the default tier JPEG (no copy)
+        "ortho_file": ortho_files[args.ortho_default]["file"],
+        "ortho_default": args.ortho_default,    # name of the default tier
+        "ortho_tiers": ortho_files,             # full tier table
+    }
+    if args.format == 'lerc':
+        ring_meta["max_z_error"] = ring_mze
+    if cad_ok:
+        ring_meta["cadastre_file"] = cad_path.name
+        ring_meta["cadastre_size"] = args.cadastre_size
+    if cad_ktx2_ok:
+        ring_meta["cadastre_ktx2_file"] = cad_ktx2_path.name
+    if vec_counts:
+        ring_meta["parcels_file"] = parcels_path.name
+        ring_meta["buildings_file"] = buildings_path.name
+        ring_meta["parcel_count"] = vec_counts["parcels"]
+        ring_meta["building_count"] = vec_counts["buildings"]
+    ring_bytes = (hm_path.stat().st_size
+                    + bare_path.stat().st_size
+                    + (out_dir / ortho_files[args.ortho_default]["file"]).stat().st_size
+                    + (cad_path.stat().st_size if cad_ok else 0))
+    return ring_meta, ring_bytes
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--slug", default=None,
@@ -790,6 +1003,9 @@ def main():
                    help="don't auto-download missing SM5 ortofoto sheets; "
                         "the composite will have empty stripes where cache "
                         "is missing. Default: auto-fetch via ČÚZK ATOM feed.")
+    p.add_argument("--no-parallel", action="store_true",
+                   help="build rings sequentially instead of one process per "
+                        "ring (default: parallel when >1 ring).")
     p.add_argument("--cadastre-size", type=int, default=8192,
                    help="cadastre PNG side in px (default 8192; server caps at 8192)")
     p.add_argument("--bits", type=int, default=16, choices=[8, 10, 12, 16],
@@ -864,205 +1080,31 @@ def main():
     manifest = {"cx": args.cx, "cy": args.cy, "rings": []}
 
     total_bytes = 0
-    for ring in rings:
-        slug = ring["slug"]
-        half = ring["half"]
-        step = ring["step"]
-        size = ring["ortho_size"]
-        # CLI override wins over per-ring value; per-ring wins over derived.
-        if args.max_z_error is not None:
-            ring_mze = args.max_z_error
-        elif "max_z_error" in ring:
-            ring_mze = ring["max_z_error"]
-        else:
-            ring_mze = default_max_z_error_for_step(step)
-        print(f"\n=== Ring '{slug}': {2*half}×{2*half} m, step {step} m, "
-              f"ortho {size}², LERC ±{ring_mze} m ===")
+    # Pre-warm the shared SM5 ortho cache for the largest ring before the
+    # (possibly parallel) ring build — concurrent ensure_sm5_cached calls
+    # would race on the same download. DMPOK is read-only (discover_sm5).
+    max_half = max(r["half"] for r in rings)
+    ensure_sm5_cached(args.cx, args.cy, max_half,
+                      fetch_missing=not args.no_fetch_missing)
 
-        ext = 'lerc' if args.format == 'lerc' else 'png'
-        hm_path = out_dir / f"{slug}_heightmap.{ext}"
-        bare_path = out_dir / f"{slug}_bare.{ext}"
-        cad_path = out_dir / f"{slug}_cadastre.png"
+    if len(rings) > 1 and not args.no_parallel:
+        # One worker per ring: while one ring waits on DMR5G / cadastre
+        # network I/O, another runs its ortho encode. CACHE_DIR is restored
+        # in each worker (spawn doesn't inherit module globals).
+        from concurrent.futures import ProcessPoolExecutor
+        from functools import partial
+        print(f"Building {len(rings)} rings in parallel …")
+        with ProcessPoolExecutor(max_workers=len(rings),
+                                 initializer=_ring_pool_init,
+                                 initargs=(CACHE_DIR,)) as ex:
+            results = list(ex.map(partial(_process_ring, args=args,
+                                          out_dir=out_dir, tiers=tiers), rings))
+    else:
+        results = [_process_ring(ring, args, out_dir, tiers) for ring in rings]
 
-        # Fetch order: bare first (despike reference), then SM5. SM5 spikes
-        # of 50-400 m would otherwise dominate the heightfield — ČÚZK source
-        # data has known LIDAR backscatter glitches that gen_detail.py's
-        # mesh pipeline filters out before meshing. Heightfield must do the
-        # same or buildings/cliffs disappear under sky-poking artefacts.
-        if bare_path.exists() and not args.refresh_bare:
-            print(f"  reusing cached bare from {bare_path.name}")
-            bare_data = decode_bare_from_disk(bare_path)
-        else:
-            print(f"  fetching DMR5G bare earth …")
-            bare_data = fetch_bare_grid(args.cx, args.cy, half, step)
-
-        sm5_data = _fetch_sm5_grid(args.cx, args.cy, half, step)
-        if sm5_data.shape != bare_data.shape:
-            # Theoretically same step → same shape, but SM5 merge() with
-            # bounds can pad by 1 cell. Resize bare to match SM5 grid.
-            bare_data = np.array(
-                Image.fromarray(bare_data).resize(
-                    (sm5_data.shape[1], sm5_data.shape[0]), Image.BILINEAR),
-                dtype=np.float64,
-            )
-        sm5_data = despike_sm5(sm5_data, bare_data, dmr_ceiling=50.0)
-
-        # Shared y-range covers both SM5 (with buildings/trees) and bare.
-        # Single uniform pair lets the viewer swap samplers without re-deriving
-        # vertex range. Bare's min/max usually lies entirely inside SM5's range.
-        y_min = float(min(sm5_data.min(), bare_data.min()))
-        y_max = float(max(sm5_data.max(), bare_data.max()))
-
-        _encode_heightmap_file(sm5_data, y_min, y_max, hm_path, ring_mze)
-        print(f"  heightmap:    {hm_path.stat().st_size/1024:>7.1f} KB, "
-              f"{sm5_data.shape[0]}×{sm5_data.shape[1]} px, "
-              f"Y {y_min:.1f}–{y_max:.1f} m")
-        _encode_heightmap_file(bare_data, y_min, y_max, bare_path, ring_mze)
-        print(f"  bare:         {bare_path.stat().st_size/1024:>7.1f} KB")
-        n = sm5_data.shape[0]
-
-        # Emit one ortho per requested quality tier as JPEG + KTX2 (ETC1S).
-        # Naming: `<slug>_ortho_<tier>.jpg` (basisu source + fallback) and
-        # `<slug>_ortho_<tier>.ktx2` (what the viewer loads for tiers ≥ 2048).
-        # WebP was dropped — the viewer never loaded it (KTX2 wins) and its
-        # method=6 encode dominated gen time.
-        # Make sure every SM5 sheet covering this ring is cached BEFORE
-        # the first composite build. Without this, gaps in cache show
-        # up as empty stripes in the ortho — exactly the recurring
-        # "one stripe didn't load" complaint. Per-ring call because each
-        # ring has its own bbox extent.
-        ensure_sm5_cached(args.cx, args.cy, half,
-                          fetch_missing=not args.no_fetch_missing)
-        ortho_files = {}
-        # Build the composite once at the largest tier and downscale (LANCZOS)
-        # for the smaller ones — rebuilding from source sheets at each tier
-        # size costs ~14 s per 8192² ring. Descending size so the first
-        # iteration is the base. (Same pattern as refresh_ortho.)
-        tier_specs = sorted(
-            ((tier, ORTHO_TIERS[tier],
-              max(64, int(round(size * ORTHO_TIERS[tier]["scale"]))))
-             for tier in tiers),
-            key=lambda s: -s[2])
-        base_composite = None
-        for tier, t, tier_size in tier_specs:
-            if base_composite is None:
-                base_composite = build_ortho_composite(args.cx, args.cy, half, tier_size)
-                composite = base_composite
-            else:
-                composite = base_composite.resize((tier_size, tier_size), Image.LANCZOS)
-            jpg_path = out_dir / f"{slug}_ortho_{tier}.jpg"
-            save_ortho_jpeg(composite, jpg_path, t["quality"], t["subsampling"])
-            jpg_kb = round(jpg_path.stat().st_size / 1024, 1)
-            # KTX2 (ETC1S) — only worth it for tiers ≥ 2048 px; smaller
-            # tiers are already tiny on GPU (low @ 1024² = 4 MB raw RGB,
-            # already not a concern) and the ~5 s basisu pass would
-            # dominate gen time per ring.
-            ktx2_name = None
-            ktx2_kb = None
-            if tier_size >= 2048:
-                ktx2_path = out_dir / f"{slug}_ortho_{tier}.ktx2"
-                try:
-                    encode_ortho_ktx2(jpg_path, ktx2_path)
-                    ktx2_name = ktx2_path.name
-                    ktx2_kb = round(ktx2_path.stat().st_size / 1024, 1)
-                except FileNotFoundError:
-                    print(f"  (ktx2 {tier} skipped: basisu not installed)")
-                except subprocess.CalledProcessError as e:
-                    err = (e.stderr or "").strip()[:200] or repr(e)
-                    print(f"  (ktx2 {tier} skipped: rc={e.returncode}, stderr={err})")
-            tier_entry = {
-                "file": jpg_path.name,
-                "size_px": tier_size,
-                "kb": jpg_kb,
-            }
-            if ktx2_name:
-                tier_entry["ktx2_file"] = ktx2_name
-                tier_entry["ktx2_kb"] = ktx2_kb
-            ortho_files[tier] = tier_entry
-            extra = f"  ktx2 {ktx2_kb:>6.1f} KB" if ktx2_name else ""
-            print(f"  ortho_{tier}: {tier_size}×{tier_size}  "
-                  f"jpg {jpg_kb:>7.1f} KB (q={t['quality']}, "
-                  f"sub={'4:2:0' if t['subsampling']==2 else '4:4:4'}, prog){extra}")
-        # No more legacy `<slug>_ortho.jpg` copy — the v1/v2 viewers that
-        # needed it were retired (June 2026) and the duplicate cost ~35 MB
-        # per ring. The manifest's `ortho_file` field now points straight at
-        # the default tier's JPEG. Drop a stale copy left by older gens
-        # (regenerable build artifact, hard delete is fine).
-        stale_legacy = out_dir / f"{slug}_ortho.jpg"
-        if stale_legacy.exists():
-            stale_legacy.unlink()
-            print(f"  removed stale legacy {stale_legacy.name}")
-
-        cad_ok = False
-        cad_ktx2_path = out_dir / f"{slug}_cadastre.ktx2"
-        cad_ktx2_ok = False
-        parcels_path = out_dir / f"{slug}_parcels.json"
-        buildings_path = out_dir / f"{slug}_buildings.json"
-        vec_counts = None
-        if not args.no_cadastre:
-            print(f"  fetching cadastre via {INZERATOR_PROXY} …")
-            cad_ok = fetch_cadastre(args.cx, args.cy, half,
-                                     args.cadastre_size, cad_path)
-            if cad_ok:
-                print(f"  cadastre.png:  {cad_path.stat().st_size/1024:.1f} KB, "
-                      f"{args.cadastre_size}×{args.cadastre_size}")
-                # KTX2 compressed mirror of the cadastre — viewer prefers it
-                # over the PNG (8× GPU saving via ETC1S transcoding).
-                try:
-                    encode_cadastre_ktx2(cad_path, cad_ktx2_path)
-                    cad_ktx2_ok = True
-                    print(f"  cadastre.ktx2: {cad_ktx2_path.stat().st_size/1024:.1f} KB, 4096×4096 ETC1S")
-                except FileNotFoundError:
-                    print(f"  (cadastre KTX2 skipped: basisu not installed)")
-                except subprocess.CalledProcessError as e:
-                    err = (e.stderr or "").strip()[:200] or repr(e)
-                    print(f"  (cadastre KTX2 skipped: rc={e.returncode}, stderr={err})")
-            # Vector cadastre (parcels + buildings) — same data source as the
-            # raster path, but lets the viewer skip the 64 MB R8 upload.
-            # Generated alongside the PNG so existing slugs keep the raster
-            # fallback if the viewer is older.
-            vec_counts = fetch_vector_cadastre(args.cx, args.cy, half,
-                                                parcels_path, buildings_path)
-            if vec_counts:
-                pkb = round(parcels_path.stat().st_size / 1024, 1)
-                bkb = round(buildings_path.stat().st_size / 1024, 1)
-                print(f"  parcels.json: {pkb:>6.1f} KB ({vec_counts['parcels']} parcel(s))")
-                print(f"  buildings:    {bkb:>6.1f} KB ({vec_counts['buildings']} building(s))")
-
-        ring_meta = {
-            "slug": slug,
-            "half": half,
-            "step": step,
-            "side_m": 2 * half,
-            "heightmap_size": n,
-            "ortho_size": size,
-            "y_min": y_min,
-            "y_max": y_max,
-            "heightmap_file": hm_path.name,
-            "heightmap_format": args.format,
-            "bare_file": bare_path.name,
-            # legacy field — now an alias for the default tier JPEG (no copy)
-            "ortho_file": ortho_files[args.ortho_default]["file"],
-            "ortho_default": args.ortho_default,    # name of the default tier
-            "ortho_tiers": ortho_files,             # full tier table
-        }
-        if args.format == 'lerc':
-            ring_meta["max_z_error"] = ring_mze
-        if cad_ok:
-            ring_meta["cadastre_file"] = cad_path.name
-            ring_meta["cadastre_size"] = args.cadastre_size
-        if cad_ktx2_ok:
-            ring_meta["cadastre_ktx2_file"] = cad_ktx2_path.name
-        if vec_counts:
-            ring_meta["parcels_file"] = parcels_path.name
-            ring_meta["buildings_file"] = buildings_path.name
-            ring_meta["parcel_count"] = vec_counts["parcels"]
-            ring_meta["building_count"] = vec_counts["buildings"]
+    for ring_meta, ring_bytes in results:
         manifest["rings"].append(ring_meta)
-        total_bytes += (hm_path.stat().st_size
-                        + bare_path.stat().st_size
-                        + (out_dir / ortho_files[args.ortho_default]["file"]).stat().st_size
-                        + (cad_path.stat().st_size if cad_ok else 0))
+        total_bytes += ring_bytes
 
     # Overall Y range across all rings (used by viewer for camera framing
     # and shared Y normalisation).

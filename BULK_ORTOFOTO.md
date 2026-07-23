@@ -1,5 +1,12 @@
 # Ortofoto bulk download
 
+> **Status (2026-07): pull complete.** 16 299 `ortofoto_<CODE>/` dirs
+> (`WRTO*.jpg` + `.jgw`) live under `/Volumes/Elements/cuzk-bulk` — the same
+> root as DMPOK, not a separate dir. The `sm5` pipeline step and the ortho
+> pyramid builder (`build_ortho_tile.py`) both read sheets from here; no
+> re-download needed for normal operation. This manual is for re-running or
+> refreshing the pull.
+
 Operating manual for pulling the entire ČÚZK ortofoto dataset (16 301 SM5
 sheets, newest acquisition per sheet, ~1.1 TB of JPEG @ 0.1239 m/px) onto
 `/Volumes/Elements/`. Clone of the DMPOK bulk system — same engine, same

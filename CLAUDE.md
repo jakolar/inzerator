@@ -60,7 +60,7 @@ Atomic manifest write pattern: `tmp = path.with_suffix('.json.tmp'); tmp.write_t
 
 ## Heightfield generation (`gen_heightfield.py`)
 
-LOD ring assets for the streaming viewer. Defaults: ortho tiers = `mid,high,ultra`, format = `lerc` (50% smaller than PNG, WASM-decoded), bare-earth DMR5G **cached** to `<slug>_bare.lerc` and skipped on rerun unless `--refresh-bare`. SM5 ortofoto auto-fetched via ČÚZK ATOM feed unless `--no-fetch-missing`.
+LOD ring assets for the streaming viewer. Defaults: ortho tiers = `mid,high,ultra`, format = `lerc` (50% smaller than PNG, WASM-decoded), bare-earth DMR5G **cached** to `<slug>_bare.lerc` and skipped on rerun unless `--refresh-bare`. SM5 ortofoto self-heal (`ensure_sm5_cached`) copies missing sheets from the local bulk archive first, ČÚZK ATOM feed only as fallback, unless `--no-fetch-missing`. Bare-earth DMR5G is still fetched live from ČÚZK ImageServer (2 requests, ~10–20 s total) — the one remaining ČÚZK dependency in generation; the rest of the ~10 min is CPU (ortho tier encode, despike), not network.
 
 ```
 python3 gen_heightfield.py --slug hnojice --cx -547700 --cy -1107700   # new lokace path

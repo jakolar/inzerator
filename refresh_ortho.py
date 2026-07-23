@@ -81,25 +81,17 @@ def refresh_one(slug: str, tiers: list[str]) -> tuple[bool, str]:
             jpg_path = hd / f"{ring_slug}_ortho_{tier_name}.jpg"
             webp_path = hd / f"{ring_slug}_ortho_{tier_name}.webp"
             g.save_ortho_jpeg(composite, jpg_path, t["quality"], t["subsampling"])
-            # WebP encoder hard-caps each dimension at 16383 px. Skip it for
-            # the super tier (16384²) and rely on the JPG + KTX2 pair —
-            # viewer picks KTX2 first anyway. Drop the stale .webp from a
-            # previous run if it's lying around.
+            # WebP dropped: the viewer picks KTX2 first for every tier ≥ 2048 px,
+            # so WebP was never loaded — pure dead encode work (method=6 at 8192²
+            # measured >100 s). Remove any stale .webp from an earlier run.
+            if webp_path.exists():
+                webp_path.unlink()
             jpg_kb = round(jpg_path.stat().st_size / 1024, 1)
             entry = {
                 "file": jpg_path.name,
                 "size_px": tier_size,
                 "kb": jpg_kb,
             }
-            if tier_size < 16384:
-                g.save_ortho_webp(composite, webp_path, t["webp_quality"])
-                webp_kb = round(webp_path.stat().st_size / 1024, 1)
-                entry["webp_file"] = webp_path.name
-                entry["webp_kb"] = webp_kb
-            else:
-                if webp_path.exists():
-                    webp_path.unlink()
-                webp_kb = None
             if tier_size >= 2048:
                 ktx2_path = hd / f"{ring_slug}_ortho_{tier_name}.ktx2"
                 try:
@@ -113,10 +105,6 @@ def refresh_one(slug: str, tiers: list[str]) -> tuple[bool, str]:
                     print(f"    (ktx2 skipped: rc={e.returncode}, stderr={err})")
             ortho_files[tier_name] = entry
             extras = [f"jpg {jpg_kb:.1f} KB"]
-            if webp_kb is not None:
-                extras.append(f"webp {webp_kb:.1f} KB")
-            else:
-                extras.append("webp skipped (>16383 px)")
             if "ktx2_file" in entry:
                 extras.append(f"ktx2 {entry['ktx2_kb']:.1f} KB")
             print(f"    {' / '.join(extras)}")

@@ -677,11 +677,13 @@ def encode_ortho_ktx2(src_path, out_path):
     # (WebGL ignores UNPACK_FLIP_Y_WEBGL for compressed paths).
     # -q 220 (default 128, max 255): pushes ETC1S quality up — file ~2×
     # vs. q=128 but ETC1S block artifacts on grass / rooftop edges become
-    # much less visible. -comp_level 4 (default 1, max 6) lets the encoder
-    # search harder for the best block fit; ~3× encode time, ~5-10 % better
-    # quality at the same file size.
+    # much less visible. -comp_level 2 (default 1, max 6): comp_level 4 was
+    # measured at 113 s for an 8192² ultra tile — the dominant cost of the
+    # whole heightfield gen. Level 2 roughly halves that for a difference
+    # invisible on terrain at viewer distance; level 1 is faster still if
+    # gen time matters more than the last few % of block fit.
     subprocess.run([
-        "basisu", "-ktx2", "-q", "220", "-comp_level", "4",
+        "basisu", "-ktx2", "-q", "220", "-comp_level", "2",
         str(src_path), "-output_file", str(out_path),
     ], check=True, capture_output=True, text=True)
 
@@ -691,13 +693,6 @@ def save_ortho_jpeg(composite, out_path, quality, subsampling):
     # so the viewer shows something useful at ~30% of bytes received.
     composite.save(out_path, quality=quality, optimize=True,
                    subsampling=subsampling, progressive=True)
-
-
-def save_ortho_webp(composite, out_path, quality):
-    # WebP at q≈75 is visually equivalent to JPEG q≈92 on photographic
-    # imagery while ~30% smaller. method=6 = slowest/best compression
-    # (single-shot, no live re-encode), worth the extra few seconds.
-    composite.save(out_path, format='WEBP', quality=quality, method=6)
 
 
 TILES_DIR_PREFIX = "tiles_v2_"
@@ -926,10 +921,11 @@ def main():
         print(f"  bare:         {bare_path.stat().st_size/1024:>7.1f} KB")
         n = sm5_data.shape[0]
 
-        # Emit one ortho per requested quality tier, in BOTH JPEG and WebP.
-        # Naming: `<slug>_ortho_<tier>.jpg` + `<slug>_ortho_<tier>.webp`.
-        # Composite built once per tier_size, re-encoded twice — saves the
-        # SM5 sheet re-discovery + crop+paste cost.
+        # Emit one ortho per requested quality tier as JPEG + KTX2 (ETC1S).
+        # Naming: `<slug>_ortho_<tier>.jpg` (basisu source + fallback) and
+        # `<slug>_ortho_<tier>.ktx2` (what the viewer loads for tiers ≥ 2048).
+        # WebP was dropped — the viewer never loaded it (KTX2 wins) and its
+        # method=6 encode dominated gen time.
         # Make sure every SM5 sheet covering this ring is cached BEFORE
         # the first composite build. Without this, gaps in cache show
         # up as empty stripes in the ortho — exactly the recurring
@@ -943,11 +939,8 @@ def main():
             tier_size = max(64, int(round(size * t["scale"])))
             composite = build_ortho_composite(args.cx, args.cy, half, tier_size)
             jpg_path = out_dir / f"{slug}_ortho_{tier}.jpg"
-            webp_path = out_dir / f"{slug}_ortho_{tier}.webp"
             save_ortho_jpeg(composite, jpg_path, t["quality"], t["subsampling"])
-            save_ortho_webp(composite, webp_path, t["webp_quality"])
             jpg_kb = round(jpg_path.stat().st_size / 1024, 1)
-            webp_kb = round(webp_path.stat().st_size / 1024, 1)
             # KTX2 (ETC1S) — only worth it for tiers ≥ 2048 px; smaller
             # tiers are already tiny on GPU (low @ 1024² = 4 MB raw RGB,
             # already not a concern) and the ~5 s basisu pass would
@@ -967,10 +960,8 @@ def main():
                     print(f"  (ktx2 {tier} skipped: rc={e.returncode}, stderr={err})")
             tier_entry = {
                 "file": jpg_path.name,
-                "webp_file": webp_path.name,
                 "size_px": tier_size,
                 "kb": jpg_kb,
-                "webp_kb": webp_kb,
             }
             if ktx2_name:
                 tier_entry["ktx2_file"] = ktx2_name
@@ -979,8 +970,7 @@ def main():
             extra = f"  ktx2 {ktx2_kb:>6.1f} KB" if ktx2_name else ""
             print(f"  ortho_{tier}: {tier_size}×{tier_size}  "
                   f"jpg {jpg_kb:>7.1f} KB (q={t['quality']}, "
-                  f"sub={'4:2:0' if t['subsampling']==2 else '4:4:4'}, prog)  "
-                  f"webp {webp_kb:>7.1f} KB (q={t['webp_quality']}){extra}")
+                  f"sub={'4:2:0' if t['subsampling']==2 else '4:4:4'}, prog){extra}")
         # No more legacy `<slug>_ortho.jpg` copy — the v1/v2 viewers that
         # needed it were retired (June 2026) and the duplicate cost ~35 MB
         # per ring. The manifest's `ortho_file` field now points straight at

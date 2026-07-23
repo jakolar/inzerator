@@ -1084,14 +1084,18 @@ async function showInfo(px, py) {
     bbody.textContent = 'Informace nejsou dostupné (backend neběží).';
     return;
   }
-  // Toggle the parcel in the selection; fall back to the building footprint
-  // only when the point isn't on a registered parcel (roads, public space).
+  // Building wins over parcel when the click is on/near a building. Under a
+  // tilted camera a tap on a facade ray-marches onto the building's top edge,
+  // whose plumb x/z can drift onto the parcel BEHIND the building — so keying
+  // the highlight off the parcel selected "the parcel behind the wall". The
+  // building is what the user pointed at; its footprint is the subject.
+  // Fall back to the parcel only off-building (roads, yards, public space).
   // A miss (neither found) leaves the selection alone — a stray tap must not
-  // wipe a multi-parcel pick.
-  if (parcel?.found && parcel.ring_wgs)
-    toggleSel('p:' + parcel.id, parcel.ring_wgs, parcel.area_m2);
-  else if (bld?.found && bld.footprint_wgs)
+  // wipe a multi-selection.
+  if (bld?.found && bld.footprint_wgs)
     toggleSel('b:' + bld.ruian_id, bld.footprint_wgs, null);
+  else if (parcel?.found && parcel.ring_wgs)
+    toggleSel('p:' + parcel.id, parcel.ring_wgs, parcel.area_m2);
 
   let html;
   if (parcel?.found) {

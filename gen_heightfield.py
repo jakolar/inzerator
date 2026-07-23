@@ -934,10 +934,22 @@ def main():
         ensure_sm5_cached(args.cx, args.cy, half,
                           fetch_missing=not args.no_fetch_missing)
         ortho_files = {}
-        for tier in tiers:
-            t = ORTHO_TIERS[tier]
-            tier_size = max(64, int(round(size * t["scale"])))
-            composite = build_ortho_composite(args.cx, args.cy, half, tier_size)
+        # Build the composite once at the largest tier and downscale (LANCZOS)
+        # for the smaller ones — rebuilding from source sheets at each tier
+        # size costs ~14 s per 8192² ring. Descending size so the first
+        # iteration is the base. (Same pattern as refresh_ortho.)
+        tier_specs = sorted(
+            ((tier, ORTHO_TIERS[tier],
+              max(64, int(round(size * ORTHO_TIERS[tier]["scale"]))))
+             for tier in tiers),
+            key=lambda s: -s[2])
+        base_composite = None
+        for tier, t, tier_size in tier_specs:
+            if base_composite is None:
+                base_composite = build_ortho_composite(args.cx, args.cy, half, tier_size)
+                composite = base_composite
+            else:
+                composite = base_composite.resize((tier_size, tier_size), Image.LANCZOS)
             jpg_path = out_dir / f"{slug}_ortho_{tier}.jpg"
             save_ortho_jpeg(composite, jpg_path, t["quality"], t["subsampling"])
             jpg_kb = round(jpg_path.stat().st_size / 1024, 1)

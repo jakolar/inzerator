@@ -1097,32 +1097,34 @@ async function showInfo(px, py) {
   else if (parcel?.found && parcel.ring_wgs)
     toggleSel('p:' + parcel.id, parcel.ring_wgs, parcel.area_m2);
 
-  let html;
-  if (parcel?.found) {
-    const pid = String(parcel.id).replace(/\.0+$/, '');
-    html = `<b>Parcela ${parcel.label}</b>` + rowsHtml([
-      ['Výměra', `${parcel.area_m2} m²`],
-      ['Druh pozemku', parcel.use_label],
-      pid ? ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/parcely/${pid}` +
-             `" target="_blank" rel="noopener">${pid}</a>`] : null,
-    ]);
-  } else {
-    html = `<b>Parcela</b><div style="color:rgba(223,231,240,.65); margin-top:4px;">` +
-           `V místě není registrovaná parcela (RÚIAN).</div>`;
-  }
-  if (bld?.found) {
-    html += `<div style="margin-top:10px; padding-top:8px; ` +
-            `border-top:1px solid rgba(255,255,255,.12);">` +
-            `<b>Budova${bld.cisladomovni ? ' č. ' + bld.cisladomovni : ''}</b>` +
-            rowsHtml([
-              ['Využití', bld.zpusob_vyuziti],
-              ['Zastavěná plocha', `${bld.plocha_zastavena_m2 ?? bld.plocha_polygon_m2} m²`],
-              bld.height_m != null ? ['Výška (DSM)', `${bld.height_m} m`] : null,
-              bld.terrain_slope_pct != null ? ['Sklon terénu', `${bld.terrain_slope_pct} %`] : null,
-              ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/stavebniobjekty/` +
-                        `${bld.ruian_id}" target="_blank" rel="noopener">${bld.ruian_id}</a>`],
-            ]) + `</div>`;
-  }
+  const pid = parcel?.found ? String(parcel.id).replace(/\.0+$/, '') : null;
+  const parcelHtml = parcel?.found
+    ? `<b>Parcela ${parcel.label}</b>` + rowsHtml([
+        ['Výměra', `${parcel.area_m2} m²`],
+        ['Druh pozemku', parcel.use_label],
+        pid ? ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/parcely/${pid}` +
+               `" target="_blank" rel="noopener">${pid}</a>`] : null,
+      ])
+    : `<b>Parcela</b><div style="color:rgba(223,231,240,.65); margin-top:4px;">` +
+      `V místě není registrovaná parcela (RÚIAN).</div>`;
+  const bldHtml = bld?.found
+    ? `<b>Budova${bld.cisladomovni ? ' č. ' + bld.cisladomovni : ''}</b>` +
+      rowsHtml([
+        ['Využití', bld.zpusob_vyuziti],
+        ['Zastavěná plocha', `${bld.plocha_zastavena_m2 ?? bld.plocha_polygon_m2} m²`],
+        bld.height_m != null ? ['Výška (DSM)', `${bld.height_m} m`] : null,
+        bld.terrain_slope_pct != null ? ['Sklon terénu', `${bld.terrain_slope_pct} %`] : null,
+        ['RÚIAN', `<a href="https://vdp.cuzk.gov.cz/vdp/ruian/stavebniobjekty/` +
+                  `${bld.ruian_id}" target="_blank" rel="noopener">${bld.ruian_id}</a>`],
+      ])
+    : null;
+  const section = (inner) => `<div style="margin-top:10px; padding-top:8px; ` +
+    `border-top:1px solid rgba(255,255,255,.12);">${inner}</div>`;
+  // Lead with whatever the highlight selected: the building when the tap is
+  // on a building (parcel demoted to a secondary section), else the parcel.
+  let html = bldHtml
+    ? bldHtml + section(parcelHtml)
+    : parcelHtml;
   if (selection.size > 1) {
     const areas = [...selection.values()].map(s => s.area).filter(a => a != null);
     const sum = areas.reduce((a, b) => a + b, 0);

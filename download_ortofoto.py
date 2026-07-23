@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
 import urllib.parse
 import urllib.request
@@ -27,6 +29,30 @@ from pathlib import Path
 
 UA = "gtaol/1.0 (ortofoto downloader)"
 ATOM_INDEX = "https://atom.cuzk.gov.cz/Ortofoto/Ortofoto.xml"
+# Full-ČR ortofoto bulk pull (bulk_ortofoto.py) lands in the same root as the
+# DMPOK bulk, as ortofoto_<CODE>/WRTO*.jpg + .jgw sidecars. When mounted, copy
+# from there instead of the slow ATOM-feed ZIP download. Override/disable via
+# env (defaults to the DMPOK bulk root — both live under /Volumes/Elements/cuzk-bulk).
+BULK_ORTOFOTO_DIR = Path(os.environ.get(
+    "BULK_ORTOFOTO_DIR",
+    os.environ.get("BULK_DMPOK_DIR", "/Volumes/Elements/cuzk-bulk")))
+
+
+def _copy_from_bulk(mapnom: str, out_dir: Path):
+    """Copy a sheet's jpg + jgw sidecars from the local bulk archive if
+    present. Returns the main .jpg Path on success, else None. Copy (not
+    symlink) so the cache survives the external drive unmounting."""
+    bulk = BULK_ORTOFOTO_DIR / f"ortofoto_{mapnom}"
+    jpgs = sorted(bulk.glob("*.jpg")) if bulk.is_dir() else []
+    if not jpgs:
+        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for f in list(bulk.glob("*.jpg")) + list(bulk.glob("*.jgw")):
+        shutil.copy2(f, out_dir / f.name)
+    main = out_dir / jpgs[0].name
+    print(f"  Copied {main.name} from bulk archive "
+          f"({main.stat().st_size // (1024*1024)} MB)")
+    return main
 
 
 def _http_get(url: str, timeout: int = 60) -> bytes:
@@ -100,6 +126,9 @@ def download(mapnom: str, dest_root: Path, force: bool = False) -> Path:
             if jpg.with_suffix(".jgw").exists():
                 print(f"  Already cached: {jpg}")
                 return jpg
+        copied = _copy_from_bulk(mapnom, out_dir)
+        if copied is not None:
+            return copied
 
     feed_url = find_dataset_feed_url(mapnom)
     print(f"  Dataset feed: {feed_url}")

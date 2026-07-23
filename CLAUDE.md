@@ -39,7 +39,7 @@ Per-step output lives under `tiles_v2_<slug>/` (the directory prefix is unchange
 
 | Step | Output | Notes |
 |------|--------|-------|
-| `sm5` | `.sm5_ok` sentinel | In-process. Resolves MAPNOM via ČÚZK `KladyMapovychListu/25`, then gets `dmpok_tiff_*` (SM5 DSM) + `ortofoto_*` JPEGs into cache. DMPOK is **copied from the local bulk archive** (`/Volumes/Elements/cuzk-bulk`, override/disable via `BULK_DMPOK_DIR`) when mounted — `download_tiff._copy_from_bulk`, ~0.5 s/sheet vs. minutes of flaky ČÚZK openzu ZIP; falls back to download on a bulk miss. Ortofoto still downloads (no bulk ortofoto archive). |
+| `sm5` | `.sm5_ok` sentinel | In-process. Resolves MAPNOM via ČÚZK `KladyMapovychListu/25`, then gets `dmpok_tiff_*` (SM5 DSM) + `ortofoto_*` JPEGs into cache. **Both are copied from the local bulk archive** (`/Volumes/Elements/cuzk-bulk`, override/disable via `BULK_DMPOK_DIR` / `BULK_ORTOFOTO_DIR`) when mounted — `download_tiff._copy_from_bulk` + `download_ortofoto._copy_from_bulk`, ~0.3–0.5 s/sheet vs. minutes of flaky ČÚZK ZIP/ATOM downloads; each falls back to its network path on a bulk miss. The full-ČR DMPOK **and** ortofoto pulls both live under `cuzk-bulk` (`dmpok_tiff_<CODE>/` and `ortofoto_<CODE>/`). |
 | `heightfield` | `heightfield/manifest.json` + LERC + KTX2 tiers | Subprocess `gen_heightfield.py --slug X --cx X --cy Y` — writes LOD streaming assets that `heightfield/index.html` reads. |
 
 `location_status()` reports `missing` (no slug dir) / `partial` (dir but no heightfield manifest) / `ready` (heightfield manifest present). `STEP_TIMEOUT_SECS = 3600` (cold DMR5G can take 10–30 min).
@@ -116,7 +116,7 @@ Negative S-JTSK coords need the `=` form (`--cx=-547700`), otherwise argparse sw
 
 `bulk_dmr5g.py` is the ground-only twin: the DMR 5G **bare-earth** product (LAZ point clouds, one `<MAPNOM>.laz` per SM5 sheet) from `openzu.cuzk.gov.cz/opendata/DMR5G/epsg-5514/`. Same signal-safe/resumable/atomic-state engine as `bulk_dmpok.py`; writes a flat archive to `/Volumes/Elements/cuzk-dmr5g/` (override `BULK_DMR5G_OUT_DIR`). Full ČR = 16 299 sheets ≈ **45 GB** (measured 2026-07-20, all `done`, 0 missing/fail, ~2h44m). Seed its `sheets.json` once from the identical DMPOK MAPNOM grid — see the module docstring. It's a **point cloud**, not a raster: to use as terrain, rasterise to a grid (the per-location pipeline still fetches the DMR5G ImageServer raster directly; see `fetch_dmr5g` in `gen_heightfield.py`).
 
-`bulk_ortofoto.py` + `bulk_ortofoto_inventory.py` + `bulk_ortofoto_status.py` are a clone of the same engine for the full ortofoto dataset (~1.1 TB JPEG, newest acquisition per sheet). Runbook in `BULK_ORTOFOTO.md`. Sanity check there: `missing` should stay ~0 — a climbing count means a broken ZIP url pattern, not a coverage gap.
+`bulk_ortofoto.py` + `bulk_ortofoto_inventory.py` + `bulk_ortofoto_status.py` are a clone of the same engine for the full ortofoto dataset (~1.1 TB JPEG, newest acquisition per sheet). Runbook in `BULK_ORTOFOTO.md`. Sanity check there: `missing` should stay ~0 — a climbing count means a broken ZIP url pattern, not a coverage gap. **This pull is complete** (16 299 `ortofoto_<CODE>/` dirs under `cuzk-bulk` as of 2026-07, `WRTO*.jpg` + `.jgw`), so the `sm5` step copies ortofoto from disk — see the Pipeline table.
 
 ## Heightmap pyramid (ČR-wide)
 

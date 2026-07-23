@@ -59,27 +59,41 @@ def default_max_z_error_for_step(step: float) -> float:
     return round(max(0.05, step / 7.0), 3)
 
 
-def derive_rings(inner_half):
-    """2-ring pyramid sized to a parcel selection (subsystem B).
+# SM5/DMPOK is 0.5 m/px, so a grid finer than that over-samples the source —
+# floor the step there. For inner_half >= 500 the step equals inner_half/1000
+# (unchanged); below that the grid shrinks instead of the cell getting smaller.
+_STEP_FLOOR_M = 0.5
 
-    inner_half (m) is clamped to [500, 2000]; closeup = 3× inner (today's
-    ratio); step = half/1000 keeps each ring a ~2000² grid so data stays
-    bounded as the model grows (detail-per-metre degrades instead). At
-    inner_half=500 the geometry equals DEFAULT_RINGS.
+
+def _ring(slug, half):
+    step = max(_STEP_FLOOR_M, half / 1000.0)
+    return {"slug": slug, "half": half, "step": step, "ortho_size": 4096,
+            "max_z_error": default_max_z_error_for_step(step)}
+
+
+def derive_rings(inner_half, single_ring=False):
+    """LOD pyramid sized to a selection (subsystem B).
+
+    Two-ring by default: inner (the subject) + a closeup context ring at
+    3× inner. `single_ring=True` drops the closeup and returns just the
+    inner ring sized tightly to the subject — used for polygon výřezy,
+    where the island mask + clipBox discard the whole closeup ring anyway
+    (it sits entirely outside the polygon or inside the inner ring), so
+    generating it is pure waste.
+
+    inner_half is clamped to [60, 2000] m (single-ring) or [500, 2000] m
+    (two-ring, where the 500 m floor keeps the closeup pedestal sensibly
+    sized). step floors at 0.5 m (SM5 resolution) so a small výřez gets a
+    smaller grid rather than an over-sampled one.
     """
+    if single_ring:
+        inner_half = max(60.0, min(2000.0, float(inner_half)))
+        return [_ring("inner", inner_half)]
     inner_half = max(500.0, min(2000.0, float(inner_half)))
-    closeup_half = 3.0 * inner_half
-    inner_step = inner_half / 1000.0
-    closeup_step = closeup_half / 1000.0
-    return [
-        {"slug": "closeup", "half": closeup_half, "step": closeup_step,
-         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(closeup_step)},
-        {"slug": "inner", "half": inner_half, "step": inner_step,
-         "ortho_size": 4096, "max_z_error": default_max_z_error_for_step(inner_step)},
-    ]
+    return [_ring("closeup", 3.0 * inner_half), _ring("inner", inner_half)]
 
 
-def resolve_rings(rings_file, inner_half):
+def resolve_rings(rings_file, inner_half, single_ring=False):
     """Pick the ring list: explicit --rings file wins (loaded + validated),
     then --inner-half (selection-driven), else fixed DEFAULT_RINGS (legacy)."""
     if rings_file:
@@ -93,7 +107,7 @@ def resolve_rings(rings_file, inner_half):
                 r["max_z_error"] = default_max_z_error_for_step(r["step"])
         return rings
     if inner_half is not None:
-        return derive_rings(inner_half)
+        return derive_rings(inner_half, single_ring=single_ring)
     return DEFAULT_RINGS
 
 
@@ -991,6 +1005,11 @@ def main():
                         "Builds a 2-ring pyramid via derive_rings (clamped "
                         "500–2000). Ignored if --rings is given. Default: "
                         "DEFAULT_RINGS fixed preset.")
+    p.add_argument("--single-ring", action="store_true",
+                   help="build only the inner ring, sized tightly to the "
+                        "subject (clamp 60–2000 m). For polygon výřezy: the "
+                        "island mask discards the whole closeup ring anyway, "
+                        "so generating it is wasted. Requires --inner-half.")
     p.add_argument("--no-cadastre", action="store_true",
                    help="skip cadastre fetch (saves ~500 KB/ring, but viewer "
                         "won't have parcel boundaries unless it fetches live)")
@@ -1065,14 +1084,18 @@ def main():
         else:
             print(f"LERC mode, per-ring max z-error")
 
-    rings = resolve_rings(args.rings, args.inner_half)
+    rings = resolve_rings(args.rings, args.inner_half, single_ring=args.single_ring)
     if args.rings:
         print(f"Using custom rings from {args.rings}: "
               f"{[r['slug'] for r in rings]}")
     elif args.inner_half is not None:
-        print(f"Using selection-driven rings (inner_half={args.inner_half}): "
-              f"inner half={rings[1]['half']} step={rings[1]['step']}, "
-              f"closeup half={rings[0]['half']} step={rings[0]['step']}")
+        inner = rings[-1]
+        geom = f"inner half={inner['half']} step={inner['step']}"
+        if len(rings) > 1:
+            geom += f", closeup half={rings[0]['half']} step={rings[0]['step']}"
+        else:
+            geom += " (single ring, výřez)"
+        print(f"Using selection-driven rings (inner_half={args.inner_half}): {geom}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

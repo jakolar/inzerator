@@ -844,8 +844,9 @@ class TestPolygonExtent:
         # S-JTSK for this area: cx ≈ -547-548k, cy ≈ -1107-1108k
         assert -549000 < ext["cx"] < -546000
         assert -1109000 < ext["cy"] < -1106000
-        assert ext["inner_half"] == 500.0          # small polygon → clamped up
-        assert ext["clamped"] is False             # raw < 500 is a floor, not a cut
+        # sized to the real bbox now (single-ring výřez, no 500 m floor)
+        assert 300 < ext["inner_half"] < 340       # ~319 m (bbox half-extent)
+        assert ext["clamped"] is False             # under the 2000 m cut
         assert 400 < ext["bbox_w_m"] < 800
         assert len(ext["polygon_local"]) == 3
         # local ring is centred on (cx, cy): bbox of dx spans ~±bbox_w/2
@@ -880,8 +881,8 @@ class TestParseJobExtentPolygon:
 
     def test_polygon_parsed_and_derived(self):
         ih, pids, ext = locations.parse_job_extent({"polygon": self.POLY})
-        assert ext is not None and ext["inner_half"] == 500.0
-        assert ih == 500.0                    # polygon fills inner_half
+        assert ext is not None and 300 < ext["inner_half"] < 340
+        assert 300 < ih < 340                 # sized to the real bbox (~319 m)
         assert pids is None
 
     def test_explicit_inner_half_wins(self):

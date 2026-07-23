@@ -26,6 +26,29 @@ def test_derive_rings_step_scales_with_half():
     assert (closeup["half"], closeup["step"]) == (3000, 3.0)
 
 
+def test_derive_rings_single_ring_drops_closeup():
+    """Polygon výřez: one tight inner ring, no closeup, 60 m floor."""
+    rings = gh.derive_rings(800, single_ring=True)
+    assert [r["slug"] for r in rings] == ["inner"]
+    assert (rings[0]["half"], rings[0]["step"]) == (800, 0.8)
+    # clamp floor 60 (not 500), cap 2000
+    assert gh.derive_rings(30, single_ring=True)[0]["half"] == 60
+    assert gh.derive_rings(9999, single_ring=True)[0]["half"] == 2000
+
+
+def test_derive_rings_step_floors_at_dmpok_resolution():
+    """A small ring must not over-sample below SM5's 0.5 m/px."""
+    # inner_half 120 → half/1000 = 0.12, floored to 0.5
+    assert gh.derive_rings(120, single_ring=True)[0]["step"] == 0.5
+    # inner_half 800 → 0.8, above the floor, unchanged
+    assert gh.derive_rings(800, single_ring=True)[0]["step"] == 0.8
+
+
+def test_resolve_rings_single_ring_passes_through():
+    rings = gh.resolve_rings(None, 800, single_ring=True)
+    assert [r["slug"] for r in rings] == ["inner"]
+
+
 def test_resolve_rings_default_when_nothing_set():
     assert gh.resolve_rings(None, None) is gh.DEFAULT_RINGS
 

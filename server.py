@@ -3906,8 +3906,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
             return
-        # Same envelope the sm5 step will use (see _do_sm5_download).
-        sm5_half = max(2500.0, 3.0 * ext["inner_half"])
+        # Same envelope the sm5 step will use for a polygon výřez (single
+        # tight ring, no 3× closeup) — see _do_sm5_download.
+        sm5_half = max(60.0, min(2000.0, ext["inner_half"]))
         try:
             codes = locations._resolve_sm5_codes(ext["cx"], ext["cy"], half=sm5_half)
         except locations.RuianUnavailable as e:

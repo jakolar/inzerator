@@ -271,7 +271,10 @@ def polygon_extent(polygon) -> dict:
     cy = (min(ys) + max(ys)) / 2.0
     bbox_w = max(xs) - min(xs); bbox_h = max(ys) - min(ys)
     raw = max(bbox_w, bbox_h) / 2.0
-    inner_half = max(500.0, min(2000.0, raw))   # mirrors derive_rings clamp
+    # Polygon výřezy build a single tight inner ring (the closeup ring is
+    # fully masked away), so size the ring to the real polygon extent —
+    # floor 60 m, not the two-ring 500 m. Mirrors derive_rings(single_ring).
+    inner_half = max(60.0, min(2000.0, raw))
     return {
         "cx": round(cx, 2), "cy": round(cy, 2),
         "inner_half_raw": round(raw, 1), "inner_half": inner_half,
@@ -609,10 +612,15 @@ def _do_sm5_download(job: dict, log_path: Path) -> bool:
     try:
         # Pre-warm envelope: cover the closeup ring (3× clamped inner_half for
         # selection-driven gen), floored at the legacy 2500 m so the default /
-        # RÚIAN flow is unchanged. The heightfield subprocess still self-heals
-        # any remaining gap via ensure_sm5_cached(fetch_missing=True).
+        # RÚIAN flow is unchanged. A polygon výřez builds a single tight ring,
+        # so its envelope is just the inner ring — no 3× closeup to cover.
+        # The heightfield subprocess still self-heals any remaining gap via
+        # ensure_sm5_cached(fetch_missing=True).
         _ih = job.get("inner_half")
-        sm5_half = max(2500.0, 3.0 * max(500.0, min(2000.0, _ih))) if _ih is not None else 2500
+        if job.get("polygon") and _ih is not None:
+            sm5_half = max(60.0, min(2000.0, _ih))
+        else:
+            sm5_half = max(2500.0, 3.0 * max(500.0, min(2000.0, _ih))) if _ih is not None else 2500
         log(f"Resolving sheets for envelope (cx={job['cx']}, cy={job['cy']}, half={sm5_half})…")
         codes = _resolve_sm5_codes(job["cx"], job["cy"], half=sm5_half)
         log(f"ČÚZK returned {len(codes)} sheet(s): {', '.join(codes)}")
@@ -985,7 +993,8 @@ _LOD_PRESET = {
 
 
 def cmd_for(step: str, slug: str, cx: float, cy: float,
-            inner_half: float | None = None) -> list[str]:
+            inner_half: float | None = None,
+            single_ring: bool = False) -> list[str]:
     """Vyrobí subprocess command pro daný step. `--center-sjtsk=cx,cy`
     musí mít `=` syntax (argparse jinak parsuje negativní cx jako flag).
     Raises ValueError for 'sm5' and 'compress' — those are in-process,
@@ -1013,6 +1022,8 @@ def cmd_for(step: str, slug: str, cx: float, cy: float,
         ]
         if inner_half is not None:
             cmd += ["--inner-half", str(inner_half)]
+        if single_ring:
+            cmd += ["--single-ring"]
         return cmd
     p = _LOD_PRESET[step]
     return base + [
@@ -1093,8 +1104,10 @@ def _run_step(job: dict, step: dict) -> bool:
         return False
 
     # === Subprocess step: panorama, outer, closeup, inner ===
+    # A polygon výřez builds a single tight ring (the closeup is masked away).
     cmd = cmd_for(step["name"], job["slug"], job["cx"], job["cy"],
-                  inner_half=job.get("inner_half"))
+                  inner_half=job.get("inner_half"),
+                  single_ring=bool(job.get("polygon")))
 
     try:
         try:

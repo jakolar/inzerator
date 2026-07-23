@@ -39,7 +39,7 @@ Per-step output lives under `tiles_v2_<slug>/` (the directory prefix is unchange
 
 | Step | Output | Notes |
 |------|--------|-------|
-| `sm5` | `.sm5_ok` sentinel | In-process. Resolves MAPNOM via ČÚZK `KladyMapovychListu/25`, auto-downloads `dmpok_tiff_*` (SM5 DSM) + `ortofoto_*` JPEGs into cache. |
+| `sm5` | `.sm5_ok` sentinel | In-process. Resolves MAPNOM via ČÚZK `KladyMapovychListu/25`, then gets `dmpok_tiff_*` (SM5 DSM) + `ortofoto_*` JPEGs into cache. DMPOK is **copied from the local bulk archive** (`/Volumes/Elements/cuzk-bulk`, override/disable via `BULK_DMPOK_DIR`) when mounted — `download_tiff._copy_from_bulk`, ~0.5 s/sheet vs. minutes of flaky ČÚZK openzu ZIP; falls back to download on a bulk miss. Ortofoto still downloads (no bulk ortofoto archive). |
 | `heightfield` | `heightfield/manifest.json` + LERC + KTX2 tiers | Subprocess `gen_heightfield.py --slug X --cx X --cy Y` — writes LOD streaming assets that `heightfield/index.html` reads. |
 
 `location_status()` reports `missing` (no slug dir) / `partial` (dir but no heightfield manifest) / `ready` (heightfield manifest present). `STEP_TIMEOUT_SECS = 3600` (cold DMR5G can take 10–30 min).

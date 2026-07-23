@@ -63,11 +63,24 @@ def default_max_z_error_for_step(step: float) -> float:
 # floor the step there. For inner_half >= 500 the step equals inner_half/1000
 # (unchanged); below that the grid shrinks instead of the cell getting smaller.
 _STEP_FLOOR_M = 0.5
+# Source ortofoto is ~0.25 m/px. The high (base) tier is sized to roughly that
+# and clamped [1024, 4096]. A large ring caps at 4096 (as before, 0.5–1 m/px);
+# a small výřez drops below 4096 instead of over-sampling the source 4–8×.
+_ORTHO_SOURCE_MPP = 0.25
+
+
+def _ortho_size_for(half):
+    target = 2.0 * half / _ORTHO_SOURCE_MPP     # px for ~source resolution
+    p2 = 1
+    while p2 < target:
+        p2 <<= 1
+    return max(1024, min(4096, p2))
 
 
 def _ring(slug, half):
     step = max(_STEP_FLOOR_M, half / 1000.0)
-    return {"slug": slug, "half": half, "step": step, "ortho_size": 4096,
+    return {"slug": slug, "half": half, "step": step,
+            "ortho_size": _ortho_size_for(half),
             "max_z_error": default_max_z_error_for_step(step)}
 
 

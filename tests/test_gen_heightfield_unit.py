@@ -49,6 +49,18 @@ def test_resolve_rings_single_ring_passes_through():
     assert [r["slug"] for r in rings] == ["inner"]
 
 
+def test_ortho_size_scales_with_ring():
+    """Small ring → smaller ortho (no 4-8× over-sampling); large ring caps 4096."""
+    assert gh._ortho_size_for(60) == 1024      # tiny → floor 1024
+    assert gh._ortho_size_for(250) == 2048     # ~0.24 m/px at high tier
+    assert gh._ortho_size_for(500) == 4096     # source native, unchanged
+    assert gh._ortho_size_for(2000) == 4096    # large → cap 4096
+    # two-ring geometry (half >= 500) keeps ortho_size 4096 as before
+    assert all(r["ortho_size"] == 4096 for r in gh.derive_rings(500))
+    # a small single-ring výřez shrinks it
+    assert gh.derive_rings(120, single_ring=True)[0]["ortho_size"] == 1024
+
+
 def test_resolve_rings_default_when_nothing_set():
     assert gh.resolve_rings(None, None) is gh.DEFAULT_RINGS
 
